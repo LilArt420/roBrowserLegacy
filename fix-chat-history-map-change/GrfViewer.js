@@ -259499,8 +259499,8 @@ function _root$9() {
 	return ChatBox._shadow || ChatBox._host;
 }
 /**
-* Empty the input. What was typed stays in the history: Up recalls it after
-* the box is taken down and built again on a map change.
+* Empty the input. What was typed stays in the history: onRemove() uses this,
+* so Up still recalls it once a map change has built the box again.
 */
 function resetInput(root) {
 	const inputChatbox = root.querySelector(".input-chatbox");
@@ -260399,6 +260399,8 @@ var init_ChatBox = __esmMin((() => {
 		keptLogs.forEach(clearChatLog);
 		keptLogs.clear();
 		resetInput(root);
+		_historyMessage.clear();
+		_historyNickName.clear();
 	};
 	ChatBox.toggleChatBattleOption = function toggleChatBattleOption() {
 		if (ChatBoxSettings_default._host?.style.display !== "none" && ChatBoxSettings_default.activeTab === this.activeTab) {
