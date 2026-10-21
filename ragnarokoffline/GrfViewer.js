@@ -947,17 +947,22 @@ var init_iconv_lite = __esmMin((() => {
 				while (i < len) res += String.fromCharCode.apply(String, codePoints.slice(i, i += MAX_ARGUMENTS_LENGTH));
 				return res;
 			}
+			function decodeCharCodes(codes) {
+				const len = codes.length;
+				if (len <= MAX_ARGUMENTS_LENGTH) return String.fromCharCode.apply(String, codes);
+				let res = "";
+				for (let i = 0; i < len; i += MAX_ARGUMENTS_LENGTH) res += String.fromCharCode.apply(String, codes.subarray(i, i + MAX_ARGUMENTS_LENGTH));
+				return res;
+			}
 			function asciiSlice(buf, start, end) {
-				let ret = "";
 				end = Math.min(buf.length, end);
-				for (let i = start; i < end; ++i) ret += String.fromCharCode(buf[i] & 127);
-				return ret;
+				const codes = new Uint8Array(Math.max(0, end - start));
+				for (let i = 0; i < codes.length; ++i) codes[i] = buf[start + i] & 127;
+				return decodeCharCodes(codes);
 			}
 			function latin1Slice(buf, start, end) {
-				let ret = "";
 				end = Math.min(buf.length, end);
-				for (let i = start; i < end; ++i) ret += String.fromCharCode(buf[i]);
-				return ret;
+				return decodeCharCodes(new Uint8Array(buf.buffer, buf.byteOffset + start, Math.max(0, end - start)));
 			}
 			function hexSlice(buf, start, end) {
 				const len = buf.length;
@@ -969,9 +974,9 @@ var init_iconv_lite = __esmMin((() => {
 			}
 			function utf16leSlice(buf, start, end) {
 				const bytes = buf.slice(start, end);
-				let res = "";
-				for (let i = 0; i < bytes.length - 1; i += 2) res += String.fromCharCode(bytes[i] + bytes[i + 1] * 256);
-				return res;
+				const codes = new Uint16Array(bytes.length >> 1);
+				for (let i = 0; i < codes.length; ++i) codes[i] = bytes[2 * i] + bytes[2 * i + 1] * 256;
+				return decodeCharCodes(codes);
 			}
 			Buffer2.prototype.slice = function slice(start, end) {
 				const len = this.length;
@@ -11406,9 +11411,80 @@ function canBuild(filename) {
 * @param {function} callback - called with a 1024-byte Uint8Array, or null
 */
 function build(filename, callback) {
+	const job = parse$1(filename);
+	load$1(job, function(own, siblings, hair, hair0) {
+		if (pick$1(job) !== "data" && own && hair && hair0) {
+			const cloth = clothIndices([own, ...siblings.filter(Boolean)]);
+			if (cloth.length) {
+				callback(fromHair(own, cloth, hair, hair0));
+				return;
+			}
+		}
+		callback(recolour(siblings.filter((p, i) => p && SIBLINGS[i] !== job.colour), job.colour));
+	});
+}
+/**
+* Check a body palette the game data has: replaced by the hair colour when
+* PICKS says so or its clothes are too dark.
+*
+* @param {string} filename
+* @param {ArrayBuffer|Uint8Array} data - the file
+* @param {function} callback - called with a replacement Uint8Array, or null to keep the file
+*/
+function adjust(filename, data, callback) {
+	const job = parse$1(filename);
+	const choice = pick$1(job);
+	if (!job.colour || choice === "data" || data.byteLength < 1024) {
+		callback(null);
+		return;
+	}
+	const pal = data instanceof ArrayBuffer ? new Uint8Array(data, 0, 1024) : new Uint8Array(data.buffer, data.byteOffset, 1024);
+	load$1(job, function(own, siblings, hair, hair0) {
+		if (!own || !hair || !hair0) {
+			callback(null);
+			return;
+		}
+		const cloth = clothIndices([own, ...siblings.filter(Boolean)]);
+		if (cloth.length && (choice === "hair" || isDark(pal, own, cloth))) {
+			callback(fromHair(own, cloth, hair, hair0));
+			return;
+		}
+		callback(null);
+	});
+}
+/**
+* <job>_<sex>_<n>(_1).pal into its parts.
+*
+* @param {string} filename - a body palette (canBuild)
+*/
+function parse$1(filename) {
 	const match = filename.match(NAME);
-	const colour = parseInt(match[2], 10);
-	const names = SIBLINGS.filter((n) => n !== colour).map((n) => match[1] + n + (match[3] || "") + ".pal");
+	const parts = match[1].slice(16, -1).split("_");
+	return {
+		prefix: match[1],
+		suffix: (match[3] || "") + ".pal",
+		colour: parseInt(match[2], 10),
+		sex: parts.pop(),
+		name: parts.join("_")
+	};
+}
+/** @return {string|undefined} PICKS' choice for this job and colour */
+function pick$1(job) {
+	return (PICKS[job.name] || {})[job.colour];
+}
+/**
+* Read the job's _0 and sibling palettes and hair colours n and 0.
+*
+* @param {object} job - from parse()
+* @param {function} callback - (own, siblings[], hair, hair0), each a Uint8Array or null
+*/
+function load$1(job, callback) {
+	const names = [
+		job.prefix + "0" + job.suffix,
+		...SIBLINGS.map((n) => job.prefix + n + job.suffix),
+		HAIR + job.sex + "_" + job.colour + ".pal",
+		HAIR + job.sex + "_0.pal"
+	];
 	const found = new Array(names.length).fill(null);
 	let pending = names.length;
 	names.forEach((name, i) => {
@@ -11417,9 +11493,101 @@ function build(filename, callback) {
 			args: null
 		}, (data, error) => {
 			if (!error && data && data.byteLength >= 1024) found[i] = new Uint8Array(data, 0, 1024);
-			if (--pending === 0) callback(recolour(found.filter(Boolean), colour));
+			if (--pending === 0) callback(found[0], found.slice(1, 1 + SIBLINGS.length), found[names.length - 2], found[names.length - 1]);
 		});
 	});
+}
+/**
+* The indices that differ between palettes: the clothes.
+*
+* @param {Uint8Array[]} palettes - the first one is compared with the rest
+* @return {number[]}
+*/
+function clothIndices(palettes) {
+	const base = palettes[0];
+	const cloth = [];
+	for (let i = FIRST_CLOTH_INDEX; i < 256; ++i) {
+		const o = i * 4;
+		if (palettes.some((p) => p[o] !== base[o] || p[o + 1] !== base[o + 1] || p[o + 2] !== base[o + 2])) cloth.push(i);
+	}
+	return cloth;
+}
+/**
+* Whether a palette's clothes (where it differs from the job's own) are on
+* average darker than DARK.
+*
+* @param {Uint8Array} pal
+* @param {Uint8Array} own - the job's _0 palette
+* @param {number[]} cloth - clothIndices
+* @return {boolean}
+*/
+function isDark(pal, own, cloth) {
+	let sum = 0;
+	let count = 0;
+	for (const i of cloth) {
+		const o = i * 4;
+		if (pal[o] === own[o] && pal[o + 1] === own[o + 1] && pal[o + 2] === own[o + 2]) continue;
+		sum += rgbToHls(pal[o] / 255, pal[o + 1] / 255, pal[o + 2] / 255)[1];
+		count++;
+	}
+	return count > 0 && sum / count < DARK;
+}
+/**
+* The job's own palette with its clothes in a hair colour's shades.
+*
+* @param {Uint8Array} own - the job's _0 palette
+* @param {number[]} cloth - clothIndices
+* @param {Uint8Array} hair - hair colour n
+* @param {Uint8Array} hair0 - hair colour 0: what n changes is the hair
+* @return {Uint8Array}
+*/
+function fromHair(own, cloth, hair, hair0) {
+	const ramp = [];
+	for (let i = FIRST_CLOTH_INDEX; i < 256; ++i) {
+		const o = i * 4;
+		if (hair[o] === hair0[o] && hair[o + 1] === hair0[o + 1] && hair[o + 2] === hair0[o + 2]) continue;
+		ramp.push({
+			l: rgbToHls(hair[o] / 255, hair[o + 1] / 255, hair[o + 2] / 255)[1],
+			c: [
+				hair[o],
+				hair[o + 1],
+				hair[o + 2]
+			]
+		});
+	}
+	const out = new Uint8Array(own);
+	if (!ramp.length) return out;
+	ramp.sort((a, b) => a.l - b.l);
+	const lights = cloth.map((i) => rgbToHls(own[i * 4] / 255, own[i * 4 + 1] / 255, own[i * 4 + 2] / 255)[1]);
+	const min = Math.min(...lights);
+	const max = Math.max(...lights);
+	const low = ramp[0].l;
+	const high = ramp[ramp.length - 1].l;
+	const dark = ramp.reduce((sum, x) => sum + x.l, 0) / ramp.length < .45;
+	cloth.forEach((i, k) => {
+		const t = (lights[k] - min) / (max - min || 1);
+		let c = shadeAt(ramp, low + t * (high - low));
+		if (dark) {
+			const [h, l, s] = rgbToHls(c[0] / 255, c[1] / 255, c[2] / 255);
+			c = hlsToRgb(h, .3 + .7 * l, s).map((v) => v * 255);
+		}
+		const o = i * 4;
+		out[o] = Math.round(c[0]);
+		out[o + 1] = Math.round(c[1]);
+		out[o + 2] = Math.round(c[2]);
+	});
+	return out;
+}
+/** The ramp's colour at a lightness, between its two nearest shades. */
+function shadeAt(ramp, l) {
+	if (l <= ramp[0].l) return ramp[0].c;
+	for (let k = 1; k < ramp.length; ++k) if (l <= ramp[k].l) {
+		const a = ramp[k - 1];
+		const b = ramp[k];
+		const t = (l - a.l) / (b.l - a.l || 1);
+		return a.c.map((v, j) => v + (b.c[j] - v) * t);
+	}
+	return ramp[ramp.length - 1].c;
 }
 /**
 * @param {Uint8Array[]} palettes - the job's own, first one first
@@ -11429,11 +11597,7 @@ function build(filename, callback) {
 function recolour(palettes, colour) {
 	if (palettes.length < 2) return null;
 	const base = palettes[0];
-	const cloth = [];
-	for (let i = FIRST_CLOTH_INDEX; i < 256; ++i) {
-		const o = i * 4;
-		if (palettes.some((p) => p[o] !== base[o] || p[o + 1] !== base[o + 1] || p[o + 2] !== base[o + 2])) cloth.push(i);
-	}
+	const cloth = clothIndices(palettes);
 	if (!cloth.length) return null;
 	const [hue, saturation, lightness] = LOOKS[((colour - 4) % LOOKS.length + LOOKS.length) % LOOKS.length];
 	const out = new Uint8Array(base);
@@ -11492,16 +11656,41 @@ function channel(m1, m2, h) {
 	if (h < 2 / 3) return m1 + (m2 - m1) * (2 / 3 - h) * 6;
 	return m1;
 }
-var BODY_DIR, NAME, SIBLINGS, LOOKS, FIRST_CLOTH_INDEX, ClothPalette_default;
+var BODY_DIR, NAME, SIBLINGS, HAIR, DARK, PICKS, LOOKS, FIRST_CLOTH_INDEX, ClothPalette_default;
 var init_ClothPalette = __esmMin((() => {
 	init_Thread();
 	BODY_DIR = "data/palette/¸ö/";
-	NAME = /^(.*_)(\d+)(_1)?\.pal$/i;
+	NAME = /^(.*?_)(\d+)(_1)?\.pal$/i;
 	SIBLINGS = [
 		1,
 		2,
 		3
 	];
+	HAIR = "data/palette/¸Ó¸®/¸Ó¸®1_";
+	DARK = .3;
+	PICKS = {
+		"ÇÁ¸®½ºÆ®": {
+			4: "hair",
+			6: "data",
+			7: "data"
+		},
+		"À§Àúµå": {
+			6: "data",
+			7: "data"
+		},
+		"¼ºÁ÷ÀÚ": {
+			6: "data",
+			7: "data"
+		},
+		"¾î¼¼½Å": {
+			6: "data",
+			7: "data"
+		},
+		"´í¼­": {
+			6: "data",
+			7: "data"
+		}
+	};
 	LOOKS = [
 		[
 			105,
@@ -11528,13 +11717,17 @@ var init_ClothPalette = __esmMin((() => {
 	ClothPalette_default = {
 		canBuild,
 		build,
-		recolour
+		adjust,
+		recolour,
+		fromHair,
+		clothIndices,
+		isDark
 	};
 }));
 //#endregion
 //#region src/Network/Packets/packets2003_len_main.js
 var packets2003_len_main_exports = /* @__PURE__ */ __exportAll({ default: () => packets2003_len_main_default });
-function init$38(packetver) {
+function init$39(packetver) {
 	length_list$22[100] = 55;
 	length_list$22[101] = 17;
 	length_list$22[102] = 3;
@@ -11942,12 +12135,12 @@ function init$38(packetver) {
 var length_list$22, packets2003_len_main_default;
 var init_packets2003_len_main = __esmMin((() => {
 	length_list$22 = new Array();
-	packets2003_len_main_default = { init: init$38 };
+	packets2003_len_main_default = { init: init$39 };
 }));
 //#endregion
 //#region src/Network/Packets/packets2004_len_main.js
 var packets2004_len_main_exports = /* @__PURE__ */ __exportAll({ default: () => packets2004_len_main_default });
-function init$37(packetver) {
+function init$38(packetver) {
 	length_list$21[100] = 55;
 	length_list$21[101] = 17;
 	length_list$21[102] = 3;
@@ -12555,12 +12748,12 @@ function init$37(packetver) {
 var length_list$21, packets2004_len_main_default;
 var init_packets2004_len_main = __esmMin((() => {
 	length_list$21 = new Array();
-	packets2004_len_main_default = { init: init$37 };
+	packets2004_len_main_default = { init: init$38 };
 }));
 //#endregion
 //#region src/Network/Packets/packets2005_len_main.js
 var packets2005_len_main_exports = /* @__PURE__ */ __exportAll({ default: () => packets2005_len_main_default });
-function init$36(packetver) {
+function init$37(packetver) {
 	length_list$20[100] = 55;
 	length_list$20[101] = 17;
 	length_list$20[102] = 3;
@@ -13185,12 +13378,12 @@ function init$36(packetver) {
 var length_list$20, packets2005_len_main_default;
 var init_packets2005_len_main = __esmMin((() => {
 	length_list$20 = new Array();
-	packets2005_len_main_default = { init: init$36 };
+	packets2005_len_main_default = { init: init$37 };
 }));
 //#endregion
 //#region src/Network/Packets/packets2006_len_main.js
 var packets2006_len_main_exports = /* @__PURE__ */ __exportAll({ default: () => packets2006_len_main_default });
-function init$35(packetver) {
+function init$36(packetver) {
 	length_list$19[100] = 55;
 	length_list$19[101] = 17;
 	length_list$19[102] = 3;
@@ -13784,12 +13977,12 @@ function init$35(packetver) {
 var length_list$19, packets2006_len_main_default;
 var init_packets2006_len_main = __esmMin((() => {
 	length_list$19 = new Array();
-	packets2006_len_main_default = { init: init$35 };
+	packets2006_len_main_default = { init: init$36 };
 }));
 //#endregion
 //#region src/Network/Packets/packets2007_len_main.js
 var packets2007_len_main_exports = /* @__PURE__ */ __exportAll({ default: () => packets2007_len_main_default });
-function init$34(packetver) {
+function init$35(packetver) {
 	length_list$18[100] = 55;
 	length_list$18[101] = 17;
 	length_list$18[102] = 3;
@@ -14476,12 +14669,12 @@ function init$34(packetver) {
 var length_list$18, packets2007_len_main_default;
 var init_packets2007_len_main = __esmMin((() => {
 	length_list$18 = new Array();
-	packets2007_len_main_default = { init: init$34 };
+	packets2007_len_main_default = { init: init$35 };
 }));
 //#endregion
 //#region src/Network/Packets/packets2008_len_main.js
 var packets2008_len_main_exports = /* @__PURE__ */ __exportAll({ default: () => packets2008_len_main_default });
-function init$33(packetver) {
+function init$34(packetver) {
 	length_list$17[100] = 55;
 	length_list$17[101] = 17;
 	length_list$17[102] = 3;
@@ -32665,12 +32858,12 @@ function init$33(packetver) {
 var length_list$17, packets2008_len_main_default;
 var init_packets2008_len_main = __esmMin((() => {
 	length_list$17 = new Array();
-	packets2008_len_main_default = { init: init$33 };
+	packets2008_len_main_default = { init: init$34 };
 }));
 //#endregion
 //#region src/Network/Packets/packets2009_len_main.js
 var packets2009_len_main_exports = /* @__PURE__ */ __exportAll({ default: () => packets2009_len_main_default });
-function init$32(packetver) {
+function init$33(packetver) {
 	length_list$16[100] = 55;
 	length_list$16[101] = 17;
 	length_list$16[102] = 3;
@@ -38907,12 +39100,12 @@ function init$32(packetver) {
 var length_list$16, packets2009_len_main_default;
 var init_packets2009_len_main = __esmMin((() => {
 	length_list$16 = new Array();
-	packets2009_len_main_default = { init: init$32 };
+	packets2009_len_main_default = { init: init$33 };
 }));
 //#endregion
 //#region src/Network/Packets/packets2010_len_main.js
 var packets2010_len_main_exports = /* @__PURE__ */ __exportAll({ default: () => packets2010_len_main_default });
-function init$31(packetver) {
+function init$32(packetver) {
 	length_list$15[100] = 55;
 	length_list$15[101] = 17;
 	length_list$15[102] = 3;
@@ -40386,12 +40579,12 @@ function init$31(packetver) {
 var length_list$15, packets2010_len_main_default;
 var init_packets2010_len_main = __esmMin((() => {
 	length_list$15 = new Array();
-	packets2010_len_main_default = { init: init$31 };
+	packets2010_len_main_default = { init: init$32 };
 }));
 //#endregion
 //#region src/Network/Packets/packets2011_len_main.js
 var packets2011_len_main_exports = /* @__PURE__ */ __exportAll({ default: () => packets2011_len_main_default });
-function init$30(packetver) {
+function init$31(packetver) {
 	length_list$14[100] = 55;
 	length_list$14[101] = 17;
 	length_list$14[102] = 3;
@@ -43321,12 +43514,12 @@ function init$30(packetver) {
 var length_list$14, packets2011_len_main_default;
 var init_packets2011_len_main = __esmMin((() => {
 	length_list$14 = new Array();
-	packets2011_len_main_default = { init: init$30 };
+	packets2011_len_main_default = { init: init$31 };
 }));
 //#endregion
 //#region src/Network/Packets/packets2012_len_main.js
 var packets2012_len_main_exports = /* @__PURE__ */ __exportAll({ default: () => packets2012_len_main_default });
-function init$29(packetver) {
+function init$30(packetver) {
 	length_list$13[100] = 55;
 	length_list$13[101] = 17;
 	length_list$13[102] = 3;
@@ -46741,12 +46934,12 @@ function init$29(packetver) {
 var length_list$13, packets2012_len_main_default;
 var init_packets2012_len_main = __esmMin((() => {
 	length_list$13 = new Array();
-	packets2012_len_main_default = { init: init$29 };
+	packets2012_len_main_default = { init: init$30 };
 }));
 //#endregion
 //#region src/Network/Packets/packets2013_len_main.js
 var packets2013_len_main_exports = /* @__PURE__ */ __exportAll({ default: () => packets2013_len_main_default });
-function init$28(packetver) {
+function init$29(packetver) {
 	length_list$12[100] = 55;
 	length_list$12[101] = 17;
 	length_list$12[102] = 3;
@@ -50235,12 +50428,12 @@ function init$28(packetver) {
 var length_list$12, packets2013_len_main_default;
 var init_packets2013_len_main = __esmMin((() => {
 	length_list$12 = new Array();
-	packets2013_len_main_default = { init: init$28 };
+	packets2013_len_main_default = { init: init$29 };
 }));
 //#endregion
 //#region src/Network/Packets/packets2014_len_main.js
 var packets2014_len_main_exports = /* @__PURE__ */ __exportAll({ default: () => packets2014_len_main_default });
-function init$27(packetver) {
+function init$28(packetver) {
 	length_list$11[100] = 55;
 	length_list$11[101] = 17;
 	length_list$11[102] = 3;
@@ -53820,12 +54013,12 @@ function init$27(packetver) {
 var length_list$11, packets2014_len_main_default;
 var init_packets2014_len_main = __esmMin((() => {
 	length_list$11 = new Array();
-	packets2014_len_main_default = { init: init$27 };
+	packets2014_len_main_default = { init: init$28 };
 }));
 //#endregion
 //#region src/Network/Packets/packets2015_len_main.js
 var packets2015_len_main_exports = /* @__PURE__ */ __exportAll({ default: () => packets2015_len_main_default });
-function init$26(packetver) {
+function init$27(packetver) {
 	length_list$10[100] = 55;
 	length_list$10[101] = 17;
 	length_list$10[102] = 3;
@@ -57257,12 +57450,12 @@ function init$26(packetver) {
 var length_list$10, packets2015_len_main_default;
 var init_packets2015_len_main = __esmMin((() => {
 	length_list$10 = new Array();
-	packets2015_len_main_default = { init: init$26 };
+	packets2015_len_main_default = { init: init$27 };
 }));
 //#endregion
 //#region src/Network/Packets/packets2016_len_main.js
 var packets2016_len_main_exports = /* @__PURE__ */ __exportAll({ default: () => packets2016_len_main_default });
-function init$25(packetver) {
+function init$26(packetver) {
 	length_list$9[100] = 55;
 	length_list$9[101] = 17;
 	length_list$9[102] = 3;
@@ -60860,12 +61053,12 @@ function init$25(packetver) {
 var length_list$9, packets2016_len_main_default;
 var init_packets2016_len_main = __esmMin((() => {
 	length_list$9 = new Array();
-	packets2016_len_main_default = { init: init$25 };
+	packets2016_len_main_default = { init: init$26 };
 }));
 //#endregion
 //#region src/Network/Packets/packets2017_len_main.js
 var packets2017_len_main_exports = /* @__PURE__ */ __exportAll({ default: () => packets2017_len_main_default });
-function init$24(packetver) {
+function init$25(packetver) {
 	length_list$8[100] = 55;
 	length_list$8[101] = 17;
 	length_list$8[102] = 3;
@@ -64443,12 +64636,12 @@ function init$24(packetver) {
 var length_list$8, packets2017_len_main_default;
 var init_packets2017_len_main = __esmMin((() => {
 	length_list$8 = new Array();
-	packets2017_len_main_default = { init: init$24 };
+	packets2017_len_main_default = { init: init$25 };
 }));
 //#endregion
 //#region src/Network/Packets/packets2018_len_main.js
 var packets2018_len_main_exports = /* @__PURE__ */ __exportAll({ default: () => packets2018_len_main_default });
-function init$23(packetver) {
+function init$24(packetver) {
 	length_list$7[100] = 55;
 	length_list$7[101] = 17;
 	length_list$7[102] = 3;
@@ -66352,12 +66545,12 @@ function init$23(packetver) {
 var length_list$7, packets2018_len_main_default;
 var init_packets2018_len_main = __esmMin((() => {
 	length_list$7 = new Array();
-	packets2018_len_main_default = { init: init$23 };
+	packets2018_len_main_default = { init: init$24 };
 }));
 //#endregion
 //#region src/Network/Packets/packets2019_len_main.js
 var packets2019_len_main_exports = /* @__PURE__ */ __exportAll({ default: () => packets2019_len_main_default });
-function init$22(packetver) {
+function init$23(packetver) {
 	length_list$6[100] = 55;
 	length_list$6[101] = 17;
 	length_list$6[102] = 3;
@@ -67935,12 +68128,12 @@ function init$22(packetver) {
 var length_list$6, packets2019_len_main_default;
 var init_packets2019_len_main = __esmMin((() => {
 	length_list$6 = new Array();
-	packets2019_len_main_default = { init: init$22 };
+	packets2019_len_main_default = { init: init$23 };
 }));
 //#endregion
 //#region src/Network/Packets/packets2020_len_main.js
 var packets2020_len_main_exports = /* @__PURE__ */ __exportAll({ default: () => packets2020_len_main_default });
-function init$21(packetver) {
+function init$22(packetver) {
 	length_list$5[100] = 55;
 	length_list$5[101] = 17;
 	length_list$5[102] = 3;
@@ -69525,12 +69718,12 @@ function init$21(packetver) {
 var length_list$5, packets2020_len_main_default;
 var init_packets2020_len_main = __esmMin((() => {
 	length_list$5 = new Array();
-	packets2020_len_main_default = { init: init$21 };
+	packets2020_len_main_default = { init: init$22 };
 }));
 //#endregion
 //#region src/Network/Packets/packets2021_len_main.js
 var packets2021_len_main_exports = /* @__PURE__ */ __exportAll({ default: () => packets2021_len_main_default });
-function init$20(packetver) {
+function init$21(packetver) {
 	length_list$4[100] = 55;
 	length_list$4[101] = 17;
 	length_list$4[102] = 3;
@@ -71136,12 +71329,12 @@ function init$20(packetver) {
 var length_list$4, packets2021_len_main_default;
 var init_packets2021_len_main = __esmMin((() => {
 	length_list$4 = new Array();
-	packets2021_len_main_default = { init: init$20 };
+	packets2021_len_main_default = { init: init$21 };
 }));
 //#endregion
 //#region src/Network/Packets/packets2022_len_main.js
 var packets2022_len_main_exports = /* @__PURE__ */ __exportAll({ default: () => packets2022_len_main_default });
-function init$19(packetver) {
+function init$20(packetver) {
 	length_list$3[100] = 55;
 	length_list$3[101] = 17;
 	length_list$3[102] = 3;
@@ -72753,12 +72946,12 @@ function init$19(packetver) {
 var length_list$3, packets2022_len_main_default;
 var init_packets2022_len_main = __esmMin((() => {
 	length_list$3 = new Array();
-	packets2022_len_main_default = { init: init$19 };
+	packets2022_len_main_default = { init: init$20 };
 }));
 //#endregion
 //#region src/Network/Packets/packets2023_len_main.js
 var packets2023_len_main_exports = /* @__PURE__ */ __exportAll({ default: () => packets2023_len_main_default });
-function init$18(packetver) {
+function init$19(packetver) {
 	length_list$2[100] = 55;
 	length_list$2[101] = 17;
 	length_list$2[102] = 3;
@@ -74424,12 +74617,12 @@ function init$18(packetver) {
 var length_list$2, packets2023_len_main_default;
 var init_packets2023_len_main = __esmMin((() => {
 	length_list$2 = new Array();
-	packets2023_len_main_default = { init: init$18 };
+	packets2023_len_main_default = { init: init$19 };
 }));
 //#endregion
 //#region src/Network/Packets/packets2024_len_main.js
 var packets2024_len_main_exports = /* @__PURE__ */ __exportAll({ default: () => packets2024_len_main_default });
-function init$17(packetver) {
+function init$18(packetver) {
 	length_list$1[100] = 55;
 	length_list$1[101] = 17;
 	length_list$1[102] = 3;
@@ -76135,12 +76328,12 @@ function init$17(packetver) {
 var length_list$1, packets2024_len_main_default;
 var init_packets2024_len_main = __esmMin((() => {
 	length_list$1 = new Array();
-	packets2024_len_main_default = { init: init$17 };
+	packets2024_len_main_default = { init: init$18 };
 }));
 //#endregion
 //#region src/Network/Packets/packets2025_len_main.js
 var packets2025_len_main_exports = /* @__PURE__ */ __exportAll({ default: () => packets2025_len_main_default });
-function init$16(packetver) {
+function init$17(packetver) {
 	length_list[100] = 55;
 	length_list[101] = 17;
 	length_list[102] = 3;
@@ -77886,7 +78079,1830 @@ function init$16(packetver) {
 var length_list, packets2025_len_main_default;
 var init_packets2025_len_main = __esmMin((() => {
 	length_list = new Array();
-	packets2025_len_main_default = { init: init$16 };
+	packets2025_len_main_default = { init: init$17 };
+}));
+//#endregion
+//#region src/Network/Packets/packets2026_len_main.js
+var packets2026_len_main_exports = /* @__PURE__ */ __exportAll({ default: () => packets2026_len_main_default });
+/**
+* Network/Packets/packets2026_len_main.js
+*
+* Network Packet Length
+* Manage packets length
+*
+* This file is part of ROBrowser, (http://www.robrowser.com/).
+*
+* Thanks to Andrei Karas (4144)
+*
+* @author Alison Serafim
+*/
+/**
+* kRO main Ragexe 2026-09-30 registration lengths establish framing only,
+* not packet fields or handlers. Original executable SHA-256:
+* 0c8586bf763053290163b9ce5e34bf08f43118032f8edb68a6139f4e307abe6c
+*
+* Keep the 2025 compatibility entries for dates before this verified build,
+* including legacy entries absent from its native registrations.
+*/
+function init$16(packetver) {
+	const length_list = new Array();
+	length_list[100] = 55;
+	length_list[101] = 17;
+	length_list[102] = 3;
+	length_list[103] = 37;
+	length_list[104] = 46;
+	length_list[105] = -1;
+	length_list[106] = 23;
+	length_list[107] = -1;
+	length_list[108] = 3;
+	length_list[109] = 157;
+	length_list[110] = 3;
+	length_list[111] = 2;
+	length_list[112] = 3;
+	length_list[113] = 28;
+	length_list[114] = 22;
+	length_list[115] = 11;
+	length_list[116] = 3;
+	length_list[117] = -1;
+	length_list[118] = 9;
+	length_list[119] = 5;
+	length_list[120] = 55;
+	length_list[121] = 53;
+	length_list[122] = 58;
+	length_list[123] = 60;
+	length_list[124] = 44;
+	length_list[125] = 2;
+	length_list[126] = 46;
+	length_list[127] = 6;
+	length_list[128] = 7;
+	length_list[129] = 3;
+	length_list[130] = 2;
+	length_list[131] = 2;
+	length_list[132] = 2;
+	length_list[133] = 10;
+	length_list[134] = 16;
+	length_list[135] = 12;
+	length_list[136] = 10;
+	length_list[137] = 11;
+	length_list[138] = 29;
+	length_list[139] = 23;
+	length_list[140] = 14;
+	length_list[141] = -1;
+	length_list[142] = -1;
+	length_list[144] = 7;
+	length_list[145] = 22;
+	length_list[146] = 28;
+	length_list[147] = 2;
+	length_list[148] = 19;
+	length_list[149] = 30;
+	length_list[150] = -1;
+	length_list[151] = -1;
+	length_list[152] = 3;
+	length_list[153] = -1;
+	length_list[154] = -1;
+	length_list[155] = 34;
+	length_list[156] = 9;
+	length_list[157] = 19;
+	length_list[158] = 19;
+	length_list[159] = 20;
+	length_list[160] = 33;
+	length_list[161] = 6;
+	length_list[162] = 14;
+	length_list[163] = -1;
+	length_list[164] = -1;
+	length_list[165] = -1;
+	length_list[166] = -1;
+	length_list[167] = 9;
+	length_list[168] = 7;
+	length_list[169] = 6;
+	length_list[170] = 9;
+	length_list[171] = 4;
+	length_list[172] = 7;
+	length_list[174] = -1;
+	length_list[175] = 6;
+	length_list[176] = 8;
+	length_list[177] = 8;
+	length_list[178] = 3;
+	length_list[179] = 3;
+	length_list[180] = -1;
+	length_list[181] = 6;
+	length_list[182] = 6;
+	length_list[183] = -1;
+	length_list[184] = 7;
+	length_list[185] = 6;
+	length_list[186] = 2;
+	length_list[187] = 5;
+	length_list[188] = 6;
+	length_list[189] = 44;
+	length_list[190] = 5;
+	length_list[191] = 3;
+	length_list[192] = 7;
+	length_list[193] = 2;
+	length_list[194] = 6;
+	length_list[195] = 8;
+	length_list[196] = 6;
+	length_list[197] = 7;
+	length_list[198] = -1;
+	length_list[199] = -1;
+	length_list[200] = -1;
+	length_list[201] = -1;
+	length_list[202] = 3;
+	length_list[203] = 3;
+	length_list[204] = 6;
+	length_list[205] = 3;
+	length_list[206] = 2;
+	length_list[207] = 27;
+	length_list[208] = 3;
+	length_list[209] = 4;
+	length_list[210] = 4;
+	length_list[211] = 2;
+	length_list[212] = -1;
+	length_list[213] = -1;
+	length_list[214] = 3;
+	length_list[215] = -1;
+	length_list[216] = 6;
+	length_list[217] = 14;
+	length_list[218] = 3;
+	length_list[219] = -1;
+	length_list[220] = 28;
+	length_list[221] = 29;
+	length_list[222] = -1;
+	length_list[223] = -1;
+	length_list[224] = 30;
+	length_list[225] = 30;
+	length_list[226] = 26;
+	length_list[227] = 2;
+	length_list[228] = 6;
+	length_list[229] = 26;
+	length_list[230] = 3;
+	length_list[231] = 3;
+	length_list[232] = 8;
+	length_list[233] = 29;
+	length_list[234] = 5;
+	length_list[235] = 2;
+	length_list[236] = 3;
+	length_list[237] = 2;
+	length_list[238] = 2;
+	length_list[239] = 2;
+	length_list[240] = 3;
+	length_list[241] = 2;
+	length_list[242] = 6;
+	length_list[243] = -1;
+	length_list[244] = 31;
+	length_list[245] = 11;
+	length_list[246] = 8;
+	length_list[247] = 17;
+	length_list[248] = 2;
+	length_list[249] = 26;
+	length_list[250] = 3;
+	length_list[251] = -1;
+	length_list[252] = 6;
+	length_list[253] = 27;
+	length_list[254] = 30;
+	length_list[255] = 10;
+	length_list[256] = 2;
+	length_list[257] = 6;
+	length_list[258] = 6;
+	length_list[259] = 30;
+	length_list[260] = 79;
+	length_list[261] = 31;
+	length_list[262] = 10;
+	length_list[263] = 10;
+	length_list[264] = -1;
+	length_list[265] = -1;
+	length_list[266] = 6;
+	length_list[267] = 6;
+	length_list[268] = 6;
+	length_list[269] = 2;
+	length_list[270] = 11;
+	length_list[271] = -1;
+	length_list[272] = 14;
+	length_list[273] = 39;
+	length_list[274] = 4;
+	length_list[275] = 25;
+	length_list[276] = 31;
+	length_list[277] = 35;
+	length_list[278] = 17;
+	length_list[279] = 18;
+	length_list[280] = 2;
+	length_list[281] = 13;
+	length_list[282] = 15;
+	length_list[283] = 20;
+	length_list[284] = 68;
+	length_list[285] = 2;
+	length_list[286] = 3;
+	length_list[287] = 16;
+	length_list[288] = 6;
+	length_list[289] = 14;
+	length_list[290] = -1;
+	length_list[291] = -1;
+	length_list[292] = 31;
+	length_list[293] = 8;
+	length_list[294] = 8;
+	length_list[295] = 8;
+	length_list[296] = 8;
+	length_list[297] = 8;
+	length_list[298] = 2;
+	length_list[299] = 2;
+	length_list[300] = 3;
+	length_list[301] = 4;
+	length_list[302] = 2;
+	length_list[303] = -1;
+	length_list[304] = 6;
+	length_list[305] = 86;
+	length_list[306] = 6;
+	length_list[307] = -1;
+	length_list[308] = -1;
+	length_list[309] = 7;
+	length_list[310] = -1;
+	length_list[311] = 6;
+	length_list[312] = 3;
+	length_list[313] = 16;
+	length_list[314] = 4;
+	length_list[315] = 4;
+	length_list[316] = 4;
+	length_list[317] = 6;
+	length_list[318] = 24;
+	length_list[319] = 26;
+	length_list[320] = 22;
+	length_list[321] = 14;
+	length_list[322] = 6;
+	length_list[323] = 10;
+	length_list[324] = 23;
+	length_list[325] = 19;
+	length_list[326] = 6;
+	length_list[327] = 39;
+	length_list[328] = 8;
+	length_list[329] = 9;
+	length_list[330] = 6;
+	length_list[331] = 27;
+	length_list[332] = -1;
+	length_list[333] = 2;
+	length_list[334] = 6;
+	length_list[335] = 6;
+	length_list[336] = 110;
+	length_list[337] = 6;
+	length_list[338] = -1;
+	length_list[339] = -1;
+	length_list[340] = -1;
+	length_list[341] = -1;
+	length_list[342] = -1;
+	length_list[343] = 6;
+	length_list[345] = 54;
+	length_list[346] = 66;
+	length_list[347] = 54;
+	length_list[348] = 90;
+	length_list[349] = 42;
+	length_list[350] = 6;
+	length_list[351] = 42;
+	length_list[352] = -1;
+	length_list[353] = -1;
+	length_list[354] = -1;
+	length_list[355] = -1;
+	length_list[356] = -1;
+	length_list[357] = 30;
+	length_list[358] = -1;
+	length_list[359] = 3;
+	length_list[360] = 14;
+	length_list[361] = 3;
+	length_list[362] = 30;
+	length_list[363] = 10;
+	length_list[364] = 43;
+	length_list[365] = 14;
+	length_list[366] = 186;
+	length_list[367] = 182;
+	length_list[368] = 14;
+	length_list[369] = 30;
+	length_list[370] = 10;
+	length_list[371] = 3;
+	length_list[372] = -1;
+	length_list[373] = 6;
+	length_list[374] = 106;
+	length_list[375] = -1;
+	length_list[376] = 4;
+	length_list[377] = 5;
+	length_list[378] = 4;
+	length_list[379] = -1;
+	length_list[380] = 6;
+	length_list[381] = 7;
+	length_list[382] = -1;
+	length_list[383] = -1;
+	length_list[384] = 6;
+	length_list[385] = 3;
+	length_list[386] = 106;
+	length_list[387] = 10;
+	length_list[388] = 10;
+	length_list[389] = 34;
+	length_list[391] = 6;
+	length_list[392] = 8;
+	length_list[393] = 4;
+	length_list[394] = 4;
+	length_list[395] = 4;
+	length_list[396] = 29;
+	length_list[397] = -1;
+	length_list[398] = 18;
+	length_list[399] = 8;
+	length_list[400] = 23;
+	length_list[401] = 27;
+	length_list[402] = 24;
+	length_list[403] = 2;
+	length_list[404] = 30;
+	length_list[405] = 102;
+	length_list[406] = 9;
+	length_list[407] = 4;
+	length_list[408] = 8;
+	length_list[409] = 4;
+	length_list[410] = 14;
+	length_list[411] = 10;
+	length_list[412] = -1;
+	length_list[413] = 6;
+	length_list[414] = 2;
+	length_list[415] = 6;
+	length_list[416] = 3;
+	length_list[417] = 3;
+	length_list[418] = 37;
+	length_list[419] = 7;
+	length_list[420] = 11;
+	length_list[421] = 26;
+	length_list[422] = -1;
+	length_list[423] = 4;
+	length_list[424] = 4;
+	length_list[425] = 6;
+	length_list[426] = 10;
+	length_list[427] = 12;
+	length_list[428] = 6;
+	length_list[429] = -1;
+	length_list[430] = 6;
+	length_list[431] = 4;
+	length_list[432] = 11;
+	length_list[433] = 7;
+	length_list[434] = -1;
+	length_list[435] = 67;
+	length_list[436] = 12;
+	length_list[437] = 18;
+	length_list[438] = 114;
+	length_list[439] = 6;
+	length_list[440] = 3;
+	length_list[441] = 6;
+	length_list[442] = 26;
+	length_list[443] = 26;
+	length_list[444] = 26;
+	length_list[445] = 26;
+	length_list[446] = 2;
+	length_list[447] = 3;
+	length_list[448] = 2;
+	length_list[449] = 14;
+	length_list[450] = 10;
+	length_list[451] = -1;
+	length_list[452] = 32;
+	length_list[453] = 32;
+	length_list[454] = 4;
+	length_list[455] = 2;
+	length_list[456] = 15;
+	length_list[457] = 97;
+	length_list[458] = 3;
+	length_list[459] = 9;
+	length_list[460] = 9;
+	length_list[461] = 30;
+	length_list[462] = 6;
+	length_list[463] = 28;
+	length_list[464] = 8;
+	length_list[465] = 14;
+	length_list[466] = 10;
+	length_list[467] = 35;
+	length_list[468] = 6;
+	length_list[469] = -1;
+	length_list[470] = 4;
+	length_list[471] = 15;
+	length_list[472] = 58;
+	length_list[473] = 57;
+	length_list[474] = 64;
+	length_list[475] = 2;
+	length_list[476] = -1;
+	length_list[477] = 47;
+	length_list[478] = 33;
+	length_list[479] = 6;
+	length_list[480] = 30;
+	length_list[481] = 8;
+	length_list[482] = 34;
+	length_list[483] = 14;
+	length_list[484] = 2;
+	length_list[485] = 6;
+	length_list[486] = 26;
+	length_list[487] = 2;
+	length_list[488] = 28;
+	length_list[489] = 81;
+	length_list[490] = 6;
+	length_list[491] = 10;
+	length_list[492] = 26;
+	length_list[493] = 2;
+	length_list[494] = -1;
+	length_list[495] = -1;
+	length_list[496] = -1;
+	length_list[497] = -1;
+	length_list[498] = 20;
+	length_list[499] = 10;
+	length_list[500] = 32;
+	length_list[501] = 9;
+	length_list[502] = 34;
+	length_list[503] = 14;
+	length_list[504] = 2;
+	length_list[505] = 6;
+	length_list[506] = 48;
+	length_list[507] = 56;
+	length_list[508] = -1;
+	length_list[509] = 25;
+	length_list[510] = 5;
+	length_list[511] = 10;
+	length_list[512] = 26;
+	length_list[513] = -1;
+	length_list[514] = 26;
+	length_list[515] = 10;
+	length_list[516] = 18;
+	length_list[517] = 26;
+	length_list[518] = 35;
+	length_list[519] = 34;
+	length_list[520] = 14;
+	length_list[521] = 36;
+	length_list[522] = 10;
+	length_list[525] = -1;
+	length_list[526] = 32;
+	length_list[530] = 26;
+	length_list[531] = 26;
+	length_list[532] = 42;
+	length_list[533] = 6;
+	length_list[534] = 6;
+	length_list[535] = 2;
+	length_list[536] = 2;
+	length_list[537] = 282;
+	length_list[538] = 282;
+	length_list[539] = 10;
+	length_list[540] = 10;
+	length_list[541] = 6;
+	length_list[542] = 6;
+	length_list[543] = 66;
+	length_list[544] = 10;
+	length_list[545] = -1;
+	length_list[546] = 6;
+	length_list[547] = 10;
+	length_list[548] = 10;
+	length_list[549] = 2;
+	length_list[550] = 282;
+	length_list[551] = 18;
+	length_list[552] = 18;
+	length_list[553] = 15;
+	length_list[554] = 62;
+	length_list[555] = 61;
+	length_list[556] = 69;
+	length_list[557] = 5;
+	length_list[558] = 73;
+	length_list[559] = 7;
+	length_list[560] = 12;
+	length_list[561] = 26;
+	length_list[562] = 9;
+	length_list[563] = 11;
+	length_list[564] = 6;
+	length_list[565] = -1;
+	length_list[566] = 10;
+	length_list[567] = 2;
+	length_list[568] = 282;
+	length_list[569] = 11;
+	length_list[570] = 4;
+	length_list[571] = 36;
+	length_list[572] = 6;
+	length_list[573] = 6;
+	length_list[574] = 8;
+	length_list[575] = 2;
+	length_list[576] = -1;
+	length_list[577] = 6;
+	length_list[578] = -1;
+	length_list[579] = 6;
+	length_list[580] = 6;
+	length_list[581] = 3;
+	length_list[582] = 4;
+	length_list[583] = 8;
+	length_list[584] = -1;
+	length_list[585] = 3;
+	length_list[586] = 70;
+	length_list[587] = 4;
+	length_list[588] = 8;
+	length_list[589] = 12;
+	length_list[590] = 6;
+	length_list[591] = 10;
+	length_list[592] = 3;
+	length_list[593] = 34;
+	length_list[594] = -1;
+	length_list[595] = 3;
+	length_list[596] = 3;
+	length_list[597] = 5;
+	length_list[598] = 5;
+	length_list[599] = 8;
+	length_list[600] = 2;
+	length_list[601] = 3;
+	length_list[602] = -1;
+	length_list[603] = 8;
+	length_list[604] = 4;
+	length_list[605] = 6;
+	length_list[606] = 4;
+	length_list[607] = 6;
+	length_list[608] = 6;
+	length_list[609] = 11;
+	length_list[610] = 11;
+	length_list[611] = 11;
+	length_list[612] = 20;
+	length_list[613] = 20;
+	length_list[614] = 30;
+	length_list[615] = 4;
+	length_list[616] = 4;
+	length_list[617] = 4;
+	length_list[618] = 4;
+	length_list[619] = 4;
+	length_list[620] = 4;
+	length_list[621] = 4;
+	length_list[623] = 2;
+	length_list[624] = 2;
+	length_list[625] = 40;
+	length_list[626] = 44;
+	length_list[627] = 30;
+	length_list[628] = 8;
+	length_list[629] = 37;
+	length_list[630] = -1;
+	length_list[631] = 84;
+	length_list[632] = 2;
+	length_list[633] = 2;
+	length_list[634] = -1;
+	length_list[635] = 14;
+	length_list[636] = 60;
+	length_list[637] = 62;
+	length_list[638] = -1;
+	length_list[639] = 8;
+	length_list[640] = 12;
+	length_list[641] = 4;
+	length_list[642] = 284;
+	length_list[643] = 6;
+	length_list[644] = 14;
+	length_list[645] = 6;
+	length_list[646] = 4;
+	length_list[647] = -1;
+	length_list[648] = -1;
+	length_list[649] = 12;
+	length_list[650] = 18;
+	length_list[651] = -1;
+	length_list[652] = 46;
+	length_list[653] = 34;
+	length_list[654] = 4;
+	length_list[655] = 6;
+	length_list[656] = 4;
+	length_list[657] = 4;
+	length_list[658] = 2;
+	length_list[659] = 70;
+	length_list[660] = 10;
+	length_list[661] = -1;
+	length_list[662] = -1;
+	length_list[663] = -1;
+	length_list[664] = 10;
+	length_list[665] = 8;
+	length_list[666] = 37;
+	length_list[667] = 80;
+	length_list[668] = 66;
+	length_list[669] = -1;
+	length_list[670] = 11;
+	length_list[671] = 3;
+	length_list[674] = 8;
+	length_list[677] = 8;
+	length_list[678] = -1;
+	length_list[679] = -1;
+	length_list[682] = 4;
+	length_list[683] = 36;
+	length_list[684] = 6;
+	length_list[685] = 8;
+	length_list[688] = 85;
+	length_list[689] = -1;
+	length_list[690] = -1;
+	length_list[691] = 107;
+	length_list[692] = 6;
+	length_list[693] = -1;
+	length_list[694] = 7;
+	length_list[695] = 7;
+	length_list[696] = 32;
+	length_list[697] = 191;
+	length_list[698] = 11;
+	length_list[699] = 8;
+	length_list[700] = 6;
+	length_list[705] = -1;
+	length_list[706] = -1;
+	length_list[708] = 26;
+	length_list[709] = 30;
+	length_list[710] = 30;
+	length_list[711] = 7;
+	length_list[712] = 3;
+	length_list[713] = 3;
+	length_list[714] = 3;
+	length_list[715] = 65;
+	length_list[716] = 4;
+	length_list[717] = 71;
+	length_list[718] = 10;
+	length_list[719] = 6;
+	length_list[720] = -1;
+	length_list[721] = -1;
+	length_list[722] = -1;
+	length_list[723] = 4;
+	length_list[724] = 39;
+	length_list[725] = 2;
+	length_list[726] = 6;
+	length_list[727] = -1;
+	length_list[728] = 10;
+	length_list[729] = 10;
+	length_list[730] = 3;
+	length_list[731] = -1;
+	length_list[732] = -1;
+	length_list[733] = 32;
+	length_list[734] = 6;
+	length_list[735] = 36;
+	length_list[736] = 34;
+	length_list[737] = 33;
+	length_list[738] = 20;
+	length_list[739] = 22;
+	length_list[740] = 11;
+	length_list[741] = 9;
+	length_list[742] = 6;
+	length_list[743] = -1;
+	length_list[744] = -1;
+	length_list[745] = -1;
+	length_list[746] = -1;
+	length_list[747] = 13;
+	length_list[748] = 71;
+	length_list[749] = 63;
+	length_list[750] = 64;
+	length_list[751] = 8;
+	length_list[752] = 10;
+	length_list[753] = 2;
+	length_list[754] = 2;
+	length_list[755] = -1;
+	length_list[756] = 3;
+	length_list[757] = 7;
+	length_list[758] = 7;
+	length_list[759] = 47;
+	length_list[760] = -1;
+	length_list[761] = -1;
+	length_list[860] = 2;
+	length_list[861] = -1;
+	length_list[862] = 2;
+	length_list[863] = 5;
+	length_list[864] = 6;
+	length_list[865] = 5;
+	length_list[866] = 6;
+	length_list[867] = 6;
+	length_list[868] = 8;
+	length_list[869] = 8;
+	length_list[870] = 10;
+	length_list[871] = 31;
+	length_list[872] = 6;
+	length_list[873] = 6;
+	length_list[989] = 18;
+	length_list[990] = 18;
+	length_list[1078] = 23;
+	length_list[1079] = 7;
+	length_list[1080] = 10;
+	length_list[1081] = 8;
+	length_list[1085] = 8;
+	length_list[1086] = -1;
+	length_list[1087] = 25;
+	length_list[1088] = 10;
+	length_list[1089] = 4;
+	length_list[1090] = -1;
+	length_list[1091] = 8;
+	length_list[1092] = -1;
+	length_list[1093] = 12;
+	length_list[1094] = 14;
+	length_list[1095] = 2;
+	length_list[1096] = -1;
+	length_list[1097] = 4;
+	length_list[1098] = 6;
+	length_list[1099] = 2;
+	length_list[2007] = 8;
+	length_list[2008] = 8;
+	length_list[2009] = 268;
+	length_list[2010] = 6;
+	length_list[2011] = 8;
+	length_list[2012] = 6;
+	length_list[2013] = 54;
+	length_list[2014] = 30;
+	length_list[2015] = 54;
+	length_list[2016] = 58;
+	length_list[2017] = 15;
+	length_list[2018] = 8;
+	length_list[2019] = 6;
+	length_list[2020] = -1;
+	length_list[2021] = 4;
+	length_list[2022] = 8;
+	length_list[2023] = 32;
+	length_list[2024] = -1;
+	length_list[2025] = 5;
+	length_list[2026] = 2;
+	length_list[2027] = -1;
+	length_list[2028] = 8;
+	length_list[2029] = 10;
+	length_list[2030] = 6;
+	length_list[2031] = 8;
+	length_list[2032] = 6;
+	length_list[2033] = 18;
+	length_list[2034] = 8;
+	length_list[2035] = 6;
+	length_list[2036] = 3;
+	length_list[2037] = 6;
+	length_list[2038] = 14;
+	length_list[2039] = -1;
+	length_list[2040] = -1;
+	length_list[2041] = -1;
+	length_list[2042] = 8;
+	length_list[2043] = 25;
+	length_list[2044] = 10;
+	length_list[2045] = -1;
+	length_list[2046] = 26;
+	length_list[2048] = -1;
+	length_list[2049] = -1;
+	length_list[2050] = 18;
+	length_list[2051] = 4;
+	length_list[2052] = 14;
+	length_list[2053] = -1;
+	length_list[2054] = 2;
+	length_list[2055] = 4;
+	length_list[2056] = 14;
+	length_list[2057] = 50;
+	length_list[2058] = 18;
+	length_list[2059] = 6;
+	length_list[2060] = 2;
+	length_list[2061] = 3;
+	length_list[2062] = 14;
+	length_list[2063] = 30;
+	length_list[2064] = 3;
+	length_list[2065] = -1;
+	length_list[2066] = 8;
+	length_list[2067] = -1;
+	length_list[2068] = 86;
+	length_list[2069] = 2;
+	length_list[2070] = 6;
+	length_list[2071] = 6;
+	length_list[2072] = -1;
+	length_list[2073] = -1;
+	length_list[2074] = 4;
+	length_list[2075] = 12;
+	length_list[2076] = 10;
+	length_list[2077] = 22;
+	length_list[2078] = 8;
+	length_list[2079] = -1;
+	length_list[2080] = 11;
+	length_list[2081] = 2;
+	length_list[2082] = 9;
+	length_list[2083] = -1;
+	length_list[2084] = 8;
+	length_list[2085] = -1;
+	length_list[2087] = 6;
+	length_list[2088] = 14;
+	length_list[2089] = 12;
+	length_list[2090] = 10;
+	length_list[2091] = 6;
+	length_list[2092] = 10;
+	length_list[2093] = -1;
+	length_list[2101] = -1;
+	length_list[2102] = -1;
+	length_list[2103] = 3;
+	length_list[2104] = 2;
+	length_list[2105] = 66;
+	length_list[2106] = 5;
+	length_list[2107] = 2;
+	length_list[2108] = 14;
+	length_list[2109] = 6;
+	length_list[2110] = 26;
+	length_list[2112] = -1;
+	length_list[2113] = 4;
+	length_list[2114] = 6;
+	length_list[2115] = 6;
+	length_list[2116] = 2;
+	length_list[2117] = 10;
+	length_list[2118] = 4;
+	length_list[2119] = -1;
+	length_list[2120] = -1;
+	length_list[2121] = 16;
+	length_list[2122] = 2;
+	length_list[2123] = 21;
+	length_list[2124] = 10;
+	length_list[2125] = 10;
+	length_list[2126] = 5;
+	length_list[2127] = 6;
+	length_list[2128] = 7;
+	length_list[2129] = -1;
+	length_list[2130] = 2;
+	length_list[2131] = -1;
+	length_list[2132] = -1;
+	length_list[2133] = 6;
+	length_list[2134] = -1;
+	length_list[2135] = -1;
+	length_list[2136] = -1;
+	length_list[2137] = -1;
+	length_list[2138] = 2;
+	length_list[2139] = 2;
+	length_list[2140] = 2;
+	length_list[2141] = 2;
+	length_list[2142] = 2;
+	length_list[2143] = 2;
+	length_list[2144] = 2;
+	length_list[2145] = 2;
+	length_list[2146] = 2;
+	length_list[2147] = 2;
+	length_list[2148] = 2;
+	length_list[2149] = 2;
+	length_list[2150] = 2;
+	length_list[2151] = 2;
+	length_list[2152] = 2;
+	length_list[2153] = 2;
+	length_list[2154] = 2;
+	length_list[2155] = 2;
+	length_list[2156] = 2;
+	length_list[2157] = 2;
+	length_list[2158] = 2;
+	length_list[2159] = 2;
+	length_list[2160] = 2;
+	length_list[2161] = 2;
+	length_list[2162] = 2;
+	length_list[2163] = 2;
+	length_list[2164] = 2;
+	length_list[2165] = 2;
+	length_list[2166] = 2;
+	length_list[2167] = 2;
+	length_list[2168] = 2;
+	length_list[2169] = 2;
+	length_list[2170] = 2;
+	length_list[2171] = 2;
+	length_list[2172] = 2;
+	length_list[2173] = 2;
+	length_list[2174] = 2;
+	length_list[2175] = 2;
+	length_list[2176] = 2;
+	length_list[2177] = 2;
+	length_list[2178] = 2;
+	length_list[2179] = 2;
+	length_list[2180] = 2;
+	length_list[2181] = 2;
+	length_list[2182] = 2;
+	length_list[2183] = 2;
+	length_list[2184] = 2;
+	length_list[2185] = 2;
+	length_list[2186] = 2;
+	length_list[2187] = 2;
+	length_list[2188] = 2;
+	length_list[2189] = 2;
+	length_list[2190] = 2;
+	length_list[2191] = 2;
+	length_list[2192] = 2;
+	length_list[2193] = 2;
+	length_list[2194] = 2;
+	length_list[2195] = 2;
+	length_list[2196] = 2;
+	length_list[2197] = 2;
+	length_list[2198] = 2;
+	length_list[2199] = 2;
+	length_list[2200] = 2;
+	length_list[2201] = 2;
+	length_list[2202] = 2;
+	length_list[2203] = 2;
+	length_list[2204] = 2;
+	length_list[2205] = 2;
+	length_list[2206] = 2;
+	length_list[2207] = 2;
+	length_list[2208] = 2;
+	length_list[2209] = 2;
+	length_list[2210] = 2;
+	length_list[2211] = 2;
+	length_list[2212] = 2;
+	length_list[2213] = 2;
+	length_list[2214] = 2;
+	length_list[2215] = 2;
+	length_list[2216] = 2;
+	length_list[2217] = 2;
+	length_list[2218] = 2;
+	length_list[2219] = 2;
+	length_list[2220] = 2;
+	length_list[2221] = 2;
+	length_list[2223] = 10;
+	length_list[2224] = 17;
+	length_list[2225] = -1;
+	length_list[2226] = -1;
+	length_list[2227] = -1;
+	length_list[2228] = 2;
+	length_list[2229] = 6;
+	length_list[2230] = 3;
+	length_list[2232] = 10;
+	length_list[2233] = 12;
+	length_list[2234] = 10;
+	length_list[2235] = 8;
+	length_list[2236] = 10;
+	length_list[2237] = 8;
+	length_list[2238] = 14;
+	length_list[2239] = 8;
+	length_list[2240] = -1;
+	length_list[2241] = 2;
+	length_list[2242] = 2;
+	length_list[2243] = 10;
+	length_list[2244] = 8;
+	length_list[2245] = 6;
+	length_list[2246] = 4;
+	length_list[2247] = -1;
+	length_list[2248] = 34;
+	length_list[2249] = 2;
+	length_list[2250] = -1;
+	length_list[2251] = -1;
+	length_list[2252] = 109;
+	length_list[2253] = 10;
+	length_list[2254] = 2;
+	length_list[2255] = 10;
+	length_list[2256] = 9;
+	length_list[2257] = 7;
+	length_list[2258] = 10;
+	length_list[2259] = 10;
+	length_list[2260] = 8;
+	length_list[2261] = -1;
+	length_list[2262] = 6;
+	length_list[2263] = 28;
+	length_list[2264] = 27;
+	length_list[2265] = 30;
+	length_list[2266] = 26;
+	length_list[2267] = 27;
+	length_list[2268] = 26;
+	length_list[2269] = 27;
+	length_list[2270] = 27;
+	length_list[2271] = 50;
+	length_list[2272] = 51;
+	length_list[2273] = 51;
+	length_list[2274] = 27;
+	length_list[2275] = 157;
+	length_list[2276] = 6;
+	length_list[2300] = 30;
+	length_list[2301] = 6;
+	length_list[2302] = -1;
+	length_list[2303] = 24;
+	length_list[2304] = -1;
+	length_list[2305] = -1;
+	length_list[2306] = -1;
+	length_list[2307] = -1;
+	length_list[2308] = -1;
+	length_list[2309] = -1;
+	length_list[2310] = -1;
+	length_list[2311] = 5;
+	length_list[2312] = 5;
+	length_list[2314] = 26;
+	length_list[2317] = -1;
+	length_list[2318] = 2;
+	length_list[2319] = -1;
+	length_list[2320] = 10;
+	length_list[2321] = 30;
+	length_list[2322] = 10;
+	length_list[2323] = 30;
+	length_list[2324] = -1;
+	length_list[2325] = -1;
+	length_list[2326] = 26;
+	length_list[2327] = 2;
+	length_list[2328] = 2;
+	length_list[2329] = 2;
+	length_list[2330] = 2;
+	length_list[2331] = 2;
+	length_list[2332] = 2;
+	length_list[2333] = 2;
+	length_list[2334] = 2;
+	length_list[2335] = 2;
+	length_list[2336] = 2;
+	length_list[2337] = 2;
+	length_list[2338] = 2;
+	length_list[2339] = 2;
+	length_list[2340] = 2;
+	length_list[2341] = 2;
+	length_list[2342] = 2;
+	length_list[2343] = 2;
+	length_list[2344] = 2;
+	length_list[2345] = 2;
+	length_list[2346] = 2;
+	length_list[2347] = 2;
+	length_list[2348] = 2;
+	length_list[2349] = 2;
+	length_list[2350] = 2;
+	length_list[2351] = 2;
+	length_list[2352] = 2;
+	length_list[2353] = 2;
+	length_list[2354] = 2;
+	length_list[2355] = 2;
+	length_list[2356] = 2;
+	length_list[2357] = 2;
+	length_list[2358] = 2;
+	length_list[2359] = 2;
+	length_list[2360] = 2;
+	length_list[2361] = 2;
+	length_list[2362] = 2;
+	length_list[2363] = 2;
+	length_list[2364] = 2;
+	length_list[2365] = 2;
+	length_list[2366] = 2;
+	length_list[2367] = 2;
+	length_list[2368] = 2;
+	length_list[2369] = 2;
+	length_list[2370] = 2;
+	length_list[2371] = 2;
+	length_list[2372] = 2;
+	length_list[2373] = 2;
+	length_list[2374] = 2;
+	length_list[2375] = 2;
+	length_list[2376] = 2;
+	length_list[2377] = 2;
+	length_list[2378] = 2;
+	length_list[2379] = 2;
+	length_list[2380] = 2;
+	length_list[2381] = 2;
+	length_list[2382] = 2;
+	length_list[2383] = 2;
+	length_list[2384] = 2;
+	length_list[2385] = 2;
+	length_list[2386] = 2;
+	length_list[2387] = 2;
+	length_list[2388] = 2;
+	length_list[2389] = 2;
+	length_list[2390] = 2;
+	length_list[2391] = 2;
+	length_list[2392] = 2;
+	length_list[2393] = 2;
+	length_list[2394] = 2;
+	length_list[2395] = 2;
+	length_list[2396] = 2;
+	length_list[2397] = 2;
+	length_list[2398] = 2;
+	length_list[2399] = 2;
+	length_list[2400] = 2;
+	length_list[2401] = 2;
+	length_list[2402] = 2;
+	length_list[2403] = 2;
+	length_list[2404] = 2;
+	length_list[2405] = 2;
+	length_list[2406] = 2;
+	length_list[2407] = 2;
+	length_list[2408] = 2;
+	length_list[2409] = 2;
+	length_list[2410] = 2;
+	length_list[2411] = 4;
+	length_list[2412] = 6;
+	length_list[2413] = -1;
+	length_list[2414] = -1;
+	length_list[2415] = 7;
+	length_list[2416] = 31;
+	length_list[2417] = 6;
+	length_list[2418] = -1;
+	length_list[2419] = 7;
+	length_list[2420] = 2;
+	length_list[2421] = -1;
+	length_list[2422] = -1;
+	length_list[2423] = 14;
+	length_list[2424] = 6;
+	length_list[2425] = 50;
+	length_list[2426] = -1;
+	length_list[2427] = -1;
+	length_list[2428] = 4;
+	length_list[2429] = 288;
+	length_list[2430] = 12;
+	length_list[2431] = -1;
+	length_list[2432] = 7;
+	length_list[2433] = -1;
+	length_list[2434] = 7;
+	length_list[2435] = 29;
+	length_list[2436] = 28;
+	length_list[2437] = -1;
+	length_list[2438] = 10;
+	length_list[2439] = -1;
+	length_list[2440] = 6;
+	length_list[2441] = 2;
+	length_list[2442] = -1;
+	length_list[2443] = 2;
+	length_list[2444] = 4;
+	length_list[2445] = -1;
+	length_list[2446] = -1;
+	length_list[2447] = -1;
+	length_list[2448] = 41;
+	length_list[2449] = -1;
+	length_list[2450] = -1;
+	length_list[2451] = -1;
+	length_list[2452] = -1;
+	length_list[2453] = -1;
+	length_list[2454] = -1;
+	length_list[2455] = -1;
+	length_list[2456] = 8;
+	length_list[2457] = 11;
+	length_list[2458] = 9;
+	length_list[2459] = 8;
+	length_list[2460] = 6;
+	length_list[2461] = -1;
+	length_list[2462] = 12;
+	length_list[2463] = -1;
+	length_list[2464] = 6;
+	length_list[2465] = 2;
+	length_list[2466] = 6;
+	length_list[2467] = -1;
+	length_list[2468] = 18;
+	length_list[2469] = 7;
+	length_list[2470] = 12;
+	length_list[2471] = 10;
+	length_list[2472] = 16;
+	length_list[2473] = 10;
+	length_list[2474] = 16;
+	length_list[2475] = 6;
+	length_list[2476] = -1;
+	length_list[2477] = 12;
+	length_list[2478] = 19;
+	length_list[2479] = 4;
+	length_list[2480] = 10;
+	length_list[2481] = 4;
+	length_list[2482] = 10;
+	length_list[2483] = 6;
+	length_list[2484] = 6;
+	length_list[2485] = 2;
+	length_list[2486] = 6;
+	length_list[2487] = 4;
+	length_list[2488] = 6;
+	length_list[2489] = 4;
+	length_list[2490] = 2;
+	length_list[2491] = 6;
+	length_list[2492] = 6;
+	length_list[2493] = 2;
+	length_list[2494] = 2;
+	length_list[2495] = 4;
+	length_list[2497] = 10;
+	length_list[2498] = -1;
+	length_list[2499] = 10;
+	length_list[2500] = 10;
+	length_list[2501] = 1042;
+	length_list[2502] = -1;
+	length_list[2503] = 18;
+	length_list[2504] = -1;
+	length_list[2505] = -1;
+	length_list[2506] = -1;
+	length_list[2507] = 17;
+	length_list[2508] = -1;
+	length_list[2509] = 8;
+	length_list[2510] = 102;
+	length_list[2511] = -1;
+	length_list[2512] = -1;
+	length_list[2513] = 14;
+	length_list[2514] = -1;
+	length_list[2515] = -1;
+	length_list[2516] = 2;
+	length_list[2517] = -1;
+	length_list[2518] = -1;
+	length_list[2519] = -1;
+	length_list[2520] = 2;
+	length_list[2521] = 4;
+	length_list[2522] = -1;
+	length_list[2523] = -1;
+	length_list[2524] = -1;
+	length_list[2525] = -1;
+	length_list[2526] = -1;
+	length_list[2527] = 7;
+	length_list[2528] = -1;
+	length_list[2529] = 8;
+	length_list[2530] = 8;
+	length_list[2531] = 8;
+	length_list[2532] = 8;
+	length_list[2533] = 18;
+	length_list[2534] = 24;
+	length_list[2535] = 3;
+	length_list[2536] = 11;
+	length_list[2537] = 2;
+	length_list[2538] = 11;
+	length_list[2539] = -1;
+	length_list[2540] = -1;
+	length_list[2541] = 3;
+	length_list[2542] = 11;
+	length_list[2543] = 11;
+	length_list[2544] = -1;
+	length_list[2545] = 11;
+	length_list[2546] = 12;
+	length_list[2547] = 11;
+	length_list[2548] = 12;
+	length_list[2549] = 11;
+	length_list[2550] = 11;
+	length_list[2551] = 77;
+	length_list[2552] = -1;
+	length_list[2553] = 143;
+	length_list[2554] = -1;
+	length_list[2555] = -1;
+	length_list[2556] = 6;
+	length_list[2557] = -1;
+	length_list[2558] = -1;
+	length_list[2559] = -1;
+	length_list[2560] = 269;
+	length_list[2561] = 3;
+	length_list[2562] = 4;
+	length_list[2563] = 2;
+	length_list[2564] = 6;
+	length_list[2565] = 63;
+	length_list[2566] = 6;
+	length_list[2567] = 9;
+	length_list[2568] = 26;
+	length_list[2569] = 55;
+	length_list[2570] = 57;
+	length_list[2571] = 57;
+	length_list[2572] = 66;
+	length_list[2573] = -1;
+	length_list[2574] = 14;
+	length_list[2575] = -1;
+	length_list[2576] = -1;
+	length_list[2577] = -1;
+	length_list[2578] = 27;
+	length_list[2579] = 26;
+	length_list[2580] = 10;
+	length_list[2581] = 12;
+	length_list[2582] = 26;
+	length_list[2583] = 6;
+	length_list[2584] = 14;
+	length_list[2585] = 2;
+	length_list[2586] = 25;
+	length_list[2587] = 2;
+	length_list[2588] = -1;
+	length_list[2589] = 2;
+	length_list[2590] = 3;
+	length_list[2591] = 2;
+	length_list[2592] = 23;
+	length_list[2593] = 3;
+	length_list[2594] = 7;
+	length_list[2595] = -1;
+	length_list[2596] = 66;
+	length_list[2597] = 6;
+	length_list[2598] = 7;
+	length_list[2599] = 8;
+	length_list[2600] = 3;
+	length_list[2601] = 6;
+	length_list[2602] = 6;
+	length_list[2603] = 14;
+	length_list[2604] = 12;
+	length_list[2605] = -1;
+	length_list[2606] = 6;
+	length_list[2607] = 7;
+	length_list[2608] = 106;
+	length_list[2609] = -1;
+	length_list[2610] = 2;
+	length_list[2611] = 7;
+	length_list[2612] = 6;
+	length_list[2613] = 4;
+	length_list[2614] = 7;
+	length_list[2615] = 69;
+	length_list[2616] = 3;
+	length_list[2617] = 36;
+	length_list[2618] = 12;
+	length_list[2619] = -1;
+	length_list[2620] = -1;
+	length_list[2621] = 20;
+	length_list[2622] = -1;
+	length_list[2623] = 11;
+	length_list[2624] = 11;
+	length_list[2625] = 18;
+	length_list[2626] = 43;
+	length_list[2627] = 85;
+	length_list[2628] = -1;
+	length_list[2630] = 14;
+	length_list[2631] = 3;
+	length_list[2632] = 2;
+	length_list[2633] = 22;
+	length_list[2634] = 6;
+	length_list[2635] = 22;
+	length_list[2636] = 28;
+	length_list[2637] = -1;
+	length_list[2638] = 6;
+	length_list[2639] = -1;
+	length_list[2640] = 4;
+	length_list[2641] = 34;
+	length_list[2642] = 20;
+	length_list[2643] = 10;
+	length_list[2644] = -1;
+	length_list[2645] = 2;
+	length_list[2646] = 6;
+	length_list[2647] = 6;
+	length_list[2648] = 8;
+	length_list[2649] = -1;
+	length_list[2650] = 2;
+	length_list[2651] = 7;
+	length_list[2652] = 18;
+	length_list[2653] = 6;
+	length_list[2654] = 26;
+	length_list[2655] = 8;
+	length_list[2656] = 3;
+	length_list[2664] = 3;
+	length_list[2665] = 6;
+	length_list[2666] = 12;
+	length_list[2667] = -1;
+	length_list[2668] = 7;
+	length_list[2669] = -1;
+	length_list[2670] = -1;
+	length_list[2671] = -1;
+	length_list[2672] = 2;
+	length_list[2673] = -1;
+	length_list[2674] = 61;
+	length_list[2675] = 2;
+	length_list[2676] = 8;
+	length_list[2678] = 80;
+	length_list[2679] = 15;
+	length_list[2680] = 15;
+	length_list[2681] = -1;
+	length_list[2683] = -1;
+	length_list[2684] = -1;
+	length_list[2685] = -1;
+	length_list[2686] = -1;
+	length_list[2687] = -1;
+	length_list[2688] = 6;
+	length_list[2689] = 4;
+	length_list[2690] = 46;
+	length_list[2691] = 46;
+	length_list[2692] = 94;
+	length_list[2693] = 82;
+	length_list[2694] = -1;
+	length_list[2695] = -1;
+	length_list[2696] = 2;
+	length_list[2697] = 61;
+	length_list[2698] = 6;
+	length_list[2699] = 2;
+	length_list[2700] = 2;
+	length_list[2701] = -1;
+	length_list[2702] = 2;
+	length_list[2703] = 2;
+	length_list[2704] = 3;
+	length_list[2705] = -1;
+	length_list[2706] = -1;
+	length_list[2707] = 3;
+	length_list[2708] = 2;
+	length_list[2709] = 4;
+	length_list[2710] = 61;
+	length_list[2711] = 8;
+	length_list[2712] = 10;
+	length_list[2713] = 4;
+	length_list[2714] = 10;
+	length_list[2715] = -1;
+	length_list[2716] = 2;
+	length_list[2717] = 4;
+	length_list[2718] = 2;
+	length_list[2719] = 2;
+	length_list[2720] = 2;
+	length_list[2721] = 4;
+	length_list[2722] = -1;
+	length_list[2723] = 9;
+	length_list[2724] = 2;
+	length_list[2725] = -1;
+	length_list[2726] = 36;
+	length_list[2727] = 6;
+	length_list[2728] = 5;
+	length_list[2729] = -1;
+	length_list[2730] = -1;
+	length_list[2731] = -1;
+	length_list[2732] = 69;
+	length_list[2733] = 51;
+	length_list[2734] = 2;
+	length_list[2735] = 6;
+	length_list[2736] = 6;
+	length_list[2737] = 14;
+	length_list[2738] = 7;
+	length_list[2739] = 19;
+	length_list[2740] = 6;
+	length_list[2741] = 2;
+	length_list[2742] = 8;
+	length_list[2743] = 4;
+	length_list[2744] = 2;
+	length_list[2745] = 47;
+	length_list[2746] = 2;
+	length_list[2747] = 2;
+	length_list[2748] = -1;
+	length_list[2749] = 10;
+	length_list[2750] = -1;
+	length_list[2751] = -1;
+	length_list[2752] = 26;
+	length_list[2753] = 26;
+	length_list[2754] = -1;
+	length_list[2755] = 2;
+	length_list[2756] = -1;
+	length_list[2757] = 156;
+	length_list[2758] = 156;
+	length_list[2759] = 156;
+	length_list[2760] = 2;
+	length_list[2761] = -1;
+	length_list[2762] = 3;
+	length_list[2763] = 12;
+	length_list[2764] = 18;
+	length_list[2765] = 23;
+	length_list[2766] = 4;
+	length_list[2767] = 68;
+	length_list[2768] = 11;
+	length_list[2769] = -1;
+	length_list[2770] = 30;
+	length_list[2771] = -1;
+	length_list[2772] = -1;
+	length_list[2773] = 2;
+	length_list[2774] = 2;
+	length_list[2775] = 8;
+	length_list[2776] = 8;
+	length_list[2777] = -1;
+	length_list[2778] = 32;
+	length_list[2779] = -1;
+	length_list[2780] = 6;
+	length_list[2781] = 24;
+	length_list[2782] = 6;
+	length_list[2783] = 58;
+	length_list[2784] = 30;
+	length_list[2785] = 28;
+	length_list[2786] = 7;
+	length_list[2787] = -1;
+	length_list[2788] = 89;
+	length_list[2789] = -1;
+	length_list[2790] = 10;
+	length_list[2791] = 38;
+	length_list[2792] = 2;
+	length_list[2793] = 13;
+	length_list[2796] = 2;
+	length_list[2797] = 2;
+	length_list[2798] = 2;
+	length_list[2799] = 2;
+	length_list[2800] = 10;
+	length_list[2801] = 102;
+	length_list[2802] = 40;
+	length_list[2803] = -1;
+	length_list[2804] = 11;
+	length_list[2805] = 3;
+	length_list[2806] = 88;
+	length_list[2807] = 32;
+	length_list[2808] = 11;
+	length_list[2809] = 6;
+	length_list[2810] = 58;
+	length_list[2811] = -1;
+	length_list[2812] = 16;
+	length_list[2813] = -1;
+	length_list[2814] = -1;
+	length_list[2815] = -1;
+	length_list[2816] = 8;
+	length_list[2817] = 56;
+	length_list[2818] = 26;
+	length_list[2819] = -1;
+	length_list[2820] = 190;
+	length_list[2821] = 63;
+	length_list[2823] = -1;
+	length_list[2824] = -1;
+	length_list[2825] = -1;
+	length_list[2826] = -1;
+	length_list[2827] = 4;
+	length_list[2828] = 155;
+	length_list[2829] = 10;
+	length_list[2830] = -1;
+	length_list[2831] = -1;
+	length_list[2832] = 10;
+	length_list[2833] = 4;
+	length_list[2834] = 2;
+	length_list[2835] = 48;
+	length_list[2836] = 2;
+	length_list[2837] = 7;
+	length_list[2838] = 2;
+	length_list[2839] = 3;
+	length_list[2840] = 4;
+	length_list[2841] = 2;
+	length_list[2842] = 29;
+	length_list[2843] = 2;
+	length_list[2844] = 2;
+	length_list[2845] = 2;
+	length_list[2846] = 14;
+	length_list[2847] = 14;
+	length_list[2848] = 271;
+	length_list[2849] = 13;
+	length_list[2850] = 5;
+	length_list[2851] = 6;
+	length_list[2852] = 6;
+	length_list[2853] = 6;
+	length_list[2855] = -1;
+	length_list[2856] = 3;
+	length_list[2859] = 11;
+	length_list[2860] = 3;
+	length_list[2861] = 11;
+	length_list[2862] = 4;
+	length_list[2863] = 73;
+	length_list[2864] = -1;
+	length_list[2865] = 17;
+	length_list[2866] = -1;
+	length_list[2867] = 17;
+	length_list[2868] = 50;
+	length_list[2869] = 3;
+	length_list[2870] = -1;
+	length_list[2871] = -1;
+	length_list[2873] = -1;
+	length_list[2876] = 4;
+	length_list[2877] = -1;
+	length_list[2878] = -1;
+	length_list[2879] = 64;
+	length_list[2880] = -1;
+	length_list[2881] = 70;
+	length_list[2882] = 62;
+	length_list[2883] = 48;
+	length_list[2884] = 58;
+	length_list[2885] = 58;
+	length_list[2886] = 10;
+	length_list[2887] = 14;
+	length_list[2888] = 18;
+	length_list[2889] = 4;
+	length_list[2890] = 6;
+	length_list[2891] = 4;
+	length_list[2892] = 2;
+	length_list[2893] = -1;
+	length_list[2894] = -1;
+	length_list[2895] = 2;
+	length_list[2896] = 2;
+	length_list[2897] = 2;
+	length_list[2898] = 2;
+	length_list[2899] = 52;
+	length_list[2900] = 8;
+	length_list[2901] = -1;
+	length_list[2902] = -1;
+	length_list[2903] = -1;
+	length_list[2904] = 2;
+	length_list[2905] = 4;
+	length_list[2906] = -1;
+	length_list[2907] = 14;
+	length_list[2908] = 2;
+	length_list[2909] = 10;
+	length_list[2910] = 33;
+	length_list[2911] = -1;
+	length_list[2912] = -1;
+	length_list[2913] = -1;
+	length_list[2914] = -1;
+	length_list[2915] = -1;
+	length_list[2916] = -1;
+	length_list[2917] = -1;
+	length_list[2918] = 26;
+	length_list[2919] = 33;
+	length_list[2920] = 12;
+	length_list[2921] = 18;
+	length_list[2922] = -1;
+	length_list[2923] = 14;
+	length_list[2924] = 12;
+	length_list[2925] = 6;
+	length_list[2926] = 14;
+	length_list[2927] = 177;
+	length_list[2928] = -1;
+	length_list[2929] = 177;
+	length_list[2930] = -1;
+	length_list[2931] = 8;
+	length_list[2932] = 1026;
+	length_list[2933] = 1026;
+	length_list[2934] = 77;
+	length_list[2935] = -1;
+	length_list[2936] = -1;
+	length_list[2937] = -1;
+	length_list[2938] = -1;
+	length_list[2939] = 118;
+	length_list[2940] = -1;
+	length_list[2941] = -1;
+	length_list[2942] = 60;
+	length_list[2943] = 10;
+	length_list[2944] = 10;
+	length_list[2956] = -1;
+	length_list[2957] = -1;
+	length_list[2958] = 18;
+	length_list[2959] = 6;
+	length_list[2960] = 2;
+	length_list[2961] = 8;
+	length_list[2962] = 5;
+	length_list[2963] = 12;
+	length_list[2964] = 14;
+	length_list[2965] = -1;
+	length_list[2966] = 26;
+	length_list[2967] = 27;
+	length_list[2968] = 6;
+	length_list[2969] = 10;
+	length_list[2970] = 11;
+	length_list[2971] = 12;
+	length_list[2972] = 16;
+	length_list[2973] = 14;
+	length_list[2974] = 12;
+	length_list[2975] = 10;
+	length_list[2976] = 2;
+	length_list[2977] = 3;
+	length_list[2978] = 10;
+	length_list[2979] = 10;
+	length_list[2980] = 85;
+	length_list[2981] = 12;
+	length_list[2982] = -1;
+	length_list[2983] = -1;
+	length_list[2984] = 7;
+	length_list[2985] = -1;
+	length_list[2986] = 22;
+	length_list[2987] = 22;
+	length_list[2988] = 22;
+	length_list[2989] = 2;
+	length_list[2990] = 3;
+	length_list[2991] = 16;
+	length_list[2992] = 9;
+	length_list[2993] = 3;
+	length_list[2994] = 2;
+	length_list[2995] = -1;
+	length_list[2996] = 31;
+	length_list[2997] = 10;
+	length_list[2998] = 18;
+	length_list[2999] = -1;
+	length_list[3e3] = 16;
+	length_list[3001] = 27;
+	length_list[3002] = -1;
+	length_list[3003] = -1;
+	length_list[3004] = 22;
+	length_list[3005] = 6;
+	length_list[3006] = 6;
+	length_list[3007] = 12;
+	length_list[3008] = 3;
+	length_list[3009] = -1;
+	length_list[3010] = 5;
+	length_list[3011] = 10;
+	length_list[3012] = 2;
+	length_list[3013] = 7;
+	length_list[3014] = 9;
+	length_list[3015] = 6;
+	length_list[3016] = -1;
+	length_list[3017] = 10;
+	length_list[3018] = -1;
+	length_list[3019] = 4;
+	length_list[3020] = -1;
+	length_list[3021] = -1;
+	length_list[3022] = 8;
+	length_list[3023] = 9;
+	length_list[3024] = 8;
+	length_list[3025] = 13;
+	length_list[3026] = 8;
+	length_list[3027] = 13;
+	length_list[3028] = 2;
+	length_list[3029] = 9;
+	length_list[3030] = 8;
+	length_list[3031] = 9;
+	length_list[3032] = 14;
+	length_list[3033] = 51;
+	length_list[3034] = -1;
+	length_list[3035] = 19;
+	length_list[3036] = 18;
+	length_list[3037] = -1;
+	length_list[3038] = -1;
+	length_list[3039] = 3;
+	length_list[3040] = 3;
+	length_list[3041] = 3;
+	length_list[3042] = 137;
+	length_list[3043] = 34;
+	length_list[3044] = 14;
+	length_list[3045] = 8;
+	length_list[3046] = 8;
+	length_list[3047] = 4;
+	length_list[3048] = 4;
+	length_list[3049] = 6;
+	length_list[3050] = 10;
+	length_list[3051] = 7;
+	length_list[3052] = 7;
+	length_list[3053] = 9;
+	length_list[3054] = 5;
+	length_list[3055] = -1;
+	length_list[3056] = 14;
+	length_list[3057] = 18;
+	length_list[3058] = 13;
+	length_list[3059] = -1;
+	length_list[3060] = -1;
+	length_list[3061] = 6;
+	length_list[3062] = -1;
+	length_list[3063] = -1;
+	length_list[3064] = 6;
+	length_list[3065] = 11;
+	length_list[3066] = 9;
+	length_list[3067] = 35;
+	length_list[3068] = 6;
+	length_list[3069] = 4;
+	length_list[3070] = -1;
+	length_list[3071] = 24;
+	length_list[3072] = 6;
+	length_list[3073] = 6;
+	length_list[3074] = 6;
+	length_list[3075] = 6;
+	length_list[3076] = 8;
+	length_list[3077] = 30;
+	length_list[3078] = 8;
+	length_list[3079] = 12;
+	length_list[3080] = 6;
+	length_list[3081] = 116;
+	length_list[3082] = 30;
+	length_list[3083] = 18;
+	length_list[3084] = 4;
+	length_list[3085] = 167;
+	length_list[3086] = 689;
+	length_list[3087] = 610;
+	length_list[3088] = 15;
+	length_list[3089] = 11;
+	length_list[3090] = 7;
+	length_list[3091] = 11;
+	length_list[3092] = 14;
+	length_list[3093] = -1;
+	length_list[3094] = 9;
+	length_list[3095] = 10;
+	length_list[3096] = 20;
+	length_list[3097] = 8;
+	length_list[3098] = 20;
+	length_list[3099] = 8;
+	length_list[3100] = -1;
+	length_list[3101] = -1;
+	length_list[3102] = 10;
+	length_list[3103] = 1e3;
+	length_list[3104] = -1;
+	length_list[3105] = -1;
+	length_list[3106] = 12;
+	length_list[3107] = 9;
+	length_list[3108] = 979;
+	length_list[3109] = 12;
+	length_list[3110] = 94;
+	length_list[3111] = 2;
+	length_list[3112] = -1;
+	length_list[3113] = -1;
+	length_list[3114] = 4;
+	length_list[3115] = 8;
+	length_list[3116] = 4;
+	length_list[3117] = 3;
+	length_list[3118] = 15;
+	length_list[3119] = 2;
+	length_list[3120] = 15;
+	length_list[3121] = -1;
+	length_list[3122] = -1;
+	length_list[3123] = 8;
+	length_list[3124] = 3;
+	length_list[3125] = 6;
+	length_list[3126] = 12;
+	length_list[3127] = -1;
+	length_list[3128] = -1;
+	length_list[3129] = -1;
+	length_list[3130] = -1;
+	length_list[3131] = 33;
+	length_list[3132] = 6;
+	length_list[3133] = 6;
+	length_list[3134] = 8;
+	length_list[3135] = 7;
+	length_list[3136] = 19;
+	length_list[3137] = 2;
+	length_list[3138] = 19;
+	length_list[3139] = 18;
+	length_list[3140] = -1;
+	length_list[9900] = 23;
+	if (packetver >= 20260930) {
+		length_list[762] = -1;
+		length_list[763] = -1;
+		length_list[764] = -1;
+		length_list[3090] = 16;
+		length_list[3141] = 2;
+		length_list[3142] = -1;
+		length_list[3143] = 4;
+		length_list[3144] = 46;
+		length_list[3145] = 42;
+		length_list[3146] = 2;
+		length_list[3147] = 6;
+		length_list[3148] = 22;
+		length_list[3149] = -1;
+		length_list[3150] = -1;
+		length_list[3151] = 18;
+		length_list[3152] = 10;
+		length_list[3153] = 10;
+		length_list[3154] = -1;
+		length_list[3155] = 10;
+		length_list[3156] = 2;
+		length_list[3157] = 6;
+		length_list[3158] = 3;
+		length_list[3159] = 11;
+		length_list[3160] = 49;
+		length_list[3161] = 11;
+		length_list[3162] = 11;
+		length_list[3163] = 30;
+		length_list[3164] = -1;
+		length_list[3166] = 4;
+		length_list[3167] = 4;
+		length_list[3168] = 7;
+		length_list[3169] = 10;
+		length_list[3170] = 34;
+		length_list[3171] = 30;
+		length_list[3184] = 30;
+		length_list[3185] = 8;
+		length_list[3186] = 4;
+		length_list[3187] = 5;
+		length_list[3188] = 10;
+		length_list[3189] = 3;
+		length_list[3190] = 2;
+		length_list[3191] = -1;
+		length_list[3192] = 23;
+		length_list[3193] = 56;
+		length_list[3196] = 14;
+		length_list[3197] = -1;
+		length_list[3198] = -1;
+		length_list[3199] = 70;
+		length_list[3200] = 15;
+		length_list[3201] = 2;
+	}
+	return length_list;
+}
+var packets2026_len_main_default;
+var init_packets2026_len_main = __esmMin((() => {
+	packets2026_len_main_default = { init: init$16 };
 }));
 //#endregion
 //#region src/Network/PacketLength.js
@@ -77898,6 +79914,7 @@ var init_packets2025_len_main = __esmMin((() => {
 function init$15(packetver) {
 	packetver = parseInt(packetver);
 	const years = [
+		2026,
 		2025,
 		2024,
 		2023,
@@ -77969,6 +79986,7 @@ var init_PacketLength = __esmMin((() => {
 	init_packets2023_len_main();
 	init_packets2024_len_main();
 	init_packets2025_len_main();
+	init_packets2026_len_main();
 	packetModules = {
 		"./Packets/packets2003_len_main.js": packets2003_len_main_exports,
 		"./Packets/packets2004_len_main.js": packets2004_len_main_exports,
@@ -77992,7 +80010,8 @@ var init_PacketLength = __esmMin((() => {
 		"./Packets/packets2022_len_main.js": packets2022_len_main_exports,
 		"./Packets/packets2023_len_main.js": packets2023_len_main_exports,
 		"./Packets/packets2024_len_main.js": packets2024_len_main_exports,
-		"./Packets/packets2025_len_main.js": packets2025_len_main_exports
+		"./Packets/packets2025_len_main.js": packets2025_len_main_exports,
+		"./Packets/packets2026_len_main.js": packets2026_len_main_exports
 	};
 	packets_len = new Array();
 	PacketLength_default = {
@@ -78720,7 +80739,7 @@ function apply$1(component) {
 * Apply a change to the mounted windows it touches, keep them on screen,
 * and let them adjust (`onScale`).
 */
-function refresh(name) {
+function refresh$2(name) {
 	_mounted.forEach((component) => {
 		if (name !== null && scaleName(component) !== name) return;
 		apply$1(component);
@@ -78759,7 +80778,7 @@ function set$1(name, value) {
 	if (scale === get$2(name)) return scale;
 	if (scale === 1) _scales.delete(name);
 	else _scales.set(name, scale);
-	refresh(name);
+	refresh$2(name);
 	emit$1(name, scale);
 	return scale;
 }
@@ -78771,7 +80790,7 @@ function setGlobal(value) {
 	const scale = checkValue(value);
 	if (scale === _global) return scale;
 	_global = scale;
-	refresh(null);
+	refresh$2(null);
 	emit$1(null, scale);
 	return scale;
 }
@@ -79400,6 +81419,7 @@ var init_Controls = __esmMin((() => {
 		joyStickCenter: null,
 		joyCameraSpeed: 90,
 		joyDisableVirtualMouse: false,
+		joyUIFocus: true,
 		joyAutoHide: false,
 		joyReverseStick: false,
 		joySense: 25
@@ -83886,11 +85906,12 @@ var init_WebGL = __esmMin((() => {
 }));
 //#endregion
 //#region src/Renderer/Effects/PostProcess.js
-var _effects, _activeEffects, _external, _externalAt, _gl$4, _sceneDepth, _inPasses, _readFbo, _writeFbo, PostProcess;
+var _effects, _activeEffects, _ready, _external, _externalAt, _gl$4, _sceneDepth, _inPasses, _readFbo, _writeFbo, PostProcess;
 var init_PostProcess = __esmMin((() => {
 	init_Graphics();
 	_effects = [];
 	_activeEffects = [];
+	_ready = /* @__PURE__ */ new Set();
 	_external = [];
 	_externalAt = -1;
 	_gl$4 = null;
@@ -83917,7 +85938,14 @@ var init_PostProcess = __esmMin((() => {
 			}
 			_gl$4 = gl;
 			_effects.push(module);
-			module.init(gl);
+		}
+		/**
+		* Whether the built-in passes are registered. They stay registered across
+		* map changes, until clean().
+		* @return {boolean}
+		*/
+		static isRegistered() {
+			return _externalAt >= 0;
 		}
 		/**
 		* Register the external passes here, in the order they were added.
@@ -83928,7 +85956,7 @@ var init_PostProcess = __esmMin((() => {
 			_externalAt = _effects.length;
 			_external.forEach((module) => {
 				_effects.push(module);
-				module.init(gl);
+				PostProcess.setUp(module, gl);
 			});
 		}
 		/**
@@ -83946,7 +85974,7 @@ var init_PostProcess = __esmMin((() => {
 			_external.push(module);
 			if (_gl$4 && _externalAt >= 0) {
 				_effects.splice(_externalAt + _external.length - 1, 0, module);
-				module.init(_gl$4);
+				PostProcess.setUp(module, _gl$4);
 			}
 		}
 		/**
@@ -83958,7 +85986,7 @@ var init_PostProcess = __esmMin((() => {
 			const index = _effects.indexOf(module);
 			if (index >= 0) {
 				_effects.splice(index, 1);
-				if (_gl$4) module.clean(_gl$4);
+				if (_gl$4 && _ready.delete(module)) module.clean(_gl$4);
 			}
 		}
 		/**
@@ -83970,12 +85998,24 @@ var init_PostProcess = __esmMin((() => {
 			return _sceneDepth;
 		}
 		/**
+		* Run a module's init() once, until it is cleaned.
+		* @param {ShaderModule} module
+		* @param {WebGLRenderingContext} gl
+		*/
+		static setUp(module, gl) {
+			if (!_ready.has(module)) {
+				_ready.add(module);
+				module.init(gl);
+			}
+		}
+		/**
 		* Prepare the pipeline for the scene rendering.
 		* Always binds a full-resolution buffer to ensure the 3D scene is sharp.
 		* @param {WebGLRenderingContext} gl - The WebGL context.
 		*/
 		static prepare(gl) {
 			_activeEffects = _effects.filter((e) => e.isActive());
+			for (let i = 0; i < _activeEffects.length; i++) PostProcess.setUp(_activeEffects[i], gl);
 			this.validateBuffers(gl);
 			if (_activeEffects.length > 0) PostProcess.beforeRenderPass(gl, _writeFbo);
 			else PostProcess.beforeRenderPass(gl, null);
@@ -84050,11 +86090,10 @@ var init_PostProcess = __esmMin((() => {
 		* restart Modules when crashs
 		*/
 		static restartModules(gl) {
-			_activeEffects.forEach((module) => {
-				module.clean(gl);
-				module.init(gl);
-			});
+			_ready.forEach((module) => module.clean(gl));
+			_ready.clear();
 			_activeEffects = [];
+			if (_externalAt >= 0) _external.forEach((module) => PostProcess.setUp(module, gl));
 			if (_readFbo) {
 				if (gl.isTexture(_readFbo.texture)) gl.deleteTexture(_readFbo.texture);
 				if (gl.isRenderbuffer(_readFbo.rbo)) gl.deleteRenderbuffer(_readFbo.rbo);
@@ -84079,7 +86118,7 @@ var init_PostProcess = __esmMin((() => {
 			const scaledHeight = Math.floor(height * scale);
 			_readFbo = this.createFbo(gl, scaledWidth, scaledHeight, _readFbo);
 			_writeFbo = this.createFbo(gl, scaledWidth, scaledHeight, _writeFbo);
-			_effects.forEach((module) => {
+			_ready.forEach((module) => {
 				if (module.recreateFbo) module.recreateFbo(gl, scaledWidth, scaledHeight);
 			});
 		}
@@ -84087,7 +86126,8 @@ var init_PostProcess = __esmMin((() => {
 		* Clean current registered modules
 		*/
 		static clean(gl) {
-			_effects.forEach((module) => module.clean(gl));
+			_ready.forEach((module) => module.clean(gl));
+			_ready.clear();
 			_effects = [];
 			_activeEffects = [];
 			_externalAt = -1;
@@ -84195,13 +86235,13 @@ var init_PostProcess = __esmMin((() => {
 }));
 //#endregion
 //#region src/Renderer/Effects/Shaders/VerticalFlip.js
-var _program$30, _buffer$23, _active$3, VerticalFlip;
+var _program$30, _buffer$23, _active$4, VerticalFlip;
 var init_VerticalFlip = __esmMin((() => {
 	init_VerticalFlip$2();
 	init_VerticalFlip$1();
 	init_WebGL();
 	init_PostProcess();
-	_active$3 = false;
+	_active$4 = false;
 	VerticalFlip = class {
 		static init(gl) {
 			if (_program$30) return;
@@ -84239,7 +86279,7 @@ var init_VerticalFlip = __esmMin((() => {
 		* @param {WebGLFramebuffer} outputFbo - Target
 		*/
 		static render(gl, inputTexture, outputFbo) {
-			if (!_buffer$23 || !_program$30 || !_active$3) return;
+			if (!_buffer$23 || !_program$30 || !_active$4) return;
 			PostProcess.beforeRenderPass(gl, outputFbo);
 			gl.useProgram(_program$30);
 			gl.bindBuffer(gl.ARRAY_BUFFER, _buffer$23);
@@ -84263,17 +86303,17 @@ var init_VerticalFlip = __esmMin((() => {
 		}
 		/** Resets effect state */
 		static clean(gl) {
-			_active$3 = false;
+			_active$4 = false;
 			if (_buffer$23) gl.deleteBuffer(_buffer$23);
 			_program$30 = _buffer$23 = null;
 		}
 		/** @returns {boolean} Whether the effect is active */
 		static isActive() {
-			return _active$3;
+			return _active$4;
 		}
 		/** @param {boolean} bool - Enables/disables the effect */
 		static setActive(bool) {
-			_active$3 = bool;
+			_active$4 = bool;
 		}
 	};
 }));
@@ -90402,6 +92442,7 @@ var init_MonsterTable = __esmMin((() => {
 		10251: "4_m_popfesta",
 		10252: "4_bonfire",
 		10253: "clear_npc",
+		10256: "DUCKLING",
 		10285: "4_hen",
 		10290: "4_teddy_bear",
 		10291: "4_teddy_bear_em",
@@ -90417,6 +92458,7 @@ var init_MonsterTable = __esmMin((() => {
 		10313: "4_f_anes_d",
 		10315: "4_m_silvano_d",
 		10317: "4_f_cecilia_d",
+		10341: "4_pigocto",
 		10344: "4_ep17_master_a",
 		10345: "4_ep17_basic_b",
 		10346: "4_ep17_guard_b",
@@ -90465,15 +92507,145 @@ var init_MonsterTable = __esmMin((() => {
 		10432: "4_point_white",
 		10439: "4_exjob_chul_ho",
 		10440: "4_exjob_ki_sul",
+		10442: "1_journey_stone_d",
 		10443: "1_journey_stone_f",
+		10477: "1_ragfes_01_m",
+		10478: "4_ragfes_02",
+		10479: "4_ragfes_02_m",
+		10480: "4_ragfes_03",
+		10481: "4_ragfes_03_m",
+		10482: "4_ragfes_04",
+		10483: "4_ragfes_04_m",
+		10484: "4_ragfes_05",
+		10485: "4_ragfes_05_m",
+		10487: "4_ragfes_06_m",
+		10488: "4_ragfes_07",
+		10489: "4_ragfes_07_m",
+		10490: "4_ragfes_08",
+		10491: "4_ragfes_08_m",
+		10492: "4_ragfes_09",
+		10493: "4_ragfes_09_m",
+		10495: "4_ragfes_10_m",
+		10497: "4_ragfes_11_m",
+		10498: "4_ragfes_12",
+		10499: "4_ragfes_12_m",
+		10500: "4_ragfes_13",
+		10501: "4_ragfes_13_m",
+		10502: "4_ragfes_14",
+		10503: "4_ragfes_14_m",
+		10505: "4_ragfes_15_m",
+		10506: "4_ragfes_16",
+		10507: "4_ragfes_16_m",
 		10527: "invisible",
+		10529: "4_m_nillem",
+		10530: "4_larva_red",
+		10531: "4_larva_yellow",
+		10532: "4_larva_black",
+		10533: "4_larva_violet",
+		10534: "4_hero_sausage",
+		10535: "4_princess_sausage",
+		10545: "4_gacha_machine",
+		10553: "4_SNOWDOG",
+		10561: "4_evt_lammir",
+		10562: "4_evt_sulki",
+		10563: "4_evt_kkat",
+		10564: "4_ep21_soldier_a",
+		10565: "4_ep21_soldier_b",
+		10566: "4_ep21_m_worker_a",
+		10567: "4_ep21_m_worker_b",
+		10568: "4_ep21_f_worker_a",
+		10569: "4_ep21_f_worker_b",
+		10570: "4_ep21_worker_kid_a",
+		10571: "4_ep21_worker_kid_b",
+		10572: "4_ep21_tan",
+		10573: "4_ep21_tris",
+		10574: "4_ep21_nadoyo",
+		10575: "4_ep21_reinhardt",
+		10576: "4_ep21_wilhelm",
+		10577: "4_ep21_maristella",
+		10578: "4_ep21_yohan",
+		10579: "4_ep21_richard",
+		10580: "4_ep21_valdaris",
+		10581: "4_ep21_gunter",
+		10582: "4_ep21_galaxia_a",
+		10583: "4_ep21_galaxia_b",
+		10584: "4_ep21_ivan",
+		10585: "4_ep21_lalaila",
+		10586: "4_ep21_ilse",
+		10587: "4_ep21_howell",
+		10588: "4_ep21_epesto",
+		10589: "4_ep21_heine_tab",
+		10590: "4_ep21_iana",
+		10591: "4_ep21_lee",
+		10592: "4_ep21_aurelie",
+		10594: "4_ep21_tan_s",
+		10600: "4_SMART_ANDRE",
+		10601: "4_Alexsander",
+		10602: "4_Kasandra",
+		10604: "4_CH1_LITHIU",
+		10605: "4_CH1_GRAY_VALKYRIE",
+		10606: "4_CH1_DELEGACY01",
+		10609: "4_CH1_DELEGACY02",
+		10610: "4_CH1_DELEGACY03",
+		10611: "4_CH1_DELEGACY04",
+		10612: "4_CH1_YUP",
+		10613: "4_CH1_KAL",
+		10614: "4_M_PATIENT01",
+		10615: "4_F_PATIENT01",
+		10616: "4_M_PATIENT02",
+		10617: "4_F_PATIENT02",
+		10618: "4_PATIEN_KID",
+		10619: "4_CH1_NEUMANN",
+		10620: "4_CH1_BRANCH",
+		10621: "4_hm_uzagi",
+		10622: "4_hm_tarong",
+		10623: "4_hm_chubby",
+		10624: "4_hm_noni",
+		10625: "4_hm_lolbby",
+		10626: "4_hm_yobby",
+		10627: "4_hm_munch",
+		10628: "4_F_VACATION_MIRIAM",
+		10644: "4_JOB_VARG",
+		10645: "4_JOB_VEDR",
+		10646: "4_M_EL",
+		10647: "4_EVT_HOR_ING",
+		10649: "4_CH2_SAMSINHARRBAN",
+		10650: "4_CH2_FROZENHARRBAN",
+		10651: "4_CH2_ORION",
+		10652: "4_CH2_BABYHARRBAN",
+		10653: "4_CH2_CHILD_A",
+		10654: "4_CH2_CHILD_B",
+		10655: "4_CH2_HARRBAN_A",
+		10656: "4_CH2_HARRBAN_B",
+		10657: "4_CH2_HARRBAN_C",
+		10658: "4_CH2_HARRBAN_D",
+		10659: "4_CH2_HARRBAN_E",
+		10660: "4_CH2_HARRBAN_F",
+		10661: "4_CH2_FOLNIR_A",
+		10662: "4_CH2_FOLNIR_B",
+		10663: "4_CH2_FOLNIR_C",
+		10664: "4_CH2_HARRBAN_G",
+		10665: "4_CH2_CHILD_C",
+		10669: "4_kiosk",
+		10675: "4_evt_suad",
+		20073: "SIROMA",
+		20074: "MYSTCASE",
+		20075: "PORING_",
+		20157: "L_MAGALETA",
+		20158: "L_YGNIZEM",
+		20159: "L_WHIKEBAIN",
+		20160: "L_ARMAIA",
+		20163: "L_RAWREL",
+		20164: "L_EREND",
 		20353: "dolor",
+		20354: "gaster",
 		20355: "bellare",
 		20357: "sanare",
 		20361: "dolor",
 		20363: "venenum",
 		20365: "caput",
 		20543: "md_ed_m_science",
+		20569: "SAVAGE_BABE",
 		20620: "redpepper",
 		20621: "redpepper",
 		20622: "assistant",
@@ -90485,11 +92657,16 @@ var init_MonsterTable = __esmMin((() => {
 		20681: "heart_hunter_n",
 		20696: "child_admin1",
 		20698: "assistant",
+		20812: "c_himel",
+		20813: "c_amdarais",
 		20847: "invisible",
 		20936: "disguiser",
 		20938: "ghost_cube",
 		20939: "lude_gal",
 		20941: "grote",
+		21087: "S_DUMMY_DEFAULT",
+		21088: "S_DUMMY_DEFAULT",
+		21290: "pet_kiel",
 		21292: "ep18_armed_villager01",
 		21293: "ep18_armed_villager02",
 		21294: "ep18_armed_villager03",
@@ -90502,8 +92679,588 @@ var init_MonsterTable = __esmMin((() => {
 		21321: "ep18_npc_miriam",
 		21323: "ep18_grey_goat",
 		21324: "ep18_grey_wolf_baby",
+		21384: "sweets_drops",
 		21394: "ILL_VITATA",
-		21395: "ILL_MAYA"
+		21395: "ILL_MAYA",
+		21547: "INCREASE_SOIL",
+		21580: "BIJOU",
+		21632: "FARMILIAR2",
+		21634: "invisible",
+		21635: "invisible",
+		21636: "invisible",
+		21637: "invisible",
+		21638: "invisible",
+		21639: "invisible",
+		21651: "KNIGHT_OF_ABYSS2",
+		21652: "GH_WHITEKNIGHT",
+		21653: "EDDGA3",
+		21809: "invisible",
+		21811: "invisible",
+		21813: "invisible",
+		21814: "invisible",
+		21815: "BONE_DETALE",
+		21816: "INGRID",
+		21817: "gran_papilia",
+		21818: "pitaya_boss",
+		21819: "silva_papilia",
+		21820: "sweety",
+		21821: "c_amdarais",
+		21822: "c_himel",
+		21823: "ILL_ABYSMAL_WITCH",
+		21824: "death_witch",
+		21825: "r001_bestia",
+		21826: "MD_SAKRAY",
+		21827: "MD_TIARA",
+		21828: "MD_Airboat_Boss",
+		21829: "BETELGEUSE",
+		21830: "ep18_burning_fang",
+		21831: "ep18_md_demi_freyja",
+		21832: "ep18_md_schulang",
+		21833: "EP19_LIMACINA_BOSS",
+		21834: "EP19_MD_JUNCEA",
+		21835: "VR_MD_HHA_RKNT",
+		21836: "VR_MD_HHA_RYGD",
+		21837: "VR_MD_HHA_ACBS",
+		21838: "VR_MD_HHA_RNGR",
+		21839: "VR_MD_HHA_GX",
+		21840: "VR_MD_HHA_SC",
+		21841: "VR_MD_HHA_WR",
+		21842: "E_PORING_20",
+		21911: "2210_EV_SPIDING",
+		21912: "MD_SEWER_THIEF_BUG",
+		21913: "MD_SEWER_CHONCHON",
+		21914: "MD_SEWER_AMBERNITE",
+		21915: "MD_SEWER_BEETLE",
+		21916: "MD_SEWER_ARCLOUSE",
+		21917: "MD_SEWER_ARGIOPE",
+		21918: "MD_SEWER_CAVE_FLOWER",
+		21919: "LARVA_VIOLET",
+		21944: "E_PORING_2023",
+		21945: "E_LUNATIC_2023",
+		21964: "2301_EV_RICE_FLOUR",
+		22156: "RHYNCHO",
+		22157: "STAPO",
+		22158: "ICE_TITAN",
+		22159: "Obeaune",
+		22160: "WILOW",
+		22161: "VR_MD_TILBY",
+		22163: "VR_MD_TILBY2",
+		22164: "VR_MD_RAINBOW",
+		22166: "HEADSTONE1",
+		22167: "HEADSTONE2",
+		22168: "HEADSTONE3",
+		22169: "HEADSTONE4",
+		22170: "HEADSTONE0",
+		22185: "DARK_LORD2",
+		22262: "mh_sasquatch",
+		22263: "golden_savage",
+		22297: "2401_EV_DRAGORING",
+		22298: "2401_EV_IMOOGI",
+		22300: "EP21_NPC_SERPENT",
+		22301: "EP21_NPC_TRIS",
+		22302: "EP21_NPC_TAN",
+		22303: "EP21_NPC_NADOYO",
+		22304: "EP21_NPC_REINHARDT",
+		22305: "EP21_NPC_WILHELM",
+		22306: "EP21_NPC_MARISTELLA",
+		22307: "EP21_NPC_YOHAN",
+		22308: "EP21_NPC_RICHARD",
+		22309: "EP21_NPC_EIBA",
+		22310: "EP21_NPC_GUNTER",
+		22311: "EP21_NPC_IVAN",
+		22312: "EP21_NPC_GALAXIA",
+		22313: "EP21_SEAWIND",
+		22314: "EP21_SCALLEG",
+		22315: "EP21_VELELLING",
+		22316: "EP21_LETTERSTER",
+		22317: "EP21_ROCKSTRIKER",
+		22318: "EP21_ICESEAHORSE",
+		22319: "EP21_SKIPSKIPPER",
+		22320: "EP21_CLIOLIMA",
+		22321: "EP21_YORKER_A",
+		22322: "EP21_YORKER_B",
+		22323: "EP21_YOSTER_A",
+		22324: "EP21_YOSTER_B",
+		22325: "EP21_YOSTER_C",
+		22326: "EP21_YOSTER_D",
+		22327: "EP21_YOSTER_E",
+		22353: "EP21_YORMI_A",
+		22354: "EP21_YORMI_B",
+		22355: "EP21_YORDOS_A",
+		22356: "EP21_YORDOS_B",
+		22357: "EP21_YORDOS_C",
+		22358: "EP21_YOSCOPUS_A",
+		22359: "EP21_YOSCOPUS_B",
+		22360: "EP21_YORTUS_A",
+		22361: "EP21_YORTUS_B",
+		22362: "EP21_ICEHORN",
+		22363: "EP21_B_YORTUS_A",
+		22364: "EP21_B_YORTUS_B",
+		22365: "EP21_ICESEAHORSE",
+		22366: "EP21_YORDOS_A",
+		22367: "EP21_YORDOS_B",
+		22368: "EP21_YORDOS_C",
+		22369: "EP21_MD_SAILOR",
+		22370: "EP21_MD_CAPTAIN",
+		22371: "EP21_YOR_TAN",
+		22372: "EP21_MD_CAPTAIN",
+		22373: "EP21_YOR_TAN",
+		22374: "purplestone",
+		22378: "MD_Airboat_Boss",
+		22383: "VIOLEN",
+		22384: "VIOLEN",
+		22385: "SPIDING",
+		22386: "SPIDING",
+		22387: "GARLING",
+		22388: "GARLING",
+		22389: "JACKONETTE",
+		22390: "JACKONETTE",
+		22391: "LIAMETTE",
+		22392: "LIAMETTE",
+		22393: "LIAMETTE",
+		22394: "NIGHTMARE_PIAMETTE",
+		22395: "MEDJED",
+		22396: "MEDJED",
+		22397: "MEDJAY",
+		22398: "MEDJAY",
+		22399: "OPHOIS",
+		22400: "OPHOIS",
+		22401: "HEKA",
+		22402: "HEKA",
+		22403: "OPHOIS",
+		22404: "GUIDE_OF_DEAD",
+		22408: "E_SMART_ANDRE",
+		22409: "E_RE_PINE",
+		22410: "EP21_YOR_TAN",
+		22411: "purplestone",
+		22412: "EP21_YORTUS_A_H",
+		22413: "EP21_YORTUS_B_H",
+		22414: "EP21_YORDOS_C_H",
+		22415: "EP21_YORDOS_B_H",
+		22416: "EP21_YORDOS_A_H",
+		22417: "EP21_YORMI_A_H",
+		22418: "EP21_YORMI_B_H",
+		22419: "EP21_YOSCOPUS_A_H",
+		22420: "EP21_YOSCOPUS_B_H",
+		22421: "EP21_B_YORTUS_A_H",
+		22422: "EP21_B_YORTUS_B_H",
+		22423: "2501_EV_MATJALAL",
+		22424: "2501_EV_ACARI",
+		22425: "E_Leader_Sheep",
+		22426: "golden_savage",
+		22430: "CRUISER",
+		22431: "TATSI",
+		22432: "TATSI",
+		22433: "TATSI",
+		22434: "GUERRERO",
+		22435: "HANOM",
+		22436: "SIRENA",
+		22437: "DIOSA",
+		22438: "PESKA",
+		22439: "GUERRERO",
+		22440: "HANOM",
+		22441: "SIRENA",
+		22442: "DIOSA",
+		22443: "CH1_YGGRING",
+		22444: "CH1_LEAFEING",
+		22445: "CH1_CHARCOARING",
+		22446: "CH1_VULRING",
+		22447: "CH1_FIRELOOP",
+		22448: "CH1_FIRAFFLESIA",
+		22449: "CH1_VOLIMPET",
+		22450: "CH1_FIRE_FLOWER",
+		22451: "CH1_PEEPING",
+		22452: "CH1_SILK_FROG",
+		22453: "CH1_SILK_SNAIL",
+		22454: "CH1_EX_ROBOT",
+		22455: "CH1_REPAIR_ROBOT",
+		22456: "CH1_DIMIC_1",
+		22457: "CH1_DIMIC_2",
+		22458: "CH1_DIMIC_3",
+		22459: "CH1_DIMIC_4",
+		22460: "CH1_IMMORTAL_CORPS1",
+		22461: "CH1_IMMORTAL_CORPS2",
+		22462: "CH1_IMMORTAL_CORPS3",
+		22463: "CH1_NYAISE",
+		22464: "CH1_SHADOW_JAILER",
+		22465: "CH1_TULIP",
+		22466: "CH1_CALENDULA",
+		22467: "CH1_SCABIOSA",
+		22468: "CH1_LOBELIA",
+		22469: "CH1_MYOSOTIS",
+		22470: "CH1_ANEMONE",
+		22471: "CH1_SKOGL",
+		22472: "CH1_FRUS",
+		22473: "CH1_LISTENER",
+		22474: "CH1_IMMORTAL_OFFICER1",
+		22475: "CH1_IMMORTAL_OFFICER2",
+		22476: "CH1_TOXIT",
+		22477: "CH1_TOXIT",
+		22478: "CH1_LUNARINA",
+		22479: "CH1_LUNARINA",
+		22480: "CH1_BLOODY_SLASHER",
+		22481: "CH1_BLOODY_SLASHER",
+		22482: "CH1_SHADIEST",
+		22483: "CH1_SHADIEST",
+		22484: "CH1_SUCCUBUS",
+		22485: "CH1_SUCCUBUS",
+		22486: "CH1_INCCUBUS",
+		22487: "CH1_INCCUBUS",
+		22488: "CH1_ABYSS_KNIGHT",
+		22489: "CH1_ABYSS_KNIGHT",
+		22490: "CH1_FIRELOOP",
+		22491: "CH1_VOLIMPET",
+		22492: "CH1_MYOSOTIS",
+		22493: "CH1_ANEMONE",
+		22494: "CH1_BULGASARI",
+		22495: "CH1_GLUTTO",
+		22496: "CH1_MD_HEMEL_N",
+		22497: "CH1_MD_HEMEL",
+		22498: "CH1_MD_AMDARAIS",
+		22499: "CH1_MD_VESSEL",
+		22505: "ANGELGOLT",
+		22507: "CH1_RK",
+		22508: "CH1_MC_M",
+		22509: "CH1_SC",
+		22510: "CH1_RA",
+		22511: "CH1_SO",
+		22512: "CH1_AB",
+		22513: "CH1_MI_D",
+		22514: "CH1_GC_D",
+		22515: "SPIRIT_C_WATER_S",
+		22516: "CH1_RG",
+		22517: "CH1_MC",
+		22518: "CH1_GN",
+		22519: "CH1_GC",
+		22520: "CH1_MI",
+		22521: "CH1_SR",
+		22522: "CH1_WL",
+		22523: "CH1_WA",
+		22524: "chimera_fulgor",
+		22525: "CH1_RK_1",
+		22526: "CH1_MC_M_1",
+		22527: "CH1_SC_1",
+		22528: "CH1_RA_1",
+		22529: "CH1_SO_1",
+		22530: "CH1_AB_1",
+		22531: "CH1_MI_D_1",
+		22532: "CH1_GC_D_1",
+		22533: "SPIRIT_C_WIND_L",
+		22534: "GOLDPORING",
+		22535: "KING_PORING",
+		22536: "VR_MD_HHA_RKNT",
+		22537: "VR_MD_HHA_RNGR",
+		22538: "VR_MD_HHA_WR",
+		22539: "VR_MD_HHA_ACBS",
+		22540: "LITTLE_BOOK_PINATA",
+		22541: "GIANT_BOOK_PINATA",
+		22542: "CH1_RG_1",
+		22543: "CH1_MC_1",
+		22544: "CH1_GN_1",
+		22545: "CH1_GC_1",
+		22546: "CH1_MI_1",
+		22547: "CH1_SR_1",
+		22548: "CH1_WL_1",
+		22549: "CH1_WA_1",
+		22550: "chimera_lava",
+		22551: "S_DUMMY_RES",
+		22552: "S_DUMMY_RES",
+		22553: "S_DUMMY_RES",
+		22554: "S_DUMMY_RES",
+		22555: "S_DUMMY_RES",
+		22556: "S_DUMMY_RES",
+		22557: "S_DUMMY_RES",
+		22558: "S_DUMMY_RES",
+		22559: "S_DUMMY_RES",
+		22560: "S_DUMMY_RES",
+		22561: "S_DUMMY_DEFAULT",
+		22562: "S_DUMMY_DEFAULT",
+		22563: "S_DUMMY_DEFAULT",
+		22564: "S_DUMMY_RES",
+		22565: "S_DUMMY_RES",
+		22566: "S_DUMMY_RES",
+		22567: "S_DUMMY_RES",
+		22568: "S_DUMMY_RES",
+		22569: "S_DUMMY_RES",
+		22570: "S_DUMMY_RES",
+		22571: "S_DUMMY_RES",
+		22572: "S_DUMMY_RES",
+		22573: "S_DUMMY_RES",
+		22574: "S_DUMMY_RES",
+		22575: "S_DUMMY_DEFAULT",
+		22576: "S_DUMMY_DEFAULT",
+		22577: "S_DUMMY_DEFAULT",
+		22578: "S_DUMMY_RES",
+		22579: "S_DUMMY_RES",
+		22580: "S_DUMMY_RES",
+		22581: "S_DUMMY_RES",
+		22582: "S_DUMMY_RES",
+		22583: "S_DUMMY_RES",
+		22584: "S_DUMMY_RES",
+		22585: "S_DUMMY_RES",
+		22586: "S_DUMMY_RES",
+		22587: "S_DUMMY_RES",
+		22588: "S_DUMMY_RES",
+		22589: "S_DUMMY_MRES",
+		22590: "S_DUMMY_MRES",
+		22591: "S_DUMMY_MRES",
+		22592: "S_DUMMY_MRES",
+		22593: "S_DUMMY_MRES",
+		22594: "S_DUMMY_MRES",
+		22595: "S_DUMMY_MRES",
+		22596: "S_DUMMY_MRES",
+		22597: "S_DUMMY_MRES",
+		22598: "S_DUMMY_MRES",
+		22599: "S_DUMMY_MRES",
+		22600: "S_DUMMY_DEFAULT",
+		22601: "S_DUMMY_DEFAULT",
+		22602: "S_DUMMY_DEFAULT",
+		22603: "S_DUMMY_MRES",
+		22604: "S_DUMMY_MRES",
+		22605: "S_DUMMY_MRES",
+		22606: "S_DUMMY_MRES",
+		22607: "S_DUMMY_MRES",
+		22608: "S_DUMMY_MRES",
+		22609: "S_DUMMY_MRES",
+		22610: "S_DUMMY_MRES",
+		22611: "S_DUMMY_MRES",
+		22612: "S_DUMMY_MRES",
+		22613: "S_DUMMY_MRES",
+		22614: "S_DUMMY_DEFAULT",
+		22615: "S_DUMMY_DEFAULT",
+		22616: "S_DUMMY_DEFAULT",
+		22617: "S_DUMMY_MRES",
+		22618: "S_DUMMY_MRES",
+		22619: "S_DUMMY_MRES",
+		22620: "S_DUMMY_MRES",
+		22621: "S_DUMMY_MRES",
+		22622: "S_DUMMY_MRES",
+		22623: "S_DUMMY_MRES",
+		22624: "S_DUMMY_MRES",
+		22625: "S_DUMMY_MRES",
+		22626: "S_DUMMY_MRES",
+		22627: "S_DUMMY_MRES",
+		22628: "S_DUMMY_DEFAULT",
+		22629: "S_DUMMY_DEFAULT",
+		22630: "S_DUMMY_DEFAULT",
+		22631: "S_DUMMY_DEFAULT",
+		22632: "S_DUMMY_DEFAULT",
+		22633: "S_DUMMY_DEFAULT",
+		22634: "S_DUMMY_DEFAULT",
+		22635: "S_DUMMY_DEFAULT",
+		22636: "S_DUMMY_DEFAULT",
+		22637: "S_DUMMY_DEFAULT",
+		22638: "S_DUMMY_DEFAULT",
+		22639: "S_DUMMY_DEFAULT",
+		22640: "S_DUMMY_DEFAULT",
+		22641: "S_DUMMY_DEFAULT",
+		22642: "S_DUMMY_DEFAULT",
+		22643: "S_DUMMY_DEFAULT",
+		22644: "S_DUMMY_DEFAULT",
+		22645: "S_DUMMY_DEFAULT",
+		22646: "S_DUMMY_DEFAULT",
+		22647: "S_DUMMY_DEFAULT",
+		22648: "S_DUMMY_WHITE",
+		22649: "S_DUMMY_BLUE",
+		22650: "S_DUMMY_WOOD",
+		22651: "S_DUMMY_RED",
+		22652: "S_DUMMY_GREEN",
+		22653: "S_DUMMY_PURPLE",
+		22654: "S_DUMMY_YELLOW",
+		22655: "S_DUMMY_BLACK",
+		22656: "S_DUMMY_TEAL",
+		22657: "S_DUMMY_GRAY",
+		22658: "S_DUMMY_WHITE",
+		22659: "S_DUMMY_BLUE",
+		22660: "S_DUMMY_WOOD",
+		22661: "S_DUMMY_RED",
+		22662: "S_DUMMY_GREEN",
+		22663: "S_DUMMY_PURPLE",
+		22664: "S_DUMMY_YELLOW",
+		22665: "S_DUMMY_BLACK",
+		22666: "S_DUMMY_TEAL",
+		22667: "S_DUMMY_GRAY",
+		22668: "S_DUMMY_RES",
+		22669: "CH1_RK",
+		22670: "CH1_GC",
+		22671: "CH1_GC_D",
+		22674: "CH2_DRAGONCLAM",
+		22678: "VARG",
+		22679: "VEDR",
+		22680: "plasma_r",
+		22681: "plasma_r",
+		22682: "SOLLITH",
+		22683: "E_SNOWRING",
+		22684: "2602_EV_HOHOR_ING",
+		22685: "CH2_FLAMEBULL",
+		22686: "CH2_UROCHS",
+		22687: "CH2_LOGIDOGI",
+		22688: "CH2_FIRECOTTON",
+		22689: "CH2_NAMUNSE",
+		22690: "CH2_NAMUNI",
+		22691: "CH2_DUDULSON",
+		22692: "CH2_GARAKSON",
+		22693: "CH2_TUKTAKSON",
+		22694: "CH2_PARUSON",
+		22695: "CH2_MORBANG",
+		22696: "CH2_FIRECLAW",
+		22697: "CH2_FLAMEANIMA",
+		22698: "CH2_FROST_MORBANG",
+		22699: "CH2_ALPURING",
+		22700: "CH2_ICYBLAST",
+		22701: "CH2_ICENEEDLE",
+		22702: "CH2_FOLNIR_NILF",
+		22703: "CH2_FOLNIR_MYRK",
+		22704: "CH2_FOLNIR_HRE",
+		22705: "CH2_FEEOS",
+		22706: "CH2_ANTIRRHINUM",
+		22707: "CH2_FLAMEBULL",
+		22708: "CH2_PARUSON",
+		22709: "CH2_ICENEEDLE",
+		22710: "CH2_FOLNIR_HRE",
+		22711: "CH2_ANTIRRHINUM",
+		22714: "CH2_FLAMEBULL",
+		22715: "CH2_FLAMEBULL",
+		22716: "CH1_FIRELOOP",
+		22717: "CH1_FIRELOOP",
+		22718: "FULBUK",
+		22719: "FULBUK",
+		22720: "CH2_LOGIDOGI",
+		22721: "CH2_LOGIDOGI",
+		22724: "HODE",
+		22725: "HODE",
+		22728: "ep18_rakehand",
+		22729: "ep18_rakehand",
+		22730: "GOAT",
+		22731: "GOAT",
+		22732: "EP21_LETTERSTER",
+		22733: "EP21_LETTERSTER",
+		22739: "venenum2",
+		22740: "venenum2",
+		22741: "dolorian",
+		22742: "dolorian",
+		22743: "CH1_LISTENER",
+		22744: "CH1_LISTENER",
+		22745: "gaster",
+		22746: "gaster",
+		22747: "FROZENWOLF",
+		22748: "FROZENWOLF",
+		22749: "ice_ghost",
+		22750: "ice_ghost",
+		22751: "EP20_ICEWIND1",
+		22752: "EP20_ICEWIND1",
+		22753: "CH2_ICYBLAST",
+		22754: "CH2_ICYBLAST",
+		22759: "MD_BETELGEUSE_T1",
+		22760: "MD_BETELGEUSE_T2",
+		22761: "MD_BETELGEUSE_T3",
+		22762: "invisible",
+		22763: "invisible",
+		22764: "invisible",
+		22765: "invisible",
+		22766: "invisible",
+		22767: "invisible",
+		22768: "XM_MARIONETTE",
+		22769: "XM_HYLOZOIST",
+		22770: "XM_CELINE_KIMI3",
+		22771: "EP20_COPO",
+		22772: "EP20_ICEEGG",
+		22773: "EP20_ICEWIND2",
+		22774: "EP20_ICEWIND1",
+		22775: "EP20_RABBIT_ICESLUG",
+		22776: "EP20_ANGEL_ICESLUG",
+		22777: "EP20_MELIBE_ICESLUG",
+		22778: "EP19_UNFROST_FLOWER",
+		22779: "EP19_CALMARING",
+		22780: "EP19_LIMACINA",
+		22781: "EP19_ICE_STRAW",
+		22782: "EP19_ICE_GANGU",
+		22783: "EP20_ICEBEAR",
+		22784: "EP19_SHINING_SEAWEED",
+		22785: "Poring",
+		22786: "MANDRAGORA",
+		22787: "mimic",
+		22788: "GOLEM",
+		22789: "WOLF",
+		22790: "Kobold_Archer",
+		22791: "GIANT_SPIDER",
+		22792: "ork_warrior",
+		22793: "GARGOYLE",
+		22794: "BEHOLDER",
+		22795: "MINOROUS",
+		22796: "Baphomet",
+		22797: "WRAITH_DEAD",
+		22798: "WRAITH_DEAD",
+		22799: "evil_druid",
+		22800: "evil_druid",
+		22801: "BURNING_KNIGHT",
+		22802: "BURNING_KNIGHT",
+		22803: "Dark_Frame",
+		22804: "Dark_Frame",
+		22805: "PLASMA_ARCH",
+		22806: "PLASMA_ARCH",
+		22807: "sanare",
+		22808: "sanare",
+		22809: "HAPPY_GIVER",
+		22810: "HAPPY_GIVER",
+		22811: "ACIDUS",
+		22812: "ACIDUS",
+		22813: "HELL_POODLE",
+		22814: "HELL_POODLE",
+		22815: "ZOMBIE_SLAUGHTER",
+		22816: "ZOMBIE_SLAUGHTER",
+		22817: "DARK_PRIEST",
+		22818: "DARK_PRIEST",
+		22819: "NECROMANCER",
+		22820: "NECROMANCER",
+		22821: "FELOCK",
+		22822: "FELOCK",
+		22823: "FELOCK",
+		22824: "BLOODY_KNIGHT",
+		22825: "CHIMERA",
+		22826: "Gargoyle",
+		22827: "khalitzburg",
+		22828: "knight_of_abyss",
+		22829: "raydric",
+		22830: "raydric_archer",
+		22831: "ANCIENT_WORM",
+		22832: "CATERPILLAR",
+		22833: "CREMY_FEAR",
+		22834: "GIANT_HONET",
+		22835: "GIANT_SPIDER",
+		22836: "ALIOT",
+		22837: "ALIOT",
+		22838: "ARCHDAM",
+		22839: "ARCHDAM",
+		22840: "ALARM",
+		22841: "ALARM",
+		22842: "DIMIK",
+		22843: "DIMIK",
+		22844: "HARPY",
+		22845: "HARPY",
+		22846: "MENBLATT",
+		22847: "MENBLATT",
+		22848: "luciola_vespa",
+		22849: "luciola_vespa",
+		22850: "WOOTAN_SHOOTER",
+		22851: "WOOTAN_SHOOTER",
+		22852: "TIYANAK",
+		22853: "TIYANAK",
+		22854: "ZENORC",
+		22855: "ZENORC",
+		22856: "caput",
+		22857: "caput",
+		22858: "WAKWAK",
+		22859: "WAKWAK",
+		23e3: "DARK_ILLUSION2",
+		23001: "MD_RIGEL",
+		23002: "20TH_EVENT_HEMEL",
+		23003: "20TH_EVENT_LOLI_RURI",
+		23004: "20TH_EVENT_GIBBET",
+		23005: "20TH_EVENT_HYLOZOIST",
+		23006: "20TH_EVENT_MURDERER",
+		23007: "20TH_EVENT_CORPS",
+		23008: "20TH_EVENT_CO_CMDER"
 	};
 }));
 //#endregion
@@ -108573,7 +111330,91 @@ var init_SkillConst = __esmMin((() => {
 		CD_DIVINUS_FLOS: 6518,
 		IQ_BLAZING_FLAME_BLAST: 6519,
 		WH_WILD_WALK: 6520,
-		TR_RHYTHMICAL_WAVE: 6521
+		TR_RHYTHMICAL_WAVE: 6521,
+		DR_WEREWOLF: 6524,
+		DR_ENRAGE_WOLF: 6525,
+		DR_NOMERCY_CLAW: 6526,
+		DR_CRUEL_BITE: 6527,
+		DR_HUNGER: 6528,
+		DR_BLOOD_HOWLING: 6529,
+		DR_BEASTY_NOSE: 6530,
+		DR_WERERAPTOR: 6531,
+		DR_ENRAGE_RAPTOR: 6532,
+		DR_SHOOTING_FEATHER: 6533,
+		DR_FLICKING_TONADO: 6534,
+		DR_LOW_FLIGHT: 6535,
+		DR_PREENING: 6536,
+		DR_SHARPE_EYES: 6537,
+		DR_TRUTH_OF_ICE: 6538,
+		DR_ICE_TOTEM: 6539,
+		DR_ICE_CLOUD: 6540,
+		DR_TRUTH_OF_WIND: 6541,
+		DR_CUTTING_WIND: 6542,
+		DR_WIND_BOMB: 6543,
+		DR_TRUTH_OF_EARTH: 6544,
+		DR_EARTH_FLOWER: 6545,
+		DR_AROUND_FLOWER: 6546,
+		DR_NATURE_SHIELD: 6547,
+		DR_NATURE_LOGIC: 6548,
+		KR_NASTY_SLASH: 6549,
+		KR_DOUBLE_SLASH: 6550,
+		KR_CLAW_WAVE: 6551,
+		KR_CHOP_CHOP: 6552,
+		KR_IRON_HOWLING: 6553,
+		KR_WOLF_INSTINCT: 6554,
+		KR_SHARPEN_GUST: 6555,
+		KR_SHARPEN_HAIL: 6556,
+		KR_TYPHOON_WING: 6557,
+		KR_FEATHER_SPRINKLE: 6558,
+		KR_WIND_VEIL: 6559,
+		KR_RAPTORIAL_INSTINCT: 6560,
+		KR_ICE_PILLAR: 6561,
+		KR_ICE_SPLASH: 6562,
+		KR_THUNDERING_FOCUS: 6563,
+		KR_THUNDERING_FOCUS_S: 6564,
+		KR_THUNDERING_ORB: 6565,
+		KR_THUNDERING_ORB_S: 6566,
+		KR_THUNDERING_CALL: 6567,
+		KR_THUNDERING_CALL_S: 6568,
+		KR_EARTH_DRILL: 6569,
+		KR_EARTH_STAMP: 6570,
+		KR_EARTH_BUD: 6571,
+		KR_NATURE_VIGOUR: 6572,
+		KR_NATURE_PROTECTION: 6573,
+		KR_GROUND_BLOOM: 6574,
+		AT_SIXTH_SENSE: 6575,
+		AT_PULSE_OF_MADNESS: 6576,
+		AT_ALPHA_PHASE: 6577,
+		AT_PRIMAL_CLAW: 6578,
+		AT_FERAL_CLAW: 6579,
+		AT_ALPHA_CLAW: 6580,
+		AT_SAVAGE_LUNGE: 6581,
+		AT_FRENZY_FANG: 6582,
+		AT_FLIP_FLAP: 6583,
+		AT_FLIP_FLAP_TARGET: 6584,
+		AT_APEX_PHASE: 6585,
+		AT_PINION_SHOT: 6586,
+		AT_ZEPHYR_LINK: 6587,
+		AT_QUILL_SPEAR: 6588,
+		AT_QUILL_SPEAR_S: 6589,
+		AT_TEMPEST_FLAP: 6590,
+		AT_AERO_SYNC: 6591,
+		AT_GLACIER_MONOLITH: 6592,
+		AT_GLACIER_NOVA: 6593,
+		AT_GLACIER_SHARD: 6594,
+		AT_GLACIER_STOMP: 6595,
+		AT_CHILLING_BLAST: 6596,
+		AT_ROARING_PIERCER: 6597,
+		AT_ROARING_PIERCER_S: 6598,
+		AT_ROARING_CHARGE: 6599,
+		AT_ROARING_CHARGE_S: 6600,
+		AT_FURIOS_STORM: 6601,
+		AT_TERRA_WAVE: 6602,
+		AT_TERRA_HARVEST: 6603,
+		AT_SOLID_STOMP: 6604,
+		AT_GRAVITY_HOLE: 6605,
+		AT_NATURE_AID: 6606,
+		AT_NATURE_HARMONY: 6607
 	};
 }));
 //#endregion
@@ -139769,6 +142610,92 @@ var init_SkillTreeView = __esmMin((() => {
 		[SkillConst_default.SS_ANKOKURYUUAKUMU]: 41,
 		[SkillConst_default.SS_FOUR_CHARM]: 42
 	};
+	SkillTreeView[JobConst_default.DRUID] = {
+		list: 1,
+		beforeJob: JobConst_default.NOVICE,
+		[SkillConst_default.DR_WEREWOLF]: 1,
+		[SkillConst_default.DR_WERERAPTOR]: 2,
+		[SkillConst_default.DR_BEASTY_NOSE]: 3,
+		[SkillConst_default.DR_TRUTH_OF_ICE]: 4,
+		[SkillConst_default.DR_TRUTH_OF_WIND]: 5,
+		[SkillConst_default.DR_TRUTH_OF_EARTH]: 6,
+		[SkillConst_default.DR_BLOOD_HOWLING]: 8,
+		[SkillConst_default.DR_PREENING]: 9,
+		[SkillConst_default.DR_SHARPE_EYES]: 10,
+		[SkillConst_default.DR_ICE_TOTEM]: 11,
+		[SkillConst_default.DR_CUTTING_WIND]: 12,
+		[SkillConst_default.DR_EARTH_FLOWER]: 13,
+		[SkillConst_default.DR_ENRAGE_WOLF]: 15,
+		[SkillConst_default.DR_ENRAGE_RAPTOR]: 16,
+		[SkillConst_default.DR_ICE_CLOUD]: 18,
+		[SkillConst_default.DR_WIND_BOMB]: 19,
+		[SkillConst_default.DR_AROUND_FLOWER]: 20,
+		[SkillConst_default.DR_NOMERCY_CLAW]: 22,
+		[SkillConst_default.DR_SHOOTING_FEATHER]: 23,
+		[SkillConst_default.DR_NATURE_SHIELD]: 25,
+		[SkillConst_default.DR_NATURE_LOGIC]: 26,
+		[SkillConst_default.DR_CRUEL_BITE]: 29,
+		[SkillConst_default.DR_LOW_FLIGHT]: 30,
+		[SkillConst_default.DR_HUNGER]: 36,
+		[SkillConst_default.DR_FLICKING_TONADO]: 37
+	};
+	SkillTreeView[JobConst_default.KARNOS] = {
+		list: 2,
+		beforeJob: JobConst_default.DRUID,
+		[SkillConst_default.KR_DOUBLE_SLASH]: 0,
+		[SkillConst_default.KR_SHARPEN_GUST]: 1,
+		[SkillConst_default.KR_WOLF_INSTINCT]: 2,
+		[SkillConst_default.KR_ICE_PILLAR]: 4,
+		[SkillConst_default.KR_THUNDERING_FOCUS]: 5,
+		[SkillConst_default.KR_EARTH_BUD]: 6,
+		[SkillConst_default.KR_NASTY_SLASH]: 7,
+		[SkillConst_default.KR_SHARPEN_HAIL]: 8,
+		[SkillConst_default.KR_RAPTORIAL_INSTINCT]: 9,
+		[SkillConst_default.KR_ICE_SPLASH]: 11,
+		[SkillConst_default.KR_THUNDERING_ORB]: 12,
+		[SkillConst_default.KR_EARTH_DRILL]: 13,
+		[SkillConst_default.KR_CLAW_WAVE]: 14,
+		[SkillConst_default.KR_FEATHER_SPRINKLE]: 15,
+		[SkillConst_default.KR_THUNDERING_CALL]: 19,
+		[SkillConst_default.KR_EARTH_STAMP]: 20,
+		[SkillConst_default.KR_CHOP_CHOP]: 21,
+		[SkillConst_default.KR_TYPHOON_WING]: 22,
+		[SkillConst_default.KR_NATURE_VIGOUR]: 25,
+		[SkillConst_default.KR_NATURE_PROTECTION]: 26,
+		[SkillConst_default.KR_IRON_HOWLING]: 28,
+		[SkillConst_default.KR_WIND_VEIL]: 29
+	};
+	SkillTreeView[JobConst_default.ALITEA] = {
+		list: 3,
+		beforeJob: JobConst_default.KARNOS,
+		[SkillConst_default.AT_PULSE_OF_MADNESS]: 0,
+		[SkillConst_default.AT_FLIP_FLAP]: 1,
+		[SkillConst_default.AT_SIXTH_SENSE]: 2,
+		[SkillConst_default.AT_GLACIER_MONOLITH]: 4,
+		[SkillConst_default.AT_ROARING_CHARGE]: 5,
+		[SkillConst_default.AT_TERRA_HARVEST]: 6,
+		[SkillConst_default.AT_PRIMAL_CLAW]: 7,
+		[SkillConst_default.AT_PINION_SHOT]: 8,
+		[SkillConst_default.AT_ALPHA_PHASE]: 9,
+		[SkillConst_default.AT_GLACIER_SHARD]: 11,
+		[SkillConst_default.AT_ROARING_PIERCER]: 12,
+		[SkillConst_default.AT_TERRA_WAVE]: 13,
+		[SkillConst_default.AT_FERAL_CLAW]: 14,
+		[SkillConst_default.AT_QUILL_SPEAR]: 15,
+		[SkillConst_default.AT_APEX_PHASE]: 16,
+		[SkillConst_default.AT_GLACIER_STOMP]: 18,
+		[SkillConst_default.AT_FURIOS_STORM]: 19,
+		[SkillConst_default.AT_SOLID_STOMP]: 20,
+		[SkillConst_default.AT_ALPHA_CLAW]: 21,
+		[SkillConst_default.AT_TEMPEST_FLAP]: 22,
+		[SkillConst_default.AT_CHILLING_BLAST]: 25,
+		[SkillConst_default.AT_FRENZY_FANG]: 28,
+		[SkillConst_default.AT_AERO_SYNC]: 29,
+		[SkillConst_default.AT_NATURE_AID]: 32,
+		[SkillConst_default.AT_NATURE_HARMONY]: 33,
+		[SkillConst_default.AT_GRAVITY_HOLE]: 34,
+		[SkillConst_default.AT_SAVAGE_LUNGE]: 35
+	};
 	duplicateEntry$1(JobConst_default.NOVICE, JobConst_default.NOVICE_B);
 	duplicateEntry$1(JobConst_default.SWORDMAN, JobConst_default.SWORDMAN_B);
 	duplicateEntry$1(JobConst_default.MAGICIAN, JobConst_default.MAGICIAN_B);
@@ -139875,6 +142802,8 @@ var init_SkillTreeView = __esmMin((() => {
 	duplicateEntry$1(JobConst_default.DRAGON_KNIGHT, JobConst_default.DRAGON_KNIGHT2);
 	duplicateEntry$1(JobConst_default.IMPERIAL_GUARD, JobConst_default.IMPERIAL_GUARD2);
 	duplicateEntry$1(JobConst_default.SKY_EMPEROR, JobConst_default.SKY_EMPEROR2);
+	duplicateEntry$1(JobConst_default.DRUID, JobConst_default.DRUID_B);
+	duplicateEntry$1(JobConst_default.KARNOS, JobConst_default.KARNOS_B);
 }));
 //#endregion
 //#region src/DB/Skills/SkillTreeMerge.js
@@ -139903,10 +142832,10 @@ function keepBuiltInSkills(tree, jobIds, builtIn = BuiltInSkillTreeView) {
 		const entry = tree[jobId];
 		const base = builtIn[jobId];
 		if (!entry || !base) continue;
-		const taken = new Set(Object.keys(entry).filter(isSkill).map((key) => entry[key]));
+		const taken = new Set(Object.keys(entry).filter(isSkill$1).map((key) => entry[key]));
 		let next = Math.max(-1, ...taken) + 1;
 		for (const [skillId, pos] of Object.entries(base)) {
-			if (!isSkill(skillId) || skillId in entry) continue;
+			if (!isSkill$1(skillId) || skillId in entry) continue;
 			let slot = pos;
 			if (taken.has(slot)) {
 				while (taken.has(next)) next++;
@@ -139917,11 +142846,116 @@ function keepBuiltInSkills(tree, jobIds, builtIn = BuiltInSkillTreeView) {
 		}
 	}
 }
-var isSkill, BuiltInSkillTreeView;
+var isSkill$1, BuiltInSkillTreeView;
 var init_SkillTreeMerge = __esmMin((() => {
 	init_SkillTreeView();
-	isSkill = (key) => /^\d+$/.test(key);
+	isSkill$1 = (key) => /^\d+$/.test(key);
 	BuiltInSkillTreeView = Object.freeze(Object.fromEntries(Object.entries(SkillTreeView).map(([jobId, entry]) => [jobId, Object.freeze({ ...entry })])));
+}));
+//#endregion
+//#region src/DB/Skills/SkillTreeMods.js
+/** Forget every hidden skill, before a client loads its mods' tables. */
+function resetHiddenSkills() {
+	HiddenSkills.clear();
+}
+/**
+* Hide a skill in a job's window.
+*
+* @param {number} jobId
+* @param {number} skillId
+*/
+function hideSkill(jobId, skillId) {
+	const job = Number(jobId);
+	if (!HiddenSkills.has(job)) HiddenSkills.set(job, /* @__PURE__ */ new Set());
+	HiddenSkills.get(job).add(String(skillId));
+}
+/**
+* A job's window, without the skills hidden for that job. `positions` is
+* what the window lays out: one object per tab, skill id to slot.
+*
+* @param {Array<object>} positions - changed in place
+* @param {number} jobId
+* @return {Array<object>} positions
+*/
+function withoutHiddenSkills(positions, jobId) {
+	const hidden = HiddenSkills.get(Number(jobId));
+	if (!hidden) return positions;
+	positions.forEach((items) => {
+		if (items) for (const skillId of hidden) delete items[skillId];
+	});
+	return positions;
+}
+/**
+* The slots the jobs before `jobId` fill in its tab. The skill window shows a
+* job's skills and its predecessors' in one tab when they share a `list`: a
+* first job's with the Novice's, a transcendent second job's with the second
+* job's (getSkillPosition).
+*
+* @param {object} tree - SkillTreeView
+* @param {number} jobId
+* @return {Set<number>} slots
+*/
+function slotsBefore(tree, jobId) {
+	const entry = tree[jobId];
+	const slots = /* @__PURE__ */ new Set();
+	const seen = /* @__PURE__ */ new Set([String(jobId)]);
+	let before = entry.beforeJob;
+	while (before !== null && before !== void 0 && !seen.has(String(before)) && tree[before]) {
+		seen.add(String(before));
+		const parent = tree[before];
+		if (parent.list === entry.list) {
+			for (const key of Object.keys(parent)) if (isSkill(key)) slots.add(parent[key]);
+		}
+		before = parent.beforeJob;
+	}
+	return slots;
+}
+/**
+* Put a mod's skill on a slot of a job's tree. A skill of the job's own
+* already there moves to the first free slot, so the mod's gets the place it
+* asked for. A slot an earlier job's skill fills in the same tab is not the
+* mod's to take: that skill is shared with other jobs, so the mod's moves to
+* the first free slot instead.
+*
+* The job gets an entry of its own first: jobs can share one (the built-in
+* tree's duplicateEntry), and a mod places a skill for the jobs it names.
+*
+* @param {object} tree - SkillTreeView, changed in place
+* @param {number} jobId
+* @param {number} pos
+* @param {number} skillId
+* @return {boolean} false when the client has no tree for that job
+*/
+function placeSkill(tree, jobId, pos, skillId) {
+	if (!tree[jobId]) return false;
+	const entry = { ...tree[jobId] };
+	tree[jobId] = entry;
+	const id = String(skillId);
+	const before = slotsBefore(tree, jobId);
+	const firstFree = (...others) => {
+		const taken = /* @__PURE__ */ new Set([
+			...before,
+			...others,
+			...Object.keys(entry).filter((key) => isSkill(key) && key !== id).map((key) => entry[key])
+		]);
+		let free = 0;
+		while (taken.has(free)) free++;
+		return free;
+	};
+	let slot = Number(pos);
+	if (before.has(slot)) slot = firstFree();
+	const occupant = Object.keys(entry).find((key) => isSkill(key) && key !== id && entry[key] === slot);
+	if (occupant !== void 0) {
+		delete entry[occupant];
+		entry[occupant] = firstFree(slot);
+	}
+	entry[id] = slot;
+	return true;
+}
+var isSkill, HiddenSkills;
+var init_SkillTreeMods = __esmMin((() => {
+	isSkill = (key) => /^\d+$/.test(key);
+	HiddenSkills = /* @__PURE__ */ new Map();
 }));
 //#endregion
 //#region src/DB/Jobs/JobHitSoundTable.js
@@ -142918,7 +145952,9 @@ var init_StatusConst = __esmMin((() => {
 		C_RATE_PLUS: 1447,
 		RESIST_PLUS: 1448,
 		PVP_DUN_BUFF: 1449,
-		MAX: 1450
+		WEREWOLF: 1675,
+		WERERAPTOR: 1680,
+		MAX: 1681
 	};
 }));
 //#endregion
@@ -161034,28 +164070,26 @@ var init_PacketStructure = __esmMin((() => {
 		this.StoreType = 0;
 		this.maxPrice = 0;
 		this.minPrice = 0;
-		this.ItemIDList = 0;
-		this.CardIDList = 0;
+		this.ItemIDList = [];
+		this.CardIDList = [];
 	};
 	PACKET.CZ.SEARCH_STORE_INFO.prototype.build = function() {
-		let i, count, offset;
 		const ver = this.getPacketVersion();
-		const pkt = new BinaryWriter(ver[2]);
+		const width = PacketVerManager_default.value >= 20181121 ? 4 : 2;
+		const length = ver[9] + width * (this.ItemIDList.length + this.CardIDList.length);
+		const pkt = new BinaryWriter(length);
 		pkt.writeShort(ver[1]);
-		pkt.view.setInt16(ver[3], 15 + this.ItemIDList.length * 2 + this.CardIDList.length * 2, true);
-		pkt.view.setUint8(ver[4], this.StoreType, true);
+		pkt.view.setUint16(ver[3], length, true);
+		pkt.view.setUint8(ver[4], this.StoreType);
 		pkt.view.setUint32(ver[5], this.maxPrice, true);
 		pkt.view.setUint32(ver[6], this.minPrice, true);
-		pkt.view.setUint8(ver[7], this.ItemIDList.length, true);
-		pkt.view.setUint8(ver[8], this.CardIDList.length, true);
-		offset = ver[9];
-		for (i = 0, count = this.ItemIDList.length; i < count; ++i) {
-			pkt.view.setUint16(offset, this.ItemIDList[i], true);
-			offset += 2;
-		}
-		for (i = 0, count = this.CardIDList.length; i < count; ++i) {
-			pkt.view.setUint16(offset, this.CardIDList[i], true);
-			offset += 2;
+		pkt.view.setUint8(ver[7], this.ItemIDList.length);
+		pkt.view.setUint8(ver[8], this.CardIDList.length);
+		let offset = ver[9];
+		for (const id of [...this.ItemIDList, ...this.CardIDList]) {
+			if (width === 4) pkt.view.setUint32(offset, id, true);
+			else pkt.view.setUint16(offset, id, true);
+			offset += width;
 		}
 		return pkt;
 	};
@@ -161080,11 +164114,13 @@ var init_PacketStructure = __esmMin((() => {
 	};
 	PACKET.CZ.SSILIST_ITEM_CLICK.prototype.build = function() {
 		const ver = this.getPacketVersion();
-		const pkt = new BinaryWriter(ver[2]);
+		const modern = PacketVerManager_default.value >= 20181121;
+		const pkt = new BinaryWriter(modern ? 14 : 12);
 		pkt.writeShort(ver[1]);
-		pkt.view.setUint32(ver[3], this.AID, true);
-		pkt.view.setULong(ver[4], this.SSI_ID, true);
-		pkt.view.setUShort(ver[5], this.ITID, true);
+		pkt.writeULong(this.AID);
+		pkt.writeULong(this.SSI_ID);
+		if (modern) pkt.writeULong(this.ITID);
+		else pkt.writeUShort(this.ITID);
 		return pkt;
 	};
 	PACKET.CH.SELECT_ACCESSIBLE_MAPNAME = function PACKET_CH_SELECT_ACCESSIBLE_MAPNAME() {
@@ -162896,9 +165932,9 @@ var init_PacketStructure = __esmMin((() => {
 	PACKET.ZC.PROPERTY_PET.size = 37;
 	PACKET.ZC.FEED_PET = function PACKET_ZC_FEED_PET(fp, end) {
 		this.cRet = fp.readChar();
-		this.ITID = fp.readUShort();
+		this.ITID = PacketVerManager_default.value >= 20181121 ? fp.readULong() : fp.readUShort();
 	};
-	PACKET.ZC.FEED_PET.size = 5;
+	PACKET.ZC.FEED_PET.size = PacketVerManager_default.value >= 20181121 ? 7 : 5;
 	PACKET.ZC.CHANGESTATE_PET = function PACKET_ZC_CHANGESTATE_PET(fp, end) {
 		this.type = fp.readChar();
 		this.GID = fp.readLong();
@@ -163759,9 +166795,9 @@ var init_PacketStructure = __esmMin((() => {
 	PACKET.ZC.PROPERTY_HOMUN.size = 71;
 	PACKET.ZC.FEED_MER = function PACKET_ZC_FEED_MER(fp, end) {
 		this.cRet = fp.readChar();
-		this.ITID = fp.readUShort();
+		this.ITID = PacketVerManager_default.value >= 20181121 ? fp.readULong() : fp.readUShort();
 	};
-	PACKET.ZC.FEED_MER.size = 5;
+	PACKET.ZC.FEED_MER.size = PacketVerManager_default.value >= 20181121 ? 7 : 5;
 	PACKET.ZC.CHANGESTATE_MER = function PACKET_ZC_CHANGESTATE_MER(fp, end) {
 		this.type = fp.readChar();
 		this.state = fp.readChar();
@@ -165347,6 +168383,11 @@ var init_PacketStructure = __esmMin((() => {
 		this.Bgm = fp.readBinaryString(NAME_LENGTH);
 	};
 	PACKET.ZC.PLAY_NPC_BGM.size = 26;
+	PACKET.ZC.PLAY_NPC_BGM2 = function PACKET_ZC_PLAY_NPC_BGM2(fp, end) {
+		this.playType = fp.readUChar();
+		this.Bgm = fp.readBinaryString(end - fp.tell());
+	};
+	PACKET.ZC.PLAY_NPC_BGM2.size = -1;
 	PACKET.ZC.DEFINE_CHECK = function PACKET_ZC_DEFINE_CHECK(fp, end) {
 		this.Result = fp.readLong();
 	};
@@ -165555,6 +168596,15 @@ var init_PacketStructure = __esmMin((() => {
 		this.limitZeny = fp.readLong();
 	};
 	PACKET.ZC.UPDATE_ITEM_FROM_BUYING_STORE.size = 10;
+	PACKET.ZC.UPDATE_ITEM_FROM_BUYING_STORE2 = function PACKET_ZC_UPDATE_ITEM_FROM_BUYING_STORE2(fp, end) {
+		this.ITID = PacketVerManager_default.value >= 20181121 ? fp.readULong() : fp.readUShort();
+		this.count = fp.readUShort();
+		this.zeny = fp.readULong();
+		this.limitZeny = fp.readULong();
+		this.charId = fp.readULong();
+		this.updateTime = fp.readULong();
+	};
+	Object.defineProperty(PACKET.ZC.UPDATE_ITEM_FROM_BUYING_STORE2, "size", { get: () => PacketVerManager_default.value >= 20181121 ? 24 : 22 });
 	PACKET.ZC.ITEM_DELETE_BUYING_STORE = function PACKET_ZC_ITEM_DELETE_BUYING_STORE(fp, end) {
 		this.index = fp.readShort();
 		this.count = fp.readShort();
@@ -165653,6 +168703,35 @@ var init_PacketStructure = __esmMin((() => {
 		})();
 	};
 	PACKET.ZC.SEARCH_STORE_INFO_ACK.size = -1;
+	PACKET.ZC.SEARCH_STORE_INFO_ACK2 = function PACKET_ZC_SEARCH_STORE_INFO_ACK2(fp, end) {
+		this.IsFirstPage = fp.readUChar();
+		this.IsNexPage = fp.readUChar();
+		this.RemainedSearchCnt = fp.readUChar();
+		this.SSI_List = [];
+		while (fp.tell() + 142 <= end) {
+			const item = {};
+			item.SSI_ID = fp.readULong();
+			item.AID = fp.readULong();
+			item.StoreName = fp.readString(80);
+			item.ITID = fp.readULong();
+			item.type = fp.readUChar();
+			item.price = fp.readULong();
+			item.count = fp.readUShort();
+			item.slot = {};
+			for (let i = 1; i <= 4; i++) item.slot[`card${i}`] = fp.readULong();
+			item.Options = [];
+			for (let i = 1; i <= 5; i++) item.Options[i] = {
+				index: fp.readShort(),
+				value: fp.readShort(),
+				param: fp.readUChar()
+			};
+			item.RefiningLevel = fp.readUChar();
+			item.enchantgrade = fp.readUChar();
+			item.IsIdentified = 1;
+			this.SSI_List.push(item);
+		}
+	};
+	PACKET.ZC.SEARCH_STORE_INFO_ACK2.size = -1;
 	PACKET.ZC.SEARCH_STORE_INFO_FAILED = function PACKET_ZC_SEARCH_STORE_INFO_FAILED(fp, end) {
 		this.Reason = fp.readUChar();
 	};
@@ -170231,12 +173310,12 @@ var init_PacketStructure = __esmMin((() => {
 		this.serial = fp.readLong();
 		this.step = fp.readChar();
 		this.idx = fp.readChar();
-		this.additionItemID = fp.readUShort();
+		this.additionItemID = PacketVerManager_default.value >= 20181121 ? fp.readULong() : fp.readUShort();
 		this.goldPoint = fp.readLong();
 		this.silverPoint = fp.readLong();
 		this.bronzePoint = fp.readLong();
 	};
-	PACKET.ZC.ACK_OPEN_ROULETTE.size = 23;
+	PACKET.ZC.ACK_OPEN_ROULETTE.size = PacketVerManager_default.value >= 20181121 ? 25 : 23;
 	PACKET.CZ.REQ_ROULETTE_INFO = function PACKET_CZ_REQ_ROULETTE_INFO() {};
 	PACKET.CZ.REQ_ROULETTE_INFO.prototype.build = function() {
 		const pkt_buf = new BinaryWriter(2);
@@ -170244,15 +173323,16 @@ var init_PacketStructure = __esmMin((() => {
 		return pkt_buf;
 	};
 	PACKET.ZC.ACK_ROULETTE_INFO = function PACKET_ZC_ACK_ROULETTE_INFO(fp, end) {
-		fp.readUShort();
 		this.serial = fp.readULong();
 		this.items = [];
-		while (fp.tell() < end) {
+		const rowSize = PacketVerManager_default.value >= 20180511 ? 12 : 8;
+		while (fp.tell() + rowSize <= end) {
 			const item = {};
 			item.row = fp.readUShort();
 			item.position = fp.readUShort();
-			item.itemId = fp.readUShort();
+			item.itemId = PacketVerManager_default.value >= 20180511 ? fp.readULong() : fp.readUShort();
 			item.count = fp.readUShort();
+			if (PacketVerManager_default.value >= 20180511) fp.readUShort();
 			this.items.push(item);
 		}
 	};
@@ -170277,12 +173357,12 @@ var init_PacketStructure = __esmMin((() => {
 		this.result = fp.readUChar();
 		this.step = fp.readUShort();
 		this.idx = fp.readUShort();
-		this.additionItemID = fp.readUShort();
+		this.additionItemID = PacketVerManager_default.value >= 20181121 ? fp.readULong() : fp.readUShort();
 		this.remainGold = fp.readLong();
 		this.remainSilver = fp.readLong();
 		this.remainBronze = fp.readLong();
 	};
-	PACKET.ZC.ACK_GENERATE_ROULETTE.size = 21;
+	PACKET.ZC.ACK_GENERATE_ROULETTE.size = PacketVerManager_default.value >= 20181121 ? 23 : 21;
 	PACKET.CZ.RECV_ROULETTE_ITEM = function PACKET_CZ_RECV_ROULETTE_ITEM() {
 		this.condition = 0;
 	};
@@ -170294,9 +173374,9 @@ var init_PacketStructure = __esmMin((() => {
 	};
 	PACKET.ZC.RECV_ROULETTE_ITEM = function PACKET_ZC_RECV_ROULETTE_ITEM(fp, end) {
 		this.result = fp.readUChar();
-		this.additionItemID = fp.readUShort();
+		this.additionItemID = PacketVerManager_default.value >= 20181121 ? fp.readULong() : fp.readUShort();
 	};
-	PACKET.ZC.RECV_ROULETTE_ITEM.size = 5;
+	PACKET.ZC.RECV_ROULETTE_ITEM.size = PacketVerManager_default.value >= 20181121 ? 7 : 5;
 	PACKET.ZC.SELECTCART = function PACKET_ZC_SELECTCART(fp, end) {
 		this.identity = fp.readLong();
 		this.typeList = [];
@@ -203169,6 +206249,14 @@ var init_PacketVersions = __esmMin((() => {
 				0
 			]
 		],
+		20181121: [[
+			PACKET.CZ.SSILIST_ITEM_CLICK,
+			2108,
+			14,
+			2,
+			6,
+			10
+		]],
 		20190904: [
 			[
 				PACKET.CZ.ADD_FRIENDS,
@@ -203356,8 +206444,10 @@ var init_PacketVersions = __esmMin((() => {
 			[
 				PACKET.CZ.SSILIST_ITEM_CLICK,
 				2108,
-				12,
-				0
+				14,
+				2,
+				6,
+				10
 			]
 		],
 		20211103: [
@@ -203547,8 +206637,10 @@ var init_PacketVersions = __esmMin((() => {
 			[
 				PACKET.CZ.SSILIST_ITEM_CLICK,
 				2108,
-				12,
-				0
+				14,
+				2,
+				6,
+				10
 			]
 		]
 	};
@@ -204088,6 +207180,7 @@ var init_PacketRegister = __esmMin((() => {
 		2093: PACKET.HC.ACCEPT_ENTER_NEO_UNION_HEADER,
 		2101: PACKET.CZ.SEARCH_STORE_INFO,
 		2102: PACKET.ZC.SEARCH_STORE_INFO_ACK,
+		2916: PACKET.ZC.SEARCH_STORE_INFO_ACK2,
 		2103: PACKET.ZC.SEARCH_STORE_INFO_FAILED,
 		2104: PACKET.CZ.SEARCH_STORE_INFO_NEXT_PAGE,
 		2105: PACKET.ZC.ACK_BAN_GUILD_SSO,
@@ -204253,6 +207346,7 @@ var init_PacketRegister = __esmMin((() => {
 		2526: PACKET.ZC.WHISPER2,
 		2527: PACKET.ZC.ACK_WHISPER2,
 		2533: PACKET.ZC.DELETEITEM_FROM_MCSTORE2,
+		2534: PACKET.ZC.UPDATE_ITEM_FROM_BUYING_STORE2,
 		2535: PACKET.ZC.RODEX_ICON,
 		2536: PACKET.CZ.OPEN_RODEXBOX,
 		2537: PACKET.CZ.CLOSE_RODEXBOX,
@@ -204460,6 +207554,7 @@ var init_PacketRegister = __esmMin((() => {
 		2940: PACKET.ZC.BAN_LIST3,
 		2941: PACKET.ZC.MEMBERMGR_INFO3,
 		2927: PACKET.HC.ACCEPT_MAKECHAR,
+		2956: PACKET.ZC.PLAY_NPC_BGM2,
 		2957: PACKET.ZC.REPUTE_INFO,
 		2958: PACKET.ZC_REPUTE_OPEN,
 		2959: PACKET.ZC.OPEN_REFORM_UI,
@@ -206940,7 +210035,7 @@ function defaultSocketFactory(host, port) {
 	return new Socket$1(host, port, proxy);
 }
 function _scheduleLogCallback(cb) {
-	if (typeof window !== "undefined" && window.requestIdleCallback) requestIdleCallback(cb);
+	if (typeof window !== "undefined" && window.requestIdleCallback) requestIdleCallback(cb, { timeout: 1e3 });
 	else setTimeout(() => cb({
 		timeRemaining: () => 0,
 		didTimeout: true
@@ -206949,7 +210044,7 @@ function _scheduleLogCallback(cb) {
 function _processLogEntry(entry) {
 	if (entry.type === LOG_ENTRY_KNOWN) {
 		if (entry.dumpBytes) console.log("%c[Network] Dump Recv:\n%cPacket ID: 0x%s\nPacket Name: %s\nLength: %d\nContent:\n%s", "color:#900090", "color:inherit", entry.pktId.toString(16), entry.pktName, entry.pktLen, utilsBufferToHexString(entry.dumpBytes).toUpperCase());
-		console.log("%c[Network] Recv:", "color:#900090", entry.instance, entry.hasCallback ? "" : "(no callback)");
+		console.log("%c[Network] Recv: %s", "color:#900090", "0x" + entry.pktId.toString(16) + " " + entry.pktName, entry.instance, entry.hasCallback ? "" : "(no callback)");
 	} else if (entry.type === LOG_ENTRY_UNKNOWN) {
 		if (entry.dumpBytes) console.log("%c[Network] Dump Recv:\n%cPacket ID: 0x%s\nPacket Name: [UNKNOWN]\nLength: %d\nContent:\n%s", "color:#900090", "color:inherit", entry.pktId.toString(16), entry.pktLen, utilsBufferToHexString(entry.dumpBytes).toUpperCase());
 		console.error("[Network] Packet \"%c0x%s%c\" not registered, skipping %d bytes.", "font-weight:bold", entry.pktId.toString(16), "font-weight:normal", entry.pktLen);
@@ -207027,16 +210122,16 @@ function sendPacket(Packet) {
 		const id = new BinaryReader(pkt.buffer).readUShort();
 		console.log("%c[Network] Dump Send: \n%cPacket ID: 0x%s\nPacket Name: %s\nLength: %d\nContent:\n%s", "color:#007070", "color:inherit", id.toString(16), Packet.constructor.name, pkt.buffer.byteLength, utilsBufferToHexString(pkt.buffer).toUpperCase());
 	}
-	console.log("%c[Network] Send:", "color:#007070", Packet);
+	console.log("%c[Network] Send: %s", "color:#007070", Packet.constructor.name, Packet);
 	if (_socket && _socket.isZone) PacketCrypt_default.process(pkt.view);
-	send(pkt.buffer);
+	send$1(pkt.buffer);
 }
 /**
 * Send buffer to the server
 *
 * @param {ArrayBuffer} buffer
 */
-function send(buffer) {
+function send$1(buffer) {
 	if (_socket) _socket.send(buffer);
 }
 /**
@@ -207077,21 +210172,21 @@ function read$1(callback) {
 * @param {number} minCapacity
 */
 function _ringGrow(minCapacity) {
-	let newCap = _ring.length;
+	let newCap = _ring$1.length;
 	while (newCap < minCapacity) newCap *= 2;
 	const pending = _ring_tail - _ring_head;
 	const newRing = new Uint8Array(newCap);
 	if (pending > 0) {
 		const physHead = _ring_head & _ring_mask;
 		const physTail = _ring_tail & _ring_mask;
-		if (physTail > physHead) newRing.set(_ring.subarray(physHead, physTail), 0);
+		if (physTail > physHead) newRing.set(_ring$1.subarray(physHead, physTail), 0);
 		else {
-			const firstChunk = _ring.length - physHead;
-			newRing.set(_ring.subarray(physHead), 0);
-			newRing.set(_ring.subarray(0, physTail), firstChunk);
+			const firstChunk = _ring$1.length - physHead;
+			newRing.set(_ring$1.subarray(physHead), 0);
+			newRing.set(_ring$1.subarray(0, physTail), firstChunk);
 		}
 	}
-	_ring = newRing;
+	_ring$1 = newRing;
 	_ring_mask = newCap - 1;
 	_ring_head = 0;
 	_ring_tail = pending;
@@ -207108,11 +210203,11 @@ function _ringGrow(minCapacity) {
 function _ringSlice(logicalStart, len) {
 	const physStart = logicalStart & _ring_mask;
 	const physEnd = physStart + len;
-	if (physEnd <= _ring.length) return _ring.subarray(physStart, physEnd);
+	if (physEnd <= _ring$1.length) return _ring$1.subarray(physStart, physEnd);
 	const tmp = new Uint8Array(len);
-	const firstChunk = _ring.length - physStart;
-	tmp.set(_ring.subarray(physStart), 0);
-	tmp.set(_ring.subarray(0, len - firstChunk), firstChunk);
+	const firstChunk = _ring$1.length - physStart;
+	tmp.set(_ring$1.subarray(physStart), 0);
+	tmp.set(_ring$1.subarray(0, len - firstChunk), firstChunk);
 	return tmp;
 }
 /**
@@ -207125,8 +210220,8 @@ function _ringSlice(logicalStart, len) {
 */
 function _ringReadUShort(logPos) {
 	const p = logPos & _ring_mask;
-	if (p + 2 <= _ring.length) return _ring[p] | _ring[p + 1] << 8;
-	return _ring[p] | _ring[0] << 8;
+	if (p + 2 <= _ring$1.length) return _ring$1[p] | _ring$1[p + 1] << 8;
+	return _ring$1[p] | _ring$1[0] << 8;
 }
 /**
 * Received data from server.
@@ -207140,13 +210235,13 @@ function receive(buf) {
 	const incoming = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
 	const inLen = incoming.length;
 	const needed = _ring_tail - _ring_head + inLen;
-	if (needed > _ring.length) _ringGrow(needed);
+	if (needed > _ring$1.length) _ringGrow(needed);
 	const physTail = _ring_tail & _ring_mask;
-	const spaceToEnd = _ring.length - physTail;
-	if (inLen <= spaceToEnd) _ring.set(incoming, physTail);
+	const spaceToEnd = _ring$1.length - physTail;
+	if (inLen <= spaceToEnd) _ring$1.set(incoming, physTail);
 	else {
-		_ring.set(incoming.subarray(0, spaceToEnd), physTail);
-		_ring.set(incoming.subarray(spaceToEnd), 0);
+		_ring$1.set(incoming.subarray(0, spaceToEnd), physTail);
+		_ring$1.set(incoming.subarray(spaceToEnd), 0);
 	}
 	_ring_tail += inLen;
 	if (!_fp) _fp = new BinaryReader(/* @__PURE__ */ new ArrayBuffer(0));
@@ -207230,7 +210325,7 @@ function onClose$9() {
 * Close connection with server
 * Is this needed ?
 */
-function close$2() {
+function close$4() {
 	let idx;
 	if (_socket) {
 		const s = _socket;
@@ -207290,7 +210385,7 @@ function utilsLongToIP(long) {
 function utilsBufferToHexString(buffer) {
 	return [...new Uint8Array(buffer)].map((x) => x.toString(16).padStart(2, "0") + " ").join("");
 }
-var _sockets, _socketFactory, _socket, LOG_ENTRY_KNOWN, LOG_ENTRY_UNKNOWN, LOG_QUEUE_SIZE, LOG_QUEUE_MASK, LogEntry, _logPool, _logHead, _logTail, _logScheduled, _ring, _ring_mask, _ring_head, _ring_tail, _fp, _onDisconnect, packetDump, Network;
+var _sockets, _socketFactory, _socket, LOG_ENTRY_KNOWN, LOG_ENTRY_UNKNOWN, LOG_QUEUE_SIZE, LOG_QUEUE_MASK, LogEntry, _logPool, _logHead, _logTail, _logScheduled, _ring$1, _ring_mask, _ring_head, _ring_tail, _fp, _onDisconnect, packetDump, Network;
 var init_NetworkManager = __esmMin((() => {
 	init_Configs();
 	init_BinaryReader();
@@ -207331,8 +210426,8 @@ var init_NetworkManager = __esmMin((() => {
 	_logHead = 0;
 	_logTail = 0;
 	_logScheduled = false;
-	_ring = /* @__PURE__ */ new Uint8Array(262144);
-	_ring_mask = _ring.length - 1;
+	_ring$1 = /* @__PURE__ */ new Uint8Array(262144);
+	_ring_mask = _ring$1.length - 1;
 	_ring_head = 0;
 	_ring_tail = 0;
 	_fp = null;
@@ -207359,11 +210454,11 @@ var init_NetworkManager = __esmMin((() => {
 		for (i = 0; i < count; ++i) registerPacket(keys[i], PacketRegister_default[keys[i]]);
 		return {
 			sendPacket,
-			send,
+			send: send$1,
 			setPing,
 			connect,
 			hookPacket,
-			close: close$2,
+			close: close$4,
 			read: read$1,
 			set onDisconnect(callback) {
 				_onDisconnect = callback;
@@ -207543,7 +210638,7 @@ function begin(lua, token = null, lists = []) {
 * @param {string} filename for the warning
 * @return {string[]} the names skipped
 */
-function finish(lua, token, filename) {
+function finish$2(lua, token, filename) {
 	let skipped = run(lua, `return __ro_lenient.finish(${token})`);
 	if (skipped instanceof Uint8Array) skipped = new TextDecoder().decode(skipped);
 	const names = skipped ? [...new Set(String(skipped).split(", "))] : [];
@@ -207623,7 +210718,7 @@ end
 		mark,
 		defined,
 		begin,
-		finish,
+		finish: finish$2,
 		LUA
 	};
 }));
@@ -207699,7 +210794,7 @@ var init_Events = __esmMin((() => {
 /**
 * Render background (or a black background if no image is loaded yet)
 */
-function render$15() {
+function render$16() {
 	_ctx$5.clearRect(0, 0, _canvas.width, _canvas.height);
 	if (Background._progress > -1) Background.setPercent(Background._progress);
 }
@@ -207711,14 +210806,21 @@ function render$15() {
 function transition(callback) {
 	const transitionDuration = Configs.get("transitionDuration") ? Configs.get("transitionDuration") : 500;
 	if (Background._overlayAnim) Background._overlayAnim.stop();
-	_overlay$1.style.opacity = "0.01";
-	document.body.appendChild(_overlay$1);
-	Background._overlayAnim = animateElement(_overlay$1, { opacity: 1 }, transitionDuration, () => {
+	let duration = transitionDuration;
+	if (_overlay$1.parentNode) {
+		if (parseFloat(_overlay$1.style.opacity) >= .99) duration = 1;
+	} else {
+		_overlay$1.style.opacity = "0.01";
+		document.body.appendChild(_overlay$1);
+	}
+	const anim = animateElement(_overlay$1, { opacity: 1 }, duration, () => {
 		callback();
+		if (Background._overlayAnim !== anim) return;
 		Background._overlayAnim = animateElement(_overlay$1, { opacity: .01 }, transitionDuration, () => {
 			if (_overlay$1.parentNode) _overlay$1.parentNode.removeChild(_overlay$1);
 		});
 	});
+	Background._overlayAnim = anim;
 }
 var _overlay$1, _container, _canvas, _ctx$5, Background;
 var init_Background = __esmMin((() => {
@@ -207785,7 +210887,7 @@ var init_Background = __esmMin((() => {
 			let i;
 			Background._progress = 0;
 			_canvas.style.zIndex = "1";
-			render$15();
+			render$16();
 			if (loading) {
 				Background._loading = loading;
 				return;
@@ -207808,7 +210910,7 @@ var init_Background = __esmMin((() => {
 				height: height + "px"
 			});
 			_ctx$5.clearRect(0, 0, width, height);
-			render$15();
+			render$16();
 		}
 		/**
 		* Set an image as background
@@ -207823,7 +210925,7 @@ var init_Background = __esmMin((() => {
 			Background._removal = null;
 			_container.innerHTML = "";
 			_container.style.backgroundImage = "none";
-			render$15();
+			render$16();
 			if (Array.isArray(filename)) {
 				let loadedCount = 0;
 				const total = filename.length;
@@ -208536,7 +211638,7 @@ function init$14(gl) {
 * @param {number} x
 * @param {number} y
 */
-function render$14(gl, modelView, projection, fog, x, y) {
+function render$15(gl, modelView, projection, fog, x, y) {
 	if (!_texture$5) return;
 	const uniform = _program$29.uniform;
 	const attribute = _program$29.attribute;
@@ -208630,7 +211732,7 @@ var init_GridSelector = __esmMin((() => {
 	GridSelector_default = {
 		init: init$14,
 		free: free$8,
-		render: render$14
+		render: render$15
 	};
 }));
 //#endregion
@@ -208722,7 +211824,7 @@ var init_Ground$1 = __esmMin((() => {
 * @param {object} fog structure
 * @param {object} light structure
 */
-function render$13(gl, modelView, projection, normalMat, fog, light) {
+function render$14(gl, modelView, projection, normalMat, fog, light) {
 	const uniform = _program$28.uniform;
 	const attribute = _program$28.attribute;
 	gl.useProgram(_program$28);
@@ -209013,7 +212115,7 @@ var init_Ground = __esmMin((() => {
 	Ground_default = {
 		init: init$13,
 		free: free$7,
-		render: render$13,
+		render: render$14,
 		getShadowFactor,
 		textures
 	};
@@ -209633,7 +212735,7 @@ function init$12(gl, water) {
 	gl.bindBuffer(gl.ARRAY_BUFFER, _buffer$19);
 	gl.bufferData(gl.ARRAY_BUFFER, water.mesh, gl.STATIC_DRAW);
 	function onTextureLoaded(texture, index) {
-		_textures$3[index] = texture;
+		_textures$6[index] = texture;
 	}
 	for (let i = 0; i < 32; ++i) WebGL_default.texture(gl, water.images[i], onTextureLoaded, i);
 }
@@ -209647,7 +212749,7 @@ function init$12(gl, water) {
 * @param {object} light structure
 * @param {number} tick (game tick)
 */
-function render$12(gl, modelView, projection, fog, light, tick) {
+function render$13(gl, modelView, projection, fog, light, tick) {
 	if (!_vertCount) return;
 	const uniform = _program$26.uniform;
 	const attribute = _program$26.attribute;
@@ -209670,7 +212772,7 @@ function render$12(gl, modelView, projection, fog, light, tick) {
 	gl.uniform1f(uniform.uOpacity, _waterOpacity);
 	gl.uniform1f(uniform.uWavePitch, _wavePitch);
 	gl.uniform1f(uniform.uWaterOffset, frame * _waveSpeed % 360 - 180);
-	gl.bindTexture(gl.TEXTURE_2D, _textures$3[frame / _animSpeed % 32 | 0]);
+	gl.bindTexture(gl.TEXTURE_2D, _textures$6[frame / _animSpeed % 32 | 0]);
 	gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
 	SpriteRenderer.runWithDepth(true, false, false, function() {
 		gl.drawArrays(gl.TRIANGLES, 0, _vertCount);
@@ -209693,9 +212795,9 @@ function free$6(gl) {
 		gl.deleteProgram(_program$26);
 		_program$26 = null;
 	}
-	for (i = 0; i < 32; ++i) if (_textures$3[i]) {
-		gl.deleteTexture(_textures$3[i]);
-		_textures$3[i] = null;
+	for (i = 0; i < 32; ++i) if (_textures$6[i]) {
+		gl.deleteTexture(_textures$6[i]);
+		_textures$6[i] = null;
 	}
 	_vertCount = 0;
 }
@@ -209732,7 +212834,7 @@ function state() {
 	return {
 		buffer: _buffer$19,
 		vertCount: _vertCount,
-		textures: _textures$3,
+		textures: _textures$6,
 		level: _waterLevel,
 		waveHeight: _waveHeight,
 		waveSpeed: _waveSpeed,
@@ -209741,7 +212843,7 @@ function state() {
 		opacity: _waterOpacity
 	};
 }
-var _program$26, _buffer$19, _vertCount, _textures$3, _waveSpeed, _waveHeight, _wavePitch, _waterLevel, _animSpeed, _waterOpacity, Water_default;
+var _program$26, _buffer$19, _vertCount, _textures$6, _waveSpeed, _waveHeight, _wavePitch, _waterLevel, _animSpeed, _waterOpacity, Water_default;
 var init_Water = __esmMin((() => {
 	init_WebGL();
 	init_SpriteRenderer();
@@ -209751,7 +212853,7 @@ var init_Water = __esmMin((() => {
 	_program$26 = null;
 	_buffer$19 = null;
 	_vertCount = 0;
-	_textures$3 = new Array(32);
+	_textures$6 = new Array(32);
 	_waveSpeed = 0;
 	_waveHeight = 0;
 	_wavePitch = 0;
@@ -209761,7 +212863,7 @@ var init_Water = __esmMin((() => {
 	Water_default = {
 		init: init$12,
 		free: free$6,
-		render: render$12,
+		render: render$13,
 		isSubmerged,
 		hasWater,
 		state
@@ -210154,7 +213256,7 @@ function renderDepth(gl, program) {
 	gl.disableVertexAttribArray(attribute.aPosition);
 	gl.disableVertexAttribArray(attribute.aTextureCoord);
 }
-function render$11(gl, modelView, projection, normalMat, fog, light) {
+function render$12(gl, modelView, projection, normalMat, fog, light) {
 	bind$1(gl, modelView, projection, fog, light);
 	OccluderFade.renderOpaque(gl, _program$25.uniform, () => drawMeshes(gl));
 	OccluderFade.renderQuery(gl, _program$25.uniform, () => drawMeshes(gl), OccluderFade.QUERY.MODELS);
@@ -210212,7 +213314,7 @@ var init_Models = __esmMin((() => {
 	_pendingTextures = 0;
 	Models_default = {
 		init: init$11,
-		render: render$11,
+		render: render$12,
 		renderFaded: renderFaded$1,
 		renderDepth,
 		free: free$5
@@ -210783,7 +213885,7 @@ function drawModels(gl) {
 /**
 * Render animated models (opaque pass)
 */
-function render$10(gl, modelView, projection, normalMat, fog, light, tick) {
+function render$11(gl, modelView, projection, normalMat, fog, light, tick) {
 	if (_animatedModels.length === 0) return;
 	if (!_program$24) init$10(gl);
 	bind(gl, modelView, projection, normalMat, fog, light);
@@ -210834,7 +213936,7 @@ var init_AnimatedModels = __esmMin((() => {
 		init: init$10,
 		free: free$4,
 		add: add$3,
-		render: render$10,
+		render: render$11,
 		renderFaded,
 		hasAnimatedModels
 	};
@@ -214828,7 +217930,7 @@ function normalize3(v) {
 * sits next to): (gl, modelView, projection, normalMat, fog, light, tick). modelView is
 * Camera.modelView (the view matrix); the per-instance world is composed on top.
 */
-function render$9(gl, modelView, projection, normalMat, fog, light, tick) {
+function render$10(gl, modelView, projection, normalMat, fog, light, tick) {
 	_gl$1 = gl;
 	if (_instances.length === 0 || !light) return;
 	if (!_program$23) init$9(gl);
@@ -215323,7 +218425,7 @@ var init_GR2ModelRenderer = __esmMin((() => {
 	GR2ModelRenderer_default = {
 		init: init$9,
 		free: free$3,
-		render: render$9,
+		render: render$10,
 		attach: attach$2,
 		detach: detach$1,
 		isMissing: function(path) {
@@ -215363,7 +218465,7 @@ function free$2() {
 *
 * @param {vec2} position
 */
-function render$8(position, tick) {
+function render$9(position, tick) {
 	_list$6.forEach((sound) => {
 		const dist = Math.floor(vec2$3.dist(sound.pos, position));
 		if (sound.tick < tick && dist <= sound.range) {
@@ -215381,7 +218483,7 @@ var init_Sounds = __esmMin((() => {
 	Sounds_default = {
 		add: add$2,
 		free: free$2,
-		render: render$8
+		render: render$9
 	};
 }));
 //#endregion
@@ -217572,6 +220674,234 @@ var init_SkillEffect = __esmMin((() => {
 	SkillEffect[SkillConst_default.SP_SOULCURSE] = { effectId: "ef_sp_soulcurse" };
 	SkillEffect[SkillConst_default.SP_SOULREVOLVE] = { effectId: "ef_sp_soulrevolve" };
 	SkillEffect[SkillConst_default.NV_HELPANGEL] = { effectId: "ef_nv_helpangel" };
+	SkillEffect[SkillConst_default.DR_WEREWOLF] = { effectId: "ef_druid_werewolf" };
+	SkillEffect[SkillConst_default.DR_WERERAPTOR] = { effectId: "ef_druid_wereraptor" };
+	SkillEffect[SkillConst_default.DR_ENRAGE_WOLF] = { effectId: "ef_druid_enrage_wolf" };
+	SkillEffect[SkillConst_default.DR_ENRAGE_RAPTOR] = { effectId: "ef_druid_enrage_raptor" };
+	SkillEffect[SkillConst_default.DR_BLOOD_HOWLING] = { effectId: "ef_druid_blood_howling" };
+	SkillEffect[SkillConst_default.DR_PREENING] = { effectId: "ef_druid_preening" };
+	SkillEffect[SkillConst_default.DR_TRUTH_OF_ICE] = { effectId: "ef_druid_truth_of_ice" };
+	SkillEffect[SkillConst_default.DR_TRUTH_OF_WIND] = { effectId: "ef_druid_truth_of_wind" };
+	SkillEffect[SkillConst_default.DR_TRUTH_OF_EARTH] = { effectId: "ef_druid_truth_of_earth" };
+	SkillEffect[SkillConst_default.DR_NATURE_SHIELD] = { effectId: "ef_druid_nature_shield" };
+	SkillEffect[SkillConst_default.DR_NOMERCY_CLAW] = {
+		effectIdOnCaster: "ef_druid_nomercy_claw",
+		hitEffectId: "ef_druid_hit_wolf"
+	};
+	SkillEffect[SkillConst_default.DR_CRUEL_BITE] = {
+		effectId: "ef_druid_cruel_bite",
+		hitEffectId: "ef_druid_hit_wolf"
+	};
+	SkillEffect[SkillConst_default.DR_HUNGER] = {
+		effectIdOnCaster: "ef_druid_hunger",
+		effectId: "ef_druid_hunger_target",
+		hitEffectId: "ef_druid_hit_wolf"
+	};
+	SkillEffect[SkillConst_default.DR_SHOOTING_FEATHER] = {
+		effectIdOnCaster: "ef_druid_shooting_feather",
+		effectId: "ef_druid_shooting_feather_hit",
+		hitEffectId: "ef_druid_hit_raptor"
+	};
+	SkillEffect[SkillConst_default.DR_FLICKING_TONADO] = {
+		effectIdOnCaster: "ef_druid_flicking_tonado",
+		hitEffectId: "ef_druid_hit_raptor"
+	};
+	SkillEffect[SkillConst_default.DR_LOW_FLIGHT] = {
+		effectIdOnCaster: "ef_druid_low_flight_up",
+		effectId: "ef_druid_low_flight",
+		hitEffectId: "ef_druid_hit_raptor"
+	};
+	SkillEffect[SkillConst_default.DR_ICE_TOTEM] = {
+		beginCastEffectId: "ef_druid_ice_cast",
+		effectId: "ef_druid_ice_totem",
+		hitEffectId: "ef_druid_ice_hit"
+	};
+	SkillEffect[SkillConst_default.DR_ICE_CLOUD] = {
+		beginCastEffectId: "ef_druid_ice_cast",
+		effectId: "ef_druid_ice_cloud",
+		hitEffectId: "ef_druid_ice_hit"
+	};
+	SkillEffect[SkillConst_default.DR_CUTTING_WIND] = {
+		effectId: "ef_druid_cutting_wind",
+		hitEffectId: "ef_druid_cutting_wind_hit"
+	};
+	SkillEffect[SkillConst_default.DR_WIND_BOMB] = {
+		effectId: "ef_druid_wind_bomb",
+		hitEffectId: "ef_druid_wind_bomb_hit"
+	};
+	SkillEffect[SkillConst_default.DR_EARTH_FLOWER] = { effectId: "ef_druid_earth_flower" };
+	SkillEffect[SkillConst_default.DR_AROUND_FLOWER] = { effectIdOnCaster: "ef_druid_around_flower" };
+	SkillEffect[SkillConst_default.KR_NASTY_SLASH] = {
+		effectId: "ef_druid_nasty_slash",
+		hitEffectId: "ef_druid_hit_wolf"
+	};
+	SkillEffect[SkillConst_default.KR_DOUBLE_SLASH] = {
+		effectId: "ef_druid_double_slash",
+		hitEffectId: "ef_druid_hit_wolf"
+	};
+	SkillEffect[SkillConst_default.KR_CLAW_WAVE] = {
+		effectId: "ef_druid_claw_wave",
+		hitEffectId: "ef_druid_hit_wolf"
+	};
+	SkillEffect[SkillConst_default.KR_CHOP_CHOP] = {
+		effectIdOnCaster: "ef_druid_chop_chop",
+		hitEffectId: "ef_druid_chop_chop_hit"
+	};
+	SkillEffect[SkillConst_default.KR_IRON_HOWLING] = { effectId: "ef_druid_iron_howling" };
+	SkillEffect[SkillConst_default.KR_SHARPEN_GUST] = {
+		effectId: "ef_druid_sharpen_gust",
+		hitEffectId: "ef_druid_hit_raptor"
+	};
+	SkillEffect[SkillConst_default.KR_SHARPEN_HAIL] = {
+		effectIdOnCaster: "ef_druid_sharpen_hail_shot",
+		effectId: "ef_druid_sharpen_hail",
+		hitEffectId: "ef_druid_hit_raptor"
+	};
+	SkillEffect[SkillConst_default.KR_TYPHOON_WING] = {
+		effectId: "ef_druid_typhoon_wing",
+		hitEffectId: "ef_druid_hit_raptor"
+	};
+	SkillEffect[SkillConst_default.KR_FEATHER_SPRINKLE] = {
+		effectIdOnCaster: "ef_druid_feather_sprinkle",
+		hitEffectId: "ef_druid_hit_raptor"
+	};
+	SkillEffect[SkillConst_default.KR_WIND_VEIL] = { effectId: "ef_druid_wind_veil" };
+	SkillEffect[SkillConst_default.KR_ICE_PILLAR] = {
+		beginCastEffectId: "ef_druid_ice_cast",
+		effectId: "ef_druid_ice_pillar_start",
+		hitEffectId: "ef_druid_ice_hit"
+	};
+	SkillEffect[SkillConst_default.KR_ICE_SPLASH] = {
+		beginCastEffectId: "ef_druid_ice_cast",
+		effectId: "ef_druid_ice_splash",
+		hitEffectId: "ef_druid_ice_hit"
+	};
+	SkillEffect[SkillConst_default.KR_THUNDERING_FOCUS] = {
+		beginCastEffectId: "ef_druid_thunder_cast",
+		effectIdOnCaster: "ef_druid_thundering_focus_g",
+		hitEffectId: "ef_druid_thunder_hit_g"
+	};
+	SkillEffect[SkillConst_default.KR_THUNDERING_FOCUS_S] = {
+		effectIdOnCaster: "ef_druid_thundering_focus_y",
+		hitEffectId: "ef_druid_thunder_hit_y"
+	};
+	SkillEffect[SkillConst_default.KR_THUNDERING_ORB] = {
+		beginCastEffectId: "ef_druid_thunder_cast",
+		effectId: "ef_druid_thundering_orb_g",
+		hitEffectId: "ef_druid_thunder_hit_g"
+	};
+	SkillEffect[SkillConst_default.KR_THUNDERING_ORB_S] = {
+		effectId: "ef_druid_thundering_orb_y",
+		hitEffectId: "ef_druid_thunder_hit_y"
+	};
+	SkillEffect[SkillConst_default.KR_THUNDERING_CALL] = {
+		beginCastEffectId: "ef_druid_thunder_cast",
+		effectId: "ef_druid_thundering_call_g",
+		hitEffectId: "ef_druid_thunder_hit_g"
+	};
+	SkillEffect[SkillConst_default.KR_THUNDERING_CALL_S] = {
+		effectId: "ef_druid_thundering_call_y",
+		hitEffectId: "ef_druid_thunder_hit_y"
+	};
+	SkillEffect[SkillConst_default.KR_EARTH_DRILL] = { effectId: "ef_druid_earth_drill" };
+	SkillEffect[SkillConst_default.KR_EARTH_STAMP] = { effectId: "ef_druid_earth_stamp" };
+	SkillEffect[SkillConst_default.KR_NATURE_PROTECTION] = { effectId: "ef_druid_nature_protection" };
+	SkillEffect[SkillConst_default.KR_GROUND_BLOOM] = { effectIdOnCaster: "ef_druid_ground_bloom" };
+	SkillEffect[SkillConst_default.AT_PULSE_OF_MADNESS] = { effectId: "ef_druid_pulse_of_madness" };
+	SkillEffect[SkillConst_default.AT_ALPHA_PHASE] = { effectId: "ef_druid_alpha_phase" };
+	SkillEffect[SkillConst_default.AT_APEX_PHASE] = { effectId: "ef_druid_apex_phase" };
+	SkillEffect[SkillConst_default.AT_FLIP_FLAP] = { effectId: "ef_druid_flip_flap" };
+	SkillEffect[SkillConst_default.AT_FLIP_FLAP_TARGET] = { effectId: "ef_druid_flip_flap" };
+	SkillEffect[SkillConst_default.AT_NATURE_HARMONY] = { effectId: "ef_druid_nature_harmony" };
+	SkillEffect[SkillConst_default.AT_PRIMAL_CLAW] = {
+		effectId: "ef_druid_primal_claw",
+		hitEffectId: "ef_druid_hit_wolf"
+	};
+	SkillEffect[SkillConst_default.AT_FERAL_CLAW] = {
+		effectIdOnCaster: "ef_druid_feral_claw",
+		hitEffectId: "ef_druid_hit_wolf"
+	};
+	SkillEffect[SkillConst_default.AT_ALPHA_CLAW] = {
+		effectIdOnCaster: "ef_druid_alpha_claw",
+		hitEffectId: "ef_druid_hit_wolf"
+	};
+	SkillEffect[SkillConst_default.AT_SAVAGE_LUNGE] = {
+		effectId: "ef_druid_savage_lunge",
+		hitEffectId: "ef_druid_hit_wolf"
+	};
+	SkillEffect[SkillConst_default.AT_FRENZY_FANG] = {
+		effectId: "ef_druid_frenzy_fang",
+		hitEffectId: "ef_druid_hit_wolf"
+	};
+	SkillEffect[SkillConst_default.AT_PINION_SHOT] = {
+		effectId: "ef_druid_pinion_shot",
+		hitEffectId: "ef_druid_hit_raptor"
+	};
+	SkillEffect[SkillConst_default.AT_QUILL_SPEAR] = {
+		effectId: "ef_druid_quill_spear",
+		hitEffectId: "ef_druid_hit_raptor"
+	};
+	SkillEffect[SkillConst_default.AT_QUILL_SPEAR_S] = {
+		effectId: "ef_druid_quill_spear_s",
+		hitEffectId: "ef_druid_hit_raptor"
+	};
+	SkillEffect[SkillConst_default.AT_TEMPEST_FLAP] = {
+		effectIdOnCaster: "ef_druid_tempest_flap_cast",
+		effectId: "ef_druid_tempest_flap",
+		hitEffectId: "ef_druid_hit_raptor"
+	};
+	SkillEffect[SkillConst_default.AT_AERO_SYNC] = {
+		effectIdOnCaster: "ef_druid_aero_sync_self",
+		effectId: "ef_druid_aero_sync"
+	};
+	SkillEffect[SkillConst_default.AT_ZEPHYR_LINK] = { effectId: "ef_druid_zephyr_link" };
+	SkillEffect[SkillConst_default.AT_GLACIER_MONOLITH] = {
+		beginCastEffectId: "ef_druid_ice_cast",
+		effectId: "ef_druid_glacier_monolith_start",
+		hitEffectId: "ef_druid_ice_hit"
+	};
+	SkillEffect[SkillConst_default.AT_GLACIER_NOVA] = {
+		effectId: "ef_druid_glacier_nova",
+		hitEffectId: "ef_druid_ice_hit"
+	};
+	SkillEffect[SkillConst_default.AT_GLACIER_SHARD] = {
+		beginCastEffectId: "ef_druid_ice_cast",
+		effectId: "ef_druid_glacier_shard",
+		hitEffectId: "ef_druid_ice_hit"
+	};
+	SkillEffect[SkillConst_default.AT_GLACIER_STOMP] = {
+		effectIdOnCaster: "ef_druid_glacier_stomp",
+		hitEffectId: "ef_druid_ice_hit"
+	};
+	SkillEffect[SkillConst_default.AT_CHILLING_BLAST] = {
+		effectIdOnCaster: "ef_druid_chilling_blast",
+		hitEffectId: "ef_druid_ice_hit"
+	};
+	SkillEffect[SkillConst_default.AT_ROARING_PIERCER] = {
+		beginCastEffectId: "ef_druid_thunder_cast",
+		effectId: "ef_druid_roaring_piercer_g",
+		hitEffectId: "ef_druid_thunder_hit_g"
+	};
+	SkillEffect[SkillConst_default.AT_ROARING_PIERCER_S] = {
+		effectId: "ef_druid_roaring_piercer_y",
+		hitEffectId: "ef_druid_thunder_hit_y"
+	};
+	SkillEffect[SkillConst_default.AT_ROARING_CHARGE] = {
+		effectIdOnCaster: "ef_druid_roaring_charge",
+		hitEffectId: "ef_druid_thunder_hit_g"
+	};
+	SkillEffect[SkillConst_default.AT_ROARING_CHARGE_S] = {
+		effectIdOnCaster: "ef_druid_roaring_charge_s",
+		hitEffectId: "ef_druid_thunder_hit_y"
+	};
+	SkillEffect[SkillConst_default.AT_FURIOS_STORM] = {
+		effectIdOnCaster: "ef_druid_furios_storm",
+		hitEffectId: "ef_druid_thunder_hit_g"
+	};
+	SkillEffect[SkillConst_default.AT_TERRA_WAVE] = { effectId: "ef_druid_terra_wave" };
+	SkillEffect[SkillConst_default.AT_TERRA_HARVEST] = { effectId: "ef_druid_terra_harvest" };
+	SkillEffect[SkillConst_default.AT_SOLID_STOMP] = { effectIdOnCaster: "ef_druid_solid_stomp" };
+	SkillEffect[SkillConst_default.AT_GRAVITY_HOLE] = { effectIdOnCaster: "ef_druid_gravity_hole" };
 }));
 //#endregion
 //#region src/DB/Skills/SkillUnitConst.js
@@ -217756,6 +221086,8 @@ var init_SkillUnitConst = __esmMin((() => {
 		UNT_GD_GLORYWOUNDS: 194,
 		UNT_GD_SOULCOLD: 195,
 		UNT_GD_HAWKEYES: 196,
+		UNT_ICE_PILLAR: 313,
+		UNT_GLACIAL_MONOLITH: 314,
 		UNT_MAX: 400
 	};
 }));
@@ -219035,6 +222367,8 @@ var init_SkillUnit = __esmMin((() => {
 	SkillUnit[SkillUnitConst_default.UNT_ICEMINE] = EffectConst_default.EF_NONE;
 	SkillUnit[SkillUnitConst_default.UNT_MAGMA_ERUPTION] = EffectConst_default.EF_NONE;
 	SkillUnit[SkillUnitConst_default.UNT_B_TRAP] = EffectConst_default.EF_NONE;
+	SkillUnit[SkillUnitConst_default.UNT_ICE_PILLAR] = "ef_druid_ice_pillar_loop";
+	SkillUnit[SkillUnitConst_default.UNT_GLACIAL_MONOLITH] = "ef_druid_glacier_monolith_loop";
 }));
 //#endregion
 //#region src/DB/Items/ItemEffect.js
@@ -222734,7 +226068,7 @@ var init_InputBox$1 = __esmMin((() => {
 /**
 * Validate input
 */
-function validate$1() {
+function validate$2() {
 	const root = InputBox.getRoot();
 	const input = root.querySelector("input");
 	let text = input ? input.value : "";
@@ -222774,7 +226108,7 @@ var init_InputBox = __esmMin((() => {
 		this._host.style.left = `${(Renderer.width - 280 * scale) / 2 + 1}px`;
 		const root = InputBox.getRoot();
 		const btn = root.querySelector("ui-button");
-		if (btn) btn.addEventListener("click", () => validate$1());
+		if (btn) btn.addEventListener("click", () => validate$2());
 		const input = root.querySelector("input");
 		if (input) input.addEventListener("mousedown", (e) => e.stopImmediatePropagation());
 		this._overlay = document.createElement("div");
@@ -222821,7 +226155,7 @@ var init_InputBox = __esmMin((() => {
 	*/
 	InputBox.onKeyDown = function onKeyDown(event) {
 		if (event.which === KEYS.ENTER) {
-			validate$1();
+			validate$2();
 			event.stopImmediatePropagation();
 			return false;
 		}
@@ -222914,13 +226248,13 @@ function _escapeHTML$5(text) {
 /**
 * Submit an index
 */
-function validate() {
+function validate$1() {
 	NpcMenu.onSelectMenu(_ownerID, _index$1 + 1);
 }
 /**
 * Pressed cancel, client send "255" as value
 */
-function cancel$1() {
+function cancel$2() {
 	NpcMenu.onSelectMenu(_ownerID, 255);
 }
 /**
@@ -222956,9 +226290,9 @@ var init_NpcMenu = __esmMin((() => {
 	NpcMenu.init = function init() {
 		const root = NpcMenu.getRoot();
 		const okBtn = root.querySelector(".ok");
-		if (okBtn) okBtn.addEventListener("click", () => validate());
+		if (okBtn) okBtn.addEventListener("click", () => validate$1());
 		const cancelBtn = root.querySelector(".cancel");
-		if (cancelBtn) cancelBtn.addEventListener("click", () => cancel$1());
+		if (cancelBtn) cancelBtn.addEventListener("click", () => cancel$2());
 		this._host.style.top = `${Math.max(376, Renderer.height / 2 + 76)}px`;
 		this._host.style.left = `${Math.max(Renderer.width / 3, 20)}px`;
 		this.draggable();
@@ -222971,7 +226305,7 @@ var init_NpcMenu = __esmMin((() => {
 			});
 			content.addEventListener("dblclick", (e) => {
 				const div = e.target.closest("div[data-index]");
-				if (div && content.contains(div)) validate();
+				if (div && content.contains(div)) validate$1();
 			});
 		}
 	};
@@ -222992,10 +226326,10 @@ var init_NpcMenu = __esmMin((() => {
 		switch (event.which) {
 			case KEYS.SPACE:
 			case KEYS.ENTER:
-				validate();
+				validate$1();
 				break;
 			case KEYS.ESCAPE:
-				cancel$1();
+				cancel$2();
 				break;
 			case KEYS.UP: {
 				const divs = content.querySelectorAll("div[data-index]");
@@ -226666,7 +230000,7 @@ var init_PackageSelection$1 = __esmMin((() => {
 }));
 //#endregion
 //#region src/UI/Components/PackageSelection/PackageSelection.js
-var Selection, request, submitted, PackageSelection_default;
+var Selection, request$1, submitted, PackageSelection_default;
 var init_PackageSelection = __esmMin((() => {
 	init_DBManager();
 	init_GUIComponent();
@@ -226681,15 +230015,15 @@ var init_PackageSelection = __esmMin((() => {
 	init_PackageSelection$1();
 	Selection = new GUIComponent("PackageSelection", PackageSelection_default$1);
 	Selection.render = () => PackageSelection_default$2;
-	request = null;
+	request$1 = null;
 	submitted = /* @__PURE__ */ new WeakMap();
 	Selection.init = function() {
 		const root = this.getRoot();
 		this.draggable(root.querySelector(".head"));
 		root.querySelector(".cancel").addEventListener("click", () => this.remove());
 		root.querySelector(".confirm").addEventListener("click", () => {
-			if (!request || request.group === null) return;
-			const { inventory, index, itemID, account, group } = request;
+			if (!request$1 || request$1.group === null) return;
+			const { inventory, index, itemID, account, group } = request$1;
 			const item = inventory.getItemByIndex(index);
 			if (account === SessionStorage_default.AID && item?.ITID === itemID && item.count > 0) {
 				const packet = new PACKET.CZ.USE_PACKAGEITEM();
@@ -226703,7 +230037,7 @@ var init_PackageSelection = __esmMin((() => {
 					count: item.count,
 					until: Date.now() + 1500
 				});
-				request = null;
+				request$1 = null;
 				Network.sendPacket(packet);
 			}
 			this.remove();
@@ -226718,7 +230052,7 @@ var init_PackageSelection = __esmMin((() => {
 			return;
 		}
 		this.append();
-		request = {
+		request$1 = {
 			inventory,
 			index: item.index,
 			itemID: item.ITID,
@@ -226749,8 +230083,8 @@ var init_PackageSelection = __esmMin((() => {
 				button.appendChild(row);
 			}
 			button.addEventListener("click", () => {
-				if (!request) return;
-				request.group = group.id;
+				if (!request$1) return;
+				request$1.group = group.id;
 				for (const option of list.children) option.setAttribute("aria-pressed", String(option === button));
 				confirm.disabled = false;
 			});
@@ -226762,7 +230096,7 @@ var init_PackageSelection = __esmMin((() => {
 		this._host.style.top = `${Math.max(0, (Renderer.height - 320) / 2)}px`;
 	};
 	Selection.onRemove = () => {
-		request = null;
+		request$1 = null;
 	};
 	PackageSelection_default = UIManager.addComponent(Selection);
 }));
@@ -227218,6 +230552,15 @@ function createStorage(config) {
 		if (isInventoryOpen) Component.reqRemoveItem(item.index, count);
 		else if (isCartOpen) Component.reqMoveItemToCart(item.index, count);
 		return true;
+	};
+	/**
+	* The open tab (Component.TAB), its place among the tab buttons. The tabs
+	* are drawn as one picture, so only this says which it is (gamepad LB / RB).
+	*
+	* @returns {number}
+	*/
+	Component.getTab = function getTab() {
+		return _preferences.tab;
 	};
 	Component.onClosePressed = function onClosedPressed() {};
 	Component.reqAddItem = function reqAddItem() {};
@@ -230077,7 +233420,7 @@ var init_GuildCompanion$1 = __esmMin((() => {
 function _root$18() {
 	return GuildCompanion.getRoot();
 }
-function open$1(mode) {
+function open$3(mode) {
 	_mode = mode;
 	if (!GuildCompanion.__active) GuildCompanion.append();
 	const root = _root$18();
@@ -230192,10 +233535,10 @@ var init_GuildCompanion = __esmMin((() => {
 		});
 	};
 	GuildCompanion.openCreate = function openCreate() {
-		open$1("create");
+		open$3("create");
 	};
 	GuildCompanion.openDisband = function openDisband() {
-		open$1("disband");
+		open$3("disband");
 	};
 	GuildCompanion.closeDisband = function closeDisband() {
 		if (_mode === "disband" && GuildCompanion.__active) GuildCompanion.remove();
@@ -231354,7 +234697,10 @@ var init_Guild$1 = __esmMin((() => {
 		general.querySelector(".exp .value").textContent = atMaxLevel ? 0 : info.exp;
 		general.querySelector(".exp").classList.toggle("maxlevel", atMaxLevel);
 		Guild.updateSession(info);
-		Guild.onRequestGuildEmblem(info.GDID, info.emblemVersion, Guild.setEmblem.bind(this));
+		const owner = SessionStorage_default.Entity;
+		Guild.onRequestGuildEmblem(info.GDID, info.emblemVersion, (image) => {
+			if (SessionStorage_default.Entity === owner && owner.GUID === info.GDID && owner.GEmblemVer !== 0) Guild.setEmblem(image);
+		});
 		updateEmblemControls(root);
 		updateDisbandButton(root, getActiveTab(root));
 		updateSkillFooter(root, getActiveTab(root));
@@ -232339,7 +235685,7 @@ function list() {
 /**
 * The button was pressed. Called by the menu.
 */
-function press(button) {
+function press$2(button) {
 	try {
 		button.onClick();
 	} catch (error) {
@@ -232366,7 +235712,7 @@ var init_MenuHooks = __esmMin((() => {
 	MenuHooks_default = {
 		add: add$1,
 		list,
-		press,
+		press: press$2,
 		onChange: onChange$1
 	};
 }));
@@ -233009,7 +236355,7 @@ var init_GraphicsOption = __esmMin((() => {
 //#region src/UI/Components/ShortCutOption/ShortCutOption.html?raw
 var ShortCutOption_default$2;
 var init_ShortCutOption$2 = __esmMin((() => {
-	ShortCutOption_default$2 = "<div id=\"ShortCutOption\" class=\"pt-page-fadeIn1\">\r\n	<div class=\"border\">\r\n		<div class=\"titlebar\" data-background=\"basic_interface/titlebar_mid.bmp\">\r\n			<div class=\"left\"><span class=\"text\">Shortcut key setting window</span></div>\r\n\r\n			<div class=\"right\">\r\n				<button\r\n					class=\"base close\"\r\n					data-background=\"basic_interface/sys_close_off.bmp\"\r\n					data-hover=\"basic_interface/sys_close_on.bmp\"\r\n				></button>\r\n			</div>\r\n\r\n			<div class=\"clear\"></div>\r\n		</div>\r\n\r\n		<div class=\"tabs\">\r\n			<button class=\"t_skillbar selectedtab\" data-index=\"t_skillbar\">Skill Bar</button\r\n			><button class=\"t_ui\" data-index=\"t_ui\">Interface</button\r\n			><button class=\"t_macro\" data-index=\"t_macro\">Macros</button\r\n			><button class=\"t_gamepad\" data-index=\"t_gamepad\">Gamepad</button>\r\n		</div>\r\n		<div class=\"panel\">\r\n			<div class=\"content t_skillbar selectedtab\">\r\n				<table border=\"1\" cellspacing=\"0\" bordercolor=\"#aaa\">\r\n					<tbody>\r\n						<tr>\r\n							<td>Skill bar 1-1</td>\r\n							<td data-button=\"F1_1\" class=\"customize\"></td>\r\n							<td>Skill bar 2-1</td>\r\n							<td data-button=\"F2_1\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Skill bar 1-2</td>\r\n							<td data-button=\"F1_2\" class=\"customize\"></td>\r\n							<td>Skill bar 2-2</td>\r\n							<td data-button=\"F2_2\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Skill bar 1-3</td>\r\n							<td data-button=\"F1_3\" class=\"customize\"></td>\r\n							<td>Skill bar 2-3</td>\r\n							<td data-button=\"F2_3\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Skill bar 1-4</td>\r\n							<td data-button=\"F1_4\" class=\"customize\"></td>\r\n							<td>Skill bar 2-4</td>\r\n							<td data-button=\"F2_4\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Skill bar 1-5</td>\r\n							<td data-button=\"F1_5\" class=\"customize\"></td>\r\n							<td>Skill bar 2-5</td>\r\n							<td data-button=\"F2_5\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Skill bar 1-6</td>\r\n							<td data-button=\"F1_6\" class=\"customize\"></td>\r\n							<td>Skill bar 2-6</td>\r\n							<td data-button=\"F2_6\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Skill bar 1-7</td>\r\n							<td data-button=\"F1_7\" class=\"customize\"></td>\r\n							<td>Skill bar 2-7</td>\r\n							<td data-button=\"F2_7\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Skill bar 1-8</td>\r\n							<td data-button=\"F1_8\" class=\"customize\"></td>\r\n							<td>Skill bar 2-8</td>\r\n							<td data-button=\"F2_8\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Skill bar 1-9</td>\r\n							<td data-button=\"F1_9\" class=\"customize\"></td>\r\n							<td>Skill bar 2-9</td>\r\n							<td data-button=\"F2_9\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Skill bar 3-1</td>\r\n							<td data-button=\"F3_1\" class=\"customize\"></td>\r\n							<td>Skill bar 4-1</td>\r\n							<td data-button=\"F4_1\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Skill bar 3-2</td>\r\n							<td data-button=\"F3_2\" class=\"customize\"></td>\r\n							<td>Skill bar 4-2</td>\r\n							<td data-button=\"F4_2\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Skill bar 3-3</td>\r\n							<td data-button=\"F3_3\" class=\"customize\"></td>\r\n							<td>Skill bar 4-3</td>\r\n							<td data-button=\"F4_3\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Skill bar 3-4</td>\r\n							<td data-button=\"F3_4\" class=\"customize\"></td>\r\n							<td>Skill bar 4-4</td>\r\n							<td data-button=\"F4_4\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Skill bar 3-5</td>\r\n							<td data-button=\"F3_5\" class=\"customize\"></td>\r\n							<td>Skill bar 4-5</td>\r\n							<td data-button=\"F4_5\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Skill bar 3-6</td>\r\n							<td data-button=\"F3_6\" class=\"customize\"></td>\r\n							<td>Skill bar 4-6</td>\r\n							<td data-button=\"F4_6\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Skill bar 3-7</td>\r\n							<td data-button=\"F3_7\" class=\"customize\"></td>\r\n							<td>Skill bar 4-7</td>\r\n							<td data-button=\"F4_7\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Skill bar 3-8</td>\r\n							<td data-button=\"F3_8\" class=\"customize\"></td>\r\n							<td>Skill bar 4-8</td>\r\n							<td data-button=\"F4_8\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Skill bar 3-9</td>\r\n							<td data-button=\"F3_9\" class=\"customize\"></td>\r\n							<td>Skill bar 4-9</td>\r\n							<td data-button=\"F4_9\" class=\"customize\"></td>\r\n						</tr>\r\n					</tbody>\r\n				</table>\r\n			</div>\r\n			<div class=\"content t_ui\">\r\n				<table border=\"1\" cellspacing=\"0\" bordercolor=\"#aaa\">\r\n					<tbody>\r\n						<tr>\r\n							<td>Basic Info</td>\r\n							<td data-button=\"BasicInfo\" class=\"customize\"></td>\r\n							<td>Character Info</td>\r\n							<td data-button=\"Equipment\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Skill List</td>\r\n							<td data-button=\"SkillList\" class=\"customize\"></td>\r\n							<td>Emotion List</td>\r\n							<td data-button=\"Emotions\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Friends List</td>\r\n							<td data-button=\"Friends\" class=\"customize\"></td>\r\n							<td>Party Window</td>\r\n							<td data-button=\"Party\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Pet Info</td>\r\n							<td data-button=\"PetInfo\" class=\"customize\"></td>\r\n							<td>Chat Room</td>\r\n							<td data-button=\"ChatRoom\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Cart Window</td>\r\n							<td data-button=\"PushCart\" class=\"customize\"></td>\r\n							<td>Item Window</td>\r\n							<td data-button=\"Inventory\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>World Map</td>\r\n							<td data-button=\"WorldMap\" class=\"customize\"></td>\r\n							<td>Guild Info</td>\r\n							<td data-button=\"Guild\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Homunculus Info</td>\r\n							<td data-button=\"HomunInfo\" class=\"customize\"></td>\r\n							<td>Mercenary Info</td>\r\n							<td data-button=\"MercInfo\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Homunculus State</td>\r\n							<td data-button=\"HomunState\" class=\"customize\"></td>\r\n							<td>Mercenary State</td>\r\n							<td data-button=\"MercState\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Sit/Stand</td>\r\n							<td data-button=\"Sit\" class=\"customize\"></td>\r\n							<td>Short Cuts</td>\r\n							<td data-button=\"ShortCuts\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Chat Bar Size</td>\r\n							<td data-button=\"ChatSize\" class=\"customize\"></td>\r\n							<td>Skill Bar Size</td>\r\n							<td data-button=\"SkillBarSize\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Quest</td>\r\n							<td data-button=\"Quest\" class=\"customize\"></td>\r\n							<td>Bank</td>\r\n							<td data-button=\"Bank\" class=\"customize\"></td>\r\n						</tr>\r\n						<!--<tr>\r\n                     <td>MobileUI</td>\r\n                     <td data-button=\"M_UI\" class=\"customize\"></td>\r\n                     <td>MUi-Toggle</td>\r\n                     <td data-button=\"M_Toggle\" class=\"customize\"></td>\r\n                  </tr>\r\n                  <tr>\r\n                     <td>MUi-TG</td>\r\n                     <td data-button=\"M_Targeting\" class=\"customize\"></td>\r\n                     <td>MUi-AT</td>\r\n                     <td data-button=\"M_AutoTarget\" class=\"customize\"></td>\r\n                  </tr>\r\n                  <tr>\r\n                     <td>MUi-ATK</td>\r\n                     <td data-button=\"M_Attack\" class=\"customize\"></td>\r\n                  </tr>-->\r\n					</tbody>\r\n				</table>\r\n			</div>\r\n			<div class=\"content t_macro\">\r\n				<table border=\"1\" cellspacing=\"0\" bordercolor=\"#aaa\">\r\n					<tbody>\r\n						<tr>\r\n							<td>Macro 1</td>\r\n							<td data-button=\"Macro1\" class=\"customize\"></td>\r\n							<td>Flag 1</td>\r\n							<td data-button=\"Flag1\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Macro 2</td>\r\n							<td data-button=\"Macro2\" class=\"customize\"></td>\r\n							<td>Flag 2</td>\r\n							<td data-button=\"Flag2\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Macro 3</td>\r\n							<td data-button=\"Macro3\" class=\"customize\"></td>\r\n							<td>Flag 3</td>\r\n							<td data-button=\"Flag3\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Macro 4</td>\r\n							<td data-button=\"Macro4\" class=\"customize\"></td>\r\n							<td>Flag 4</td>\r\n							<td data-button=\"Flag4\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Macro 5</td>\r\n							<td data-button=\"Macro5\" class=\"customize\"></td>\r\n							<td>Flag 5</td>\r\n							<td data-button=\"Flag5\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Macro 6</td>\r\n							<td data-button=\"Macro6\" class=\"customize\"></td>\r\n							<td>Flag 6</td>\r\n							<td data-button=\"Flag6\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Macro 7</td>\r\n							<td data-button=\"Macro7\" class=\"customize\"></td>\r\n							<td>Flag 7</td>\r\n							<td data-button=\"Flag7\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Macro 8</td>\r\n							<td data-button=\"Macro8\" class=\"customize\"></td>\r\n							<td>Flag 8</td>\r\n							<td data-button=\"Flag8\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Macro 9</td>\r\n							<td data-button=\"Macro9\" class=\"customize\"></td>\r\n							<td>Flag 9</td>\r\n							<td data-button=\"Flag9\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Macro 10</td>\r\n							<td data-button=\"Macro10\" class=\"customize\"></td>\r\n						</tr>\r\n					</tbody>\r\n				</table>\r\n			</div>\r\n			<div class=\"content t_gamepad\">\r\n				<table class=\"joySettings\" border=\"1\" cellspacing=\"0\" bordercolor=\"#aaa\">\r\n					<tbody>\r\n						<tr title=\"Show which button does what, and remap them\">\r\n							<td>Button Mapping</td>\r\n							<td>\r\n								<button type=\"button\" class=\"joyBtn joyMappingOpen\">Mapping</button>\r\n							</td>\r\n						</tr>\r\n						<tr title=\"Define how targets are selected in combat\">\r\n							<td>Attack Target Mode</td>\r\n							<td>\r\n								<select class=\"attackTargetMode\">\r\n									<option value=\"0\">Off</option>\r\n									<option value=\"1\">Lowest HP</option>\r\n									<option value=\"2\">Closest</option>\r\n								</select>\r\n							</td>\r\n						</tr>\r\n						<tr title=\"What the pad targets: D-pad left/right and the aim pick from it. D-pad up/down switches in game. Support: the right stick opens a radial with your party\">\r\n							<td>Target Category</td>\r\n							<td>\r\n								<select class=\"joyCycleMode\">\r\n									<option value=\"0\">Mobs</option>\r\n									<option value=\"3\">NPCs &amp; portals</option>\r\n									<option value=\"5\">Players</option>\r\n									<option value=\"6\">NPCs, portals &amp; players</option>\r\n									<option value=\"1\">Items</option>\r\n									<option value=\"4\">Support (party)</option>\r\n								</select>\r\n							</td>\r\n						</tr>\r\n						<tr\r\n							title=\"Choose how skills are cast with gamepad. With Right-Stick Aiming on, Off is not available: skills go to the aimed target\"\r\n						>\r\n							<td>Quick-Cast Mode</td>\r\n							<td>\r\n								<select class=\"joyQuick\">\r\n									<option value=\"0\">Off</option>\r\n									<option value=\"1\">Release Mode</option>\r\n									<option value=\"2\">Instant Mode</option>\r\n								</select>\r\n							</td>\r\n						</tr>\r\n						<tr title=\"Adjust mouse movement sensitivity for R3 stick\">\r\n							<td>Mouse Move</td>\r\n							<td>\r\n								<label style=\"display: inline-block; width: 90px\">\r\n									Sensitivity:\r\n									<input\r\n										class=\"joySense\"\r\n										type=\"range\"\r\n										value=\"25.0\"\r\n										min=\"1.0\"\r\n										max=\"100.0\"\r\n										step=\"1.0\"\r\n										style=\"width: 90%; vertical-align: middle\"\r\n									/>\r\n								</label>\r\n							</td>\r\n						</tr>\r\n						<tr title=\"Disable mouse input from gamepad for UI interaction\">\r\n							<td>Disable Virtual Mouse</td>\r\n							<td>\r\n								<input type=\"checkbox\" class=\"joyDisableVirtualMouse\" />\r\n							</td>\r\n						</tr>\r\n						<tr title=\"Swap L3 and R3 stick functions\">\r\n							<td>Swap L3-R3 Sticks</td>\r\n							<td>\r\n								<input type=\"checkbox\" class=\"joyReverseStick\" />\r\n							</td>\r\n						</tr>\r\n						<tr title=\"Automatically hide UI during gameplay mouse movement\">\r\n							<td>Auto Hide UI</td>\r\n							<td>\r\n								<input type=\"checkbox\" class=\"joyAutoHide\" />\r\n							</td>\r\n						</tr>\r\n						<tr title=\"Set deadzone threshold for analog sticks\">\r\n							<td>Axis Threshold</td>\r\n							<td>\r\n								<label style=\"display: inline-block; width: 90px\">\r\n									Deadline:\r\n									<input\r\n										class=\"joyDeadline\"\r\n										type=\"range\"\r\n										value=\"0.10\"\r\n										min=\"0.0\"\r\n										max=\"1.0\"\r\n										step=\"0.1\"\r\n										style=\"width: 90%; vertical-align: middle\"\r\n									/>\r\n								</label>\r\n							</td>\r\n						</tr>\r\n						<tr title=\"How fast View + D-pad left/right turns the camera, in degrees per second\">\r\n							<td>Camera Turn Speed</td>\r\n							<td>\r\n								<input\r\n									class=\"joyCameraSpeed joyRange\"\r\n									type=\"range\"\r\n									value=\"90\"\r\n									min=\"30\"\r\n									max=\"360\"\r\n									step=\"10\"\r\n								/>\r\n								<span class=\"joyValue\" data-for=\"joyCameraSpeed\"></span>\r\n							</td>\r\n						</tr>\r\n						<tr class=\"joySection\">\r\n							<td colspan=\"2\">Stick Drift</td>\r\n						</tr>\r\n						<tr\r\n							title=\"Measure where the sticks rest and treat that as centre. Leave both sticks alone while it runs (one second)\"\r\n						>\r\n							<td>Calibrate Sticks</td>\r\n							<td>\r\n								<button type=\"button\" class=\"joyBtn joyCalibrate\">Calibrate</button>\r\n								<button type=\"button\" class=\"joyBtn joyCalibrateReset\">Reset</button>\r\n								<div class=\"joyCalibrateStatus\"></div>\r\n							</td>\r\n						</tr>\r\n						<tr title=\"Left stick: movement on each axis below this value is ignored\">\r\n							<td>Left Stick Drift</td>\r\n							<td>\r\n								<label class=\"joyAxis\">\r\n									X\r\n									<input\r\n										class=\"joyDriftLX joyRange\"\r\n										type=\"range\"\r\n										value=\"0\"\r\n										min=\"0\"\r\n										max=\"0.5\"\r\n										step=\"0.01\"\r\n									/>\r\n									<span class=\"joyValue\" data-for=\"joyDriftLX\"></span>\r\n								</label>\r\n								<label class=\"joyAxis\">\r\n									Y\r\n									<input\r\n										class=\"joyDriftLY joyRange\"\r\n										type=\"range\"\r\n										value=\"0\"\r\n										min=\"0\"\r\n										max=\"0.5\"\r\n										step=\"0.01\"\r\n									/>\r\n									<span class=\"joyValue\" data-for=\"joyDriftLY\"></span>\r\n								</label>\r\n							</td>\r\n						</tr>\r\n						<tr title=\"Right stick: movement on each axis below this value is ignored\">\r\n							<td>Right Stick Drift</td>\r\n							<td>\r\n								<label class=\"joyAxis\">\r\n									X\r\n									<input\r\n										class=\"joyDriftRX joyRange\"\r\n										type=\"range\"\r\n										value=\"0\"\r\n										min=\"0\"\r\n										max=\"0.5\"\r\n										step=\"0.01\"\r\n									/>\r\n									<span class=\"joyValue\" data-for=\"joyDriftRX\"></span>\r\n								</label>\r\n								<label class=\"joyAxis\">\r\n									Y\r\n									<input\r\n										class=\"joyDriftRY joyRange\"\r\n										type=\"range\"\r\n										value=\"0\"\r\n										min=\"0\"\r\n										max=\"0.5\"\r\n										step=\"0.01\"\r\n									/>\r\n									<span class=\"joyValue\" data-for=\"joyDriftRY\"></span>\r\n								</label>\r\n							</td>\r\n						</tr>\r\n						<tr class=\"joySection\">\r\n							<td colspan=\"2\">Aim Settings</td>\r\n						</tr>\r\n						<tr title=\"Push the right stick toward a monster or item to target the first one in that direction. In game, tap RS click to switch the right stick between aiming and the cursor; hold it to recenter the cursor. Tap L3 to clear the target, hold L3 to sit or stand\">\r\n							<td>Right-Stick Aiming</td>\r\n							<td>\r\n								<input type=\"checkbox\" class=\"joyAimEnabled\" />\r\n							</td>\r\n						</tr>\r\n						<tr title=\"While aiming, a red ring marks a newly selected target on the ground, then fades out within two seconds\">\r\n							<td>Show Target Ring</td>\r\n							<td>\r\n								<input type=\"checkbox\" class=\"joyAimRing\" />\r\n							</td>\r\n						</tr>\r\n						<tr title=\"While aiming, draw a short line in the aimed direction, which connects to the target once the aim is on one\">\r\n							<td>Show Aim Line</td>\r\n							<td>\r\n								<input type=\"checkbox\" class=\"joyAimLine\" />\r\n							</td>\r\n						</tr>\r\n						<tr\r\n							title=\"While the right stick aims, hide the game's cursor. Moving the mouse shows it again; tap RS click for the cursor mode\"\r\n						>\r\n							<td>Hide Cursor While Aiming</td>\r\n							<td>\r\n								<input type=\"checkbox\" class=\"joyAimHideCursor\" />\r\n							</td>\r\n						</tr>\r\n					</tbody>\r\n				</table>\r\n				<div class=\"joyMapping\">\r\n					<div class=\"joyMappingHeader\">\r\n						<button type=\"button\" class=\"joyBtn joyMappingBack\">&#9664; Back</button>\r\n						<span class=\"joyMappingTitle\">Button mapping</span>\r\n						<button type=\"button\" class=\"joyBtn joyMappingReset\">Reset to defaults</button>\r\n					</div>\r\n					<div class=\"joyMappingStatus\">Remap: press Remap, then a button on the gamepad. The two buttons trade places.</div>\r\n					<div class=\"joyMappingScroll\">\r\n						<table class=\"joyMappingRoles\" border=\"1\" cellspacing=\"0\" bordercolor=\"#aaa\">\r\n							<tbody></tbody>\r\n						</table>\r\n						<div class=\"joyMappingSub\">Combinations (follow the buttons above)</div>\r\n						<table class=\"joyMappingCombos\" border=\"1\" cellspacing=\"0\" bordercolor=\"#aaa\">\r\n							<tbody></tbody>\r\n						</table>\r\n					</div>\r\n				</div>\r\n			</div>\r\n			<button\r\n				class=\"button reset left\"\r\n				data-background=\"btn_reset.bmp\"\r\n				data-hover=\"btn_reset_a.bmp\"\r\n				data-down=\"btn_reset_b.bmp\"\r\n			></button>\r\n			<button\r\n				class=\"button ok right\"\r\n				data-background=\"btn_ok.bmp\"\r\n				data-hover=\"btn_ok_a.bmp\"\r\n				data-down=\"btn_ok_b.bmp\"\r\n			></button>\r\n			<button\r\n				class=\"button cancel right\"\r\n				data-background=\"btn_cancel.bmp\"\r\n				data-hover=\"btn_cancel_a.bmp\"\r\n				data-down=\"btn_cancel_b.bmp\"\r\n			></button>\r\n			<button\r\n				class=\"button close right\"\r\n				data-background=\"btn_close.bmp\"\r\n				data-hover=\"btn_close_a.bmp\"\r\n				data-down=\"btn_close_b.bmp\"\r\n			></button>\r\n		</div>\r\n	</div>\r\n</div>\r\n";
+	ShortCutOption_default$2 = "<div id=\"ShortCutOption\" class=\"pt-page-fadeIn1\">\r\n	<div class=\"border\">\r\n		<div class=\"titlebar\" data-background=\"basic_interface/titlebar_mid.bmp\">\r\n			<div class=\"left\"><span class=\"text\">Shortcut key setting window</span></div>\r\n\r\n			<div class=\"right\">\r\n				<button\r\n					class=\"base close\"\r\n					data-background=\"basic_interface/sys_close_off.bmp\"\r\n					data-hover=\"basic_interface/sys_close_on.bmp\"\r\n				></button>\r\n			</div>\r\n\r\n			<div class=\"clear\"></div>\r\n		</div>\r\n\r\n		<div class=\"tabs\">\r\n			<button class=\"t_skillbar selectedtab\" data-index=\"t_skillbar\">Skill Bar</button\r\n			><button class=\"t_ui\" data-index=\"t_ui\">Interface</button\r\n			><button class=\"t_macro\" data-index=\"t_macro\">Macros</button\r\n			><button class=\"t_gamepad\" data-index=\"t_gamepad\">Gamepad</button>\r\n		</div>\r\n		<div class=\"panel\">\r\n			<div class=\"content t_skillbar selectedtab\">\r\n				<table border=\"1\" cellspacing=\"0\" bordercolor=\"#aaa\">\r\n					<tbody>\r\n						<tr>\r\n							<td>Skill bar 1-1</td>\r\n							<td data-button=\"F1_1\" class=\"customize\"></td>\r\n							<td>Skill bar 2-1</td>\r\n							<td data-button=\"F2_1\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Skill bar 1-2</td>\r\n							<td data-button=\"F1_2\" class=\"customize\"></td>\r\n							<td>Skill bar 2-2</td>\r\n							<td data-button=\"F2_2\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Skill bar 1-3</td>\r\n							<td data-button=\"F1_3\" class=\"customize\"></td>\r\n							<td>Skill bar 2-3</td>\r\n							<td data-button=\"F2_3\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Skill bar 1-4</td>\r\n							<td data-button=\"F1_4\" class=\"customize\"></td>\r\n							<td>Skill bar 2-4</td>\r\n							<td data-button=\"F2_4\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Skill bar 1-5</td>\r\n							<td data-button=\"F1_5\" class=\"customize\"></td>\r\n							<td>Skill bar 2-5</td>\r\n							<td data-button=\"F2_5\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Skill bar 1-6</td>\r\n							<td data-button=\"F1_6\" class=\"customize\"></td>\r\n							<td>Skill bar 2-6</td>\r\n							<td data-button=\"F2_6\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Skill bar 1-7</td>\r\n							<td data-button=\"F1_7\" class=\"customize\"></td>\r\n							<td>Skill bar 2-7</td>\r\n							<td data-button=\"F2_7\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Skill bar 1-8</td>\r\n							<td data-button=\"F1_8\" class=\"customize\"></td>\r\n							<td>Skill bar 2-8</td>\r\n							<td data-button=\"F2_8\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Skill bar 1-9</td>\r\n							<td data-button=\"F1_9\" class=\"customize\"></td>\r\n							<td>Skill bar 2-9</td>\r\n							<td data-button=\"F2_9\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Skill bar 3-1</td>\r\n							<td data-button=\"F3_1\" class=\"customize\"></td>\r\n							<td>Skill bar 4-1</td>\r\n							<td data-button=\"F4_1\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Skill bar 3-2</td>\r\n							<td data-button=\"F3_2\" class=\"customize\"></td>\r\n							<td>Skill bar 4-2</td>\r\n							<td data-button=\"F4_2\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Skill bar 3-3</td>\r\n							<td data-button=\"F3_3\" class=\"customize\"></td>\r\n							<td>Skill bar 4-3</td>\r\n							<td data-button=\"F4_3\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Skill bar 3-4</td>\r\n							<td data-button=\"F3_4\" class=\"customize\"></td>\r\n							<td>Skill bar 4-4</td>\r\n							<td data-button=\"F4_4\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Skill bar 3-5</td>\r\n							<td data-button=\"F3_5\" class=\"customize\"></td>\r\n							<td>Skill bar 4-5</td>\r\n							<td data-button=\"F4_5\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Skill bar 3-6</td>\r\n							<td data-button=\"F3_6\" class=\"customize\"></td>\r\n							<td>Skill bar 4-6</td>\r\n							<td data-button=\"F4_6\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Skill bar 3-7</td>\r\n							<td data-button=\"F3_7\" class=\"customize\"></td>\r\n							<td>Skill bar 4-7</td>\r\n							<td data-button=\"F4_7\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Skill bar 3-8</td>\r\n							<td data-button=\"F3_8\" class=\"customize\"></td>\r\n							<td>Skill bar 4-8</td>\r\n							<td data-button=\"F4_8\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Skill bar 3-9</td>\r\n							<td data-button=\"F3_9\" class=\"customize\"></td>\r\n							<td>Skill bar 4-9</td>\r\n							<td data-button=\"F4_9\" class=\"customize\"></td>\r\n						</tr>\r\n					</tbody>\r\n				</table>\r\n			</div>\r\n			<div class=\"content t_ui\">\r\n				<table border=\"1\" cellspacing=\"0\" bordercolor=\"#aaa\">\r\n					<tbody>\r\n						<tr>\r\n							<td>Basic Info</td>\r\n							<td data-button=\"BasicInfo\" class=\"customize\"></td>\r\n							<td>Character Info</td>\r\n							<td data-button=\"Equipment\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Skill List</td>\r\n							<td data-button=\"SkillList\" class=\"customize\"></td>\r\n							<td>Emotion List</td>\r\n							<td data-button=\"Emotions\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Friends List</td>\r\n							<td data-button=\"Friends\" class=\"customize\"></td>\r\n							<td>Party Window</td>\r\n							<td data-button=\"Party\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Pet Info</td>\r\n							<td data-button=\"PetInfo\" class=\"customize\"></td>\r\n							<td>Chat Room</td>\r\n							<td data-button=\"ChatRoom\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Cart Window</td>\r\n							<td data-button=\"PushCart\" class=\"customize\"></td>\r\n							<td>Item Window</td>\r\n							<td data-button=\"Inventory\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>World Map</td>\r\n							<td data-button=\"WorldMap\" class=\"customize\"></td>\r\n							<td>Guild Info</td>\r\n							<td data-button=\"Guild\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Homunculus Info</td>\r\n							<td data-button=\"HomunInfo\" class=\"customize\"></td>\r\n							<td>Mercenary Info</td>\r\n							<td data-button=\"MercInfo\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Homunculus State</td>\r\n							<td data-button=\"HomunState\" class=\"customize\"></td>\r\n							<td>Mercenary State</td>\r\n							<td data-button=\"MercState\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Sit/Stand</td>\r\n							<td data-button=\"Sit\" class=\"customize\"></td>\r\n							<td>Short Cuts</td>\r\n							<td data-button=\"ShortCuts\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Chat Bar Size</td>\r\n							<td data-button=\"ChatSize\" class=\"customize\"></td>\r\n							<td>Skill Bar Size</td>\r\n							<td data-button=\"SkillBarSize\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Quest</td>\r\n							<td data-button=\"Quest\" class=\"customize\"></td>\r\n							<td>Bank</td>\r\n							<td data-button=\"Bank\" class=\"customize\"></td>\r\n						</tr>\r\n						<!--<tr>\r\n                     <td>MobileUI</td>\r\n                     <td data-button=\"M_UI\" class=\"customize\"></td>\r\n                     <td>MUi-Toggle</td>\r\n                     <td data-button=\"M_Toggle\" class=\"customize\"></td>\r\n                  </tr>\r\n                  <tr>\r\n                     <td>MUi-TG</td>\r\n                     <td data-button=\"M_Targeting\" class=\"customize\"></td>\r\n                     <td>MUi-AT</td>\r\n                     <td data-button=\"M_AutoTarget\" class=\"customize\"></td>\r\n                  </tr>\r\n                  <tr>\r\n                     <td>MUi-ATK</td>\r\n                     <td data-button=\"M_Attack\" class=\"customize\"></td>\r\n                  </tr>-->\r\n					</tbody>\r\n				</table>\r\n			</div>\r\n			<div class=\"content t_macro\">\r\n				<table border=\"1\" cellspacing=\"0\" bordercolor=\"#aaa\">\r\n					<tbody>\r\n						<tr>\r\n							<td>Macro 1</td>\r\n							<td data-button=\"Macro1\" class=\"customize\"></td>\r\n							<td>Flag 1</td>\r\n							<td data-button=\"Flag1\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Macro 2</td>\r\n							<td data-button=\"Macro2\" class=\"customize\"></td>\r\n							<td>Flag 2</td>\r\n							<td data-button=\"Flag2\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Macro 3</td>\r\n							<td data-button=\"Macro3\" class=\"customize\"></td>\r\n							<td>Flag 3</td>\r\n							<td data-button=\"Flag3\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Macro 4</td>\r\n							<td data-button=\"Macro4\" class=\"customize\"></td>\r\n							<td>Flag 4</td>\r\n							<td data-button=\"Flag4\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Macro 5</td>\r\n							<td data-button=\"Macro5\" class=\"customize\"></td>\r\n							<td>Flag 5</td>\r\n							<td data-button=\"Flag5\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Macro 6</td>\r\n							<td data-button=\"Macro6\" class=\"customize\"></td>\r\n							<td>Flag 6</td>\r\n							<td data-button=\"Flag6\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Macro 7</td>\r\n							<td data-button=\"Macro7\" class=\"customize\"></td>\r\n							<td>Flag 7</td>\r\n							<td data-button=\"Flag7\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Macro 8</td>\r\n							<td data-button=\"Macro8\" class=\"customize\"></td>\r\n							<td>Flag 8</td>\r\n							<td data-button=\"Flag8\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Macro 9</td>\r\n							<td data-button=\"Macro9\" class=\"customize\"></td>\r\n							<td>Flag 9</td>\r\n							<td data-button=\"Flag9\" class=\"customize\"></td>\r\n						</tr>\r\n						<tr>\r\n							<td>Macro 10</td>\r\n							<td data-button=\"Macro10\" class=\"customize\"></td>\r\n						</tr>\r\n					</tbody>\r\n				</table>\r\n			</div>\r\n			<div class=\"content t_gamepad\">\r\n				<table class=\"joySettings\" border=\"1\" cellspacing=\"0\" bordercolor=\"#aaa\">\r\n					<tbody>\r\n						<tr title=\"Show which button does what, and remap them\">\r\n							<td>Button Mapping</td>\r\n							<td>\r\n								<button type=\"button\" class=\"joyBtn joyMappingOpen\">Mapping</button>\r\n							</td>\r\n						</tr>\r\n						<tr title=\"Define how targets are selected in combat\">\r\n							<td>Attack Target Mode</td>\r\n							<td>\r\n								<select class=\"attackTargetMode\">\r\n									<option value=\"0\">Off</option>\r\n									<option value=\"1\">Lowest HP</option>\r\n									<option value=\"2\">Closest</option>\r\n								</select>\r\n							</td>\r\n						</tr>\r\n						<tr title=\"What the pad targets: D-pad left/right and the aim pick from it. D-pad up/down switches in game. Support: the right stick opens a radial with your party\">\r\n							<td>Target Category</td>\r\n							<td>\r\n								<select class=\"joyCycleMode\">\r\n									<option value=\"0\">Mobs</option>\r\n									<option value=\"3\">NPCs &amp; portals</option>\r\n									<option value=\"5\">Players</option>\r\n									<option value=\"6\">NPCs, portals &amp; players</option>\r\n									<option value=\"1\">Items</option>\r\n									<option value=\"4\">Support (party)</option>\r\n								</select>\r\n							</td>\r\n						</tr>\r\n						<tr\r\n							title=\"Choose how skills are cast with gamepad. With Right-Stick Aiming on, Off is not available: skills go to the aimed target\"\r\n						>\r\n							<td>Quick-Cast Mode</td>\r\n							<td>\r\n								<select class=\"joyQuick\">\r\n									<option value=\"0\">Off</option>\r\n									<option value=\"1\">Release Mode</option>\r\n									<option value=\"2\">Instant Mode</option>\r\n								</select>\r\n							</td>\r\n						</tr>\r\n						<tr title=\"Adjust mouse movement sensitivity for R3 stick\">\r\n							<td>Mouse Move</td>\r\n							<td>\r\n								<label style=\"display: inline-block; width: 90px\">\r\n									Sensitivity:\r\n									<input\r\n										class=\"joySense\"\r\n										type=\"range\"\r\n										value=\"25.0\"\r\n										min=\"1.0\"\r\n										max=\"100.0\"\r\n										step=\"1.0\"\r\n										style=\"width: 90%; vertical-align: middle\"\r\n									/>\r\n								</label>\r\n							</td>\r\n						</tr>\r\n						<tr title=\"Disable mouse input from gamepad for UI interaction\">\r\n							<td>Disable Virtual Mouse</td>\r\n							<td>\r\n								<input type=\"checkbox\" class=\"joyDisableVirtualMouse\" />\r\n							</td>\r\n						</tr>\r\n						<tr\r\n							title=\"Tap View to move between the buttons and items of open windows with the D-pad: A presses, X offers more and (held) picks an item up, LB / RB switch tabs. Dialogues (NPCs, amounts, message boxes) start it on their own.\"\r\n						>\r\n							<td>Menu Navigation</td>\r\n							<td>\r\n								<input type=\"checkbox\" class=\"joyUIFocus\" />\r\n							</td>\r\n						</tr>\r\n						<tr title=\"Swap L3 and R3 stick functions\">\r\n							<td>Swap L3-R3 Sticks</td>\r\n							<td>\r\n								<input type=\"checkbox\" class=\"joyReverseStick\" />\r\n							</td>\r\n						</tr>\r\n						<tr title=\"Automatically hide UI during gameplay mouse movement\">\r\n							<td>Auto Hide UI</td>\r\n							<td>\r\n								<input type=\"checkbox\" class=\"joyAutoHide\" />\r\n							</td>\r\n						</tr>\r\n						<tr title=\"Set deadzone threshold for analog sticks\">\r\n							<td>Axis Threshold</td>\r\n							<td>\r\n								<label style=\"display: inline-block; width: 90px\">\r\n									Deadline:\r\n									<input\r\n										class=\"joyDeadline\"\r\n										type=\"range\"\r\n										value=\"0.10\"\r\n										min=\"0.0\"\r\n										max=\"1.0\"\r\n										step=\"0.1\"\r\n										style=\"width: 90%; vertical-align: middle\"\r\n									/>\r\n								</label>\r\n							</td>\r\n						</tr>\r\n						<tr title=\"How fast View + D-pad left/right turns the camera, in degrees per second\">\r\n							<td>Camera Turn Speed</td>\r\n							<td>\r\n								<input\r\n									class=\"joyCameraSpeed joyRange\"\r\n									type=\"range\"\r\n									value=\"90\"\r\n									min=\"30\"\r\n									max=\"360\"\r\n									step=\"10\"\r\n								/>\r\n								<span class=\"joyValue\" data-for=\"joyCameraSpeed\"></span>\r\n							</td>\r\n						</tr>\r\n						<tr class=\"joySection\">\r\n							<td colspan=\"2\">Stick Drift</td>\r\n						</tr>\r\n						<tr\r\n							title=\"Measure where the sticks rest and treat that as centre. Leave both sticks alone while it runs (one second)\"\r\n						>\r\n							<td>Calibrate Sticks</td>\r\n							<td>\r\n								<button type=\"button\" class=\"joyBtn joyCalibrate\">Calibrate</button>\r\n								<button type=\"button\" class=\"joyBtn joyCalibrateReset\">Reset</button>\r\n								<div class=\"joyCalibrateStatus\"></div>\r\n							</td>\r\n						</tr>\r\n						<tr title=\"Left stick: movement on each axis below this value is ignored\">\r\n							<td>Left Stick Drift</td>\r\n							<td>\r\n								<label class=\"joyAxis\">\r\n									X\r\n									<input\r\n										class=\"joyDriftLX joyRange\"\r\n										type=\"range\"\r\n										value=\"0\"\r\n										min=\"0\"\r\n										max=\"0.5\"\r\n										step=\"0.01\"\r\n									/>\r\n									<span class=\"joyValue\" data-for=\"joyDriftLX\"></span>\r\n								</label>\r\n								<label class=\"joyAxis\">\r\n									Y\r\n									<input\r\n										class=\"joyDriftLY joyRange\"\r\n										type=\"range\"\r\n										value=\"0\"\r\n										min=\"0\"\r\n										max=\"0.5\"\r\n										step=\"0.01\"\r\n									/>\r\n									<span class=\"joyValue\" data-for=\"joyDriftLY\"></span>\r\n								</label>\r\n							</td>\r\n						</tr>\r\n						<tr title=\"Right stick: movement on each axis below this value is ignored\">\r\n							<td>Right Stick Drift</td>\r\n							<td>\r\n								<label class=\"joyAxis\">\r\n									X\r\n									<input\r\n										class=\"joyDriftRX joyRange\"\r\n										type=\"range\"\r\n										value=\"0\"\r\n										min=\"0\"\r\n										max=\"0.5\"\r\n										step=\"0.01\"\r\n									/>\r\n									<span class=\"joyValue\" data-for=\"joyDriftRX\"></span>\r\n								</label>\r\n								<label class=\"joyAxis\">\r\n									Y\r\n									<input\r\n										class=\"joyDriftRY joyRange\"\r\n										type=\"range\"\r\n										value=\"0\"\r\n										min=\"0\"\r\n										max=\"0.5\"\r\n										step=\"0.01\"\r\n									/>\r\n									<span class=\"joyValue\" data-for=\"joyDriftRY\"></span>\r\n								</label>\r\n							</td>\r\n						</tr>\r\n						<tr class=\"joySection\">\r\n							<td colspan=\"2\">Aim Settings</td>\r\n						</tr>\r\n						<tr title=\"Push the right stick toward a monster or item to target the first one in that direction. In game, tap RS click to switch the right stick between aiming and the cursor; hold it to recenter the cursor. Tap L3 to clear the target, hold L3 to sit or stand\">\r\n							<td>Right-Stick Aiming</td>\r\n							<td>\r\n								<input type=\"checkbox\" class=\"joyAimEnabled\" />\r\n							</td>\r\n						</tr>\r\n						<tr title=\"While aiming, a red ring marks a newly selected target on the ground, then fades out within two seconds\">\r\n							<td>Show Target Ring</td>\r\n							<td>\r\n								<input type=\"checkbox\" class=\"joyAimRing\" />\r\n							</td>\r\n						</tr>\r\n						<tr title=\"While aiming, draw a short line in the aimed direction, which connects to the target once the aim is on one\">\r\n							<td>Show Aim Line</td>\r\n							<td>\r\n								<input type=\"checkbox\" class=\"joyAimLine\" />\r\n							</td>\r\n						</tr>\r\n						<tr\r\n							title=\"While the right stick aims, hide the game's cursor. Moving the mouse shows it again; tap RS click for the cursor mode\"\r\n						>\r\n							<td>Hide Cursor While Aiming</td>\r\n							<td>\r\n								<input type=\"checkbox\" class=\"joyAimHideCursor\" />\r\n							</td>\r\n						</tr>\r\n					</tbody>\r\n				</table>\r\n				<div class=\"joyMapping\">\r\n					<div class=\"joyMappingHeader\">\r\n						<button type=\"button\" class=\"joyBtn joyMappingBack\">&#9664; Back</button>\r\n						<span class=\"joyMappingTitle\">Button mapping</span>\r\n						<button type=\"button\" class=\"joyBtn joyMappingReset\">Reset to defaults</button>\r\n					</div>\r\n					<div class=\"joyMappingStatus\">Remap: press Remap, then a button on the gamepad. The two buttons trade places.</div>\r\n					<div class=\"joyMappingScroll\">\r\n						<table class=\"joyMappingRoles\" border=\"1\" cellspacing=\"0\" bordercolor=\"#aaa\">\r\n							<tbody></tbody>\r\n						</table>\r\n						<div class=\"joyMappingSub\">Combinations (follow the buttons above)</div>\r\n						<table class=\"joyMappingCombos\" border=\"1\" cellspacing=\"0\" bordercolor=\"#aaa\">\r\n							<tbody></tbody>\r\n						</table>\r\n					</div>\r\n				</div>\r\n			</div>\r\n			<button\r\n				class=\"button reset left\"\r\n				data-background=\"btn_reset.bmp\"\r\n				data-hover=\"btn_reset_a.bmp\"\r\n				data-down=\"btn_reset_b.bmp\"\r\n			></button>\r\n			<button\r\n				class=\"button ok right\"\r\n				data-background=\"btn_ok.bmp\"\r\n				data-hover=\"btn_ok_a.bmp\"\r\n				data-down=\"btn_ok_b.bmp\"\r\n			></button>\r\n			<button\r\n				class=\"button cancel right\"\r\n				data-background=\"btn_cancel.bmp\"\r\n				data-hover=\"btn_cancel_a.bmp\"\r\n				data-down=\"btn_cancel_b.bmp\"\r\n			></button>\r\n			<button\r\n				class=\"button close right\"\r\n				data-background=\"btn_close.bmp\"\r\n				data-hover=\"btn_close_a.bmp\"\r\n				data-down=\"btn_close_b.bmp\"\r\n			></button>\r\n		</div>\r\n	</div>\r\n</div>\r\n";
 }));
 //#endregion
 //#region src/UI/Components/ShortCutOption/ShortCutOption.css?raw
@@ -233073,7 +236419,7 @@ function assign$1(logical, physical) {
 	map[logical] = physical;
 	save$2(map);
 }
-function reset() {
+function reset$1() {
 	save$2(identity());
 }
 /**
@@ -233163,7 +236509,7 @@ var init_JoystickButtonMap = __esmMin((() => {
 		toLogical,
 		nameOf: nameOf$1,
 		assign: assign$1,
-		reset,
+		reset: reset$1,
 		startCapture,
 		cancelCapture,
 		isCapturing,
@@ -233900,7 +237246,7 @@ function createSkillList({ name, htmlText, cssText, hasTabs = false, showDescOnM
 				positions[list] = positions[list] ? Object.assign(positions[list], items) : items;
 			});
 		}
-		return positions;
+		return withoutHiddenSkills(positions, JobId);
 	}
 	Component.addSkill = function addSkill(skill) {
 		if (!(skill.SKID in SkillInfo)) return;
@@ -234179,11 +237525,54 @@ function createSkillList({ name, htmlText, cssText, hasTabs = false, showDescOnM
 			save: false
 		};
 		let _ctx = null;
+		const _lookProps = [
+			"head",
+			"headpalette",
+			"bodypalette",
+			"weapon",
+			"shield",
+			"accessory",
+			"accessory2",
+			"accessory3",
+			"robe"
+		];
+		let _onFoot = null;
+		let _onFootKey = "";
+		function onFoot(character) {
+			if (!character.costume) {
+				_onFoot = null;
+				_onFootKey = "";
+				return character;
+			}
+			const key = [
+				character.GID,
+				character._job,
+				character.sex,
+				character.body
+			].concat(_lookProps.map((prop) => character[prop])).join(",");
+			if (key !== _onFootKey) {
+				_onFoot = new Entity();
+				_onFoot.set({
+					GID: character.GID + "_SKILLTREE",
+					objecttype: Entity.TYPE_PC,
+					job: character._job,
+					sex: character.sex,
+					name: "",
+					hideShadow: true
+				});
+				_lookProps.forEach((prop) => {
+					_onFoot[prop] = character[prop];
+				});
+				if (character.body > 0 && character.body !== character._job) _onFoot.body = character.body;
+				_onFootKey = key;
+			}
+			return _onFoot;
+		}
 		return function renderSittingChar(tick) {
-			const character = SessionStorage_default.Entity;
 			const root = Component.getRoot();
 			const contentbig = root.querySelector(".contentbig");
-			if (!character || !contentbig || contentbig.style.display === "none" || !Component.ui.is(":visible")) return;
+			if (!SessionStorage_default.Entity || !contentbig || contentbig.style.display === "none" || !Component.ui.is(":visible")) return;
+			const character = onFoot(SessionStorage_default.Entity);
 			if (!_ctx) {
 				_ctx = root.querySelector("canvas.sitting")?.getContext("2d");
 				if (!_ctx) return;
@@ -234411,6 +237800,7 @@ var init_SkillListCommon = __esmMin((() => {
 	init_GUIComponent();
 	init_MouseEventHandler();
 	init_Preferences$1();
+	init_Entity$1();
 	init_Renderer();
 	init_SessionStorage();
 	init_SpriteRenderer();
@@ -234419,6 +237809,7 @@ var init_SkillListCommon = __esmMin((() => {
 	init_SkillConst();
 	init_SkillTargetSelection();
 	init_SkillTreeView();
+	init_SkillTreeMods();
 	init_TouchDrag();
 	init_SkillRequirements();
 	init_UIManager();
@@ -235564,7 +238955,7 @@ function getIndexFromButtons(btn, set) {
 	if (slot === -1) return -1;
 	return (tab - 1) * 9 + slot;
 }
-function prepare() {
+function prepare$1() {
 	if (!this.__loaded) {
 		const oldonChange = ShortCut_default.onChange;
 		ShortCut_default.onChange = function(index, isSkill, ID, count) {
@@ -235633,7 +239024,7 @@ var init_JoystickShortcutMapper = __esmMin((() => {
 	];
 	JoystickShortcutMapper_default = {
 		slotMap: slotMapping,
-		prepare,
+		prepare: prepare$1,
 		getGroup,
 		getShortcutIndex: function(btn) {
 			const idx = getIndexFromButtons(btn, JoystickSetManager_default.getCurrentSet());
@@ -235644,7 +239035,7 @@ var init_JoystickShortcutMapper = __esmMin((() => {
 }));
 //#endregion
 //#region src/UI/Components/JoystickUI/JoystickMouseCursorAdapter.js
-function move$2(dx, dy) {
+function move$3(dx, dy) {
 	moveBy(dx * Controls_default.joySense, dy * Controls_default.joySense);
 }
 /**
@@ -235718,7 +239109,7 @@ function elementAtCursor() {
 /**
 * Put the virtual cursor at a screen position.
 */
-function moveTo(x, y) {
+function moveTo$1(x, y) {
 	Mouse.screen.x = Math.max(0, Math.min(Renderer.width, x));
 	Mouse.screen.y = Math.max(0, Math.min(Renderer.height, y));
 	const cursor = document.querySelector(".cursor");
@@ -235838,10 +239229,10 @@ function _dispatchKeyEvent(target, type, which) {
 function esc() {
 	_dispatchKeyEvent(document, "keydown", 27);
 }
-function enter() {
+function enter$1() {
 	_dispatchKeyEvent(document, "keydown", 13);
 }
-function contextMenu() {
+function contextMenu$2() {
 	const el = elementAtCursor();
 	if (el && el.closest(".item, .skill")) {
 		const contextMenuEvent = new MouseEvent("contextmenu", {
@@ -235963,17 +239354,17 @@ var init_JoystickMouseCursorAdapter = __esmMin((() => {
 		quickCastClick,
 		moveMouseToEntity,
 		navigateDraggableItems,
-		contextMenu,
+		contextMenu: contextMenu$2,
 		esc,
-		enter,
+		enter: enter$1,
 		changeCameraZoom,
 		changeCameraAngle,
-		move: move$2,
+		move: move$3,
 		moveBy,
 		leftClick,
 		rightClick,
 		elementAtCursor,
-		moveTo,
+		moveTo: moveTo$1,
 		recenter: recenter$1
 	};
 }));
@@ -236054,7 +239445,7 @@ function set(category) {
 * @param {function(): ?Array<number>} [anchor] the character's feet on
 *   screen, for the list
 */
-function step(direction, anchor) {
+function step$3(direction, anchor) {
 	let index = ORDER.indexOf(get$1());
 	if (index === -1) index = 0;
 	index = (index + (direction === "up" ? -1 : 1) + ORDER.length) % ORDER.length;
@@ -236121,7 +239512,7 @@ function showList(anchor) {
 		list.style.opacity = "0";
 	}, LIST_VISIBLE_MS);
 }
-function dispose$3() {
+function dispose$5() {
 	if (_hideTimer) {
 		clearTimeout(_hideTimer);
 		_hideTimer = null;
@@ -236169,12 +239560,12 @@ var init_JoystickTargetCategory = __esmMin((() => {
 		ORDER,
 		get: get$1,
 		set,
-		step,
+		step: step$3,
 		nameOf,
 		isSupport,
 		onChange,
 		showList,
-		dispose: dispose$3
+		dispose: dispose$5
 	};
 }));
 //#endregion
@@ -236485,7 +239876,7 @@ var init_JoystickTargetService = __esmMin((() => {
 function releaseStick() {
 	_stickHeld = false;
 }
-function move$1(x, y) {
+function move$2(x, y) {
 	const player = SessionStorage_default.Entity;
 	if (!player || _stickHeld) return;
 	SessionStorage_default.moveAction = null;
@@ -236545,7 +239936,7 @@ function attack(repeat) {
 * reach (more than 2 cells, same rule as a mouse click in EntityControl),
 * walk to it first and let onWalkEnd send the pickup via Session.moveAction.
 */
-function pickUp() {
+function pickUp$1() {
 	const Player = SessionStorage_default.Entity;
 	if (!Player) return;
 	const item = JoystickTargetService_default.getItem() || EntityManager.getClosestEntity(Player, Player.constructor.TYPE_ITEM);
@@ -236588,8 +239979,8 @@ var init_JoystickCharacterControl = __esmMin((() => {
 	JoystickCharacterControl_default = {
 		attack,
 		toggleSit,
-		pickUp,
-		move: move$1,
+		pickUp: pickUp$1,
+		move: move$2,
 		releaseStick
 	};
 }));
@@ -237048,7 +240439,7 @@ function setCursorHidden(hidden) {
 * is never left without one. Synthetic events (isTrusted false) do not
 * count.
 */
-function onMouseMove(event) {
+function onMouseMove$1(event) {
 	if (event.isTrusted) {
 		_mouseMoved = true;
 		setCursorHidden(false);
@@ -237057,7 +240448,7 @@ function onMouseMove(event) {
 /**
 * Aim mode left: remove the ring, forget the last hit, show the cursor.
 */
-function release$1() {
+function release$2() {
 	_aimLastHit = null;
 	if (_aimGate) _aimGate.reset();
 	_aimRingTarget = null;
@@ -237074,12 +240465,12 @@ function release$1() {
 function update$3(x, y, held) {
 	const player = SessionStorage_default.Entity;
 	if (!player) {
-		release$1();
+		release$2();
 		return;
 	}
 	if (held) _mouseMoved = false;
 	if (Controls_default.joyAimHideCursor && !_mouseListening) {
-		window.addEventListener("mousemove", onMouseMove);
+		window.addEventListener("mousemove", onMouseMove$1);
 		_mouseListening = true;
 	}
 	setCursorHidden(!!Controls_default.joyAimHideCursor && !_mouseMoved);
@@ -237129,11 +240520,11 @@ function update$3(x, y, held) {
 /**
 * Switch the right stick between aim and cursor (tap RS click).
 */
-function toggle() {
+function toggle$1() {
 	if (!isEnabled()) return;
 	Controls_default.joyRightStickMode = isActive$1() ? MODE.CURSOR : MODE.AIM;
 	Controls_default.save();
-	release$1();
+	release$2();
 	JoystickUIRenderer_default.updateStickMode();
 	ChatBox_default.addText("Right stick: " + (isActive$1() ? "aim" : "cursor"), ChatBox_default.TYPE.INFO, ChatBox_default.FILTER.PUBLIC_LOG);
 }
@@ -237146,7 +240537,7 @@ function setEnabled(enabled) {
 	Controls_default.joyRightStickMode = enabled ? MODE.AIM : MODE.CURSOR;
 	if (enabled && (Controls_default.joyQuick | 0) === QUICK_CAST.OFF) Controls_default.joyQuick = QUICK_CAST.INSTANT;
 	Controls_default.save();
-	release$1();
+	release$2();
 	JoystickUIRenderer_default.updateStickMode();
 }
 var MODE, QUICK_CAST, HIT_RADIUS, HIT_SPREAD, RETARGET_MAGNITUDE, RELEASE_LOCK_MS, FLIP_DOT, RING_RADIUS, RING_POINTS, RING_FADE_MS, LINE_STEP, LINE_IDLE_LENGTH, LINE_COLOR_HIT, LINE_COLOR_IDLE, _aimLastHit, _aimGate, _aimOverlay, _aimCtx, _aimDrawn, _aimRingTarget, _aimRingAt, _cursorHidden, _mouseMoved, _mouseListening, _aimWorld, _aimView, JoystickAimMode_default;
@@ -237202,8 +240593,8 @@ var init_JoystickAimMode = __esmMin((() => {
 		quickCastMode,
 		setEnabled,
 		update: update$3,
-		release: release$1,
-		toggle,
+		release: release$2,
+		toggle: toggle$1,
 		stickToMapDirection,
 		findFirstHit,
 		createRetargetGate,
@@ -237221,14 +240612,14 @@ function getComponent(name) {
 		return null;
 	}
 }
-function isShown(component) {
+function isShown$1(component) {
 	const host = component && component._host;
 	return !!host && !!host.parentNode && host.style.display !== "none";
 }
 function isVisible$1(el) {
 	return el.style.display !== "none" && el.getClientRects().length > 0;
 }
-function hover(el, on) {
+function hover$1(el, on) {
 	el.classList.toggle("pad-hover", on);
 	el.dispatchEvent(new MouseEvent(on ? "mouseover" : "mouseout", {
 		bubbles: true,
@@ -237247,7 +240638,7 @@ function navigate(direction) {
 	let component = null;
 	for (let i = 0; i < MENUS.length; i++) {
 		component = getComponent(MENUS[i].component);
-		if (isShown(component)) {
+		if (isShown$1(component)) {
 			open = MENUS[i];
 			break;
 		}
@@ -237263,10 +240654,10 @@ function navigate(direction) {
 	let index = open === _menuCurrent && _menuButton ? buttons.indexOf(_menuButton) : -1;
 	if (index === -1) index = forward ? 0 : buttons.length - 1;
 	else index = (index + (forward ? 1 : -1) + buttons.length) % buttons.length;
-	if (_menuButton && _menuButton !== buttons[index]) hover(_menuButton, false);
+	if (_menuButton && _menuButton !== buttons[index]) hover$1(_menuButton, false);
 	_menuCurrent = open;
 	_menuButton = buttons[index];
-	hover(_menuButton, true);
+	hover$1(_menuButton, true);
 	const rect = _menuButton.getBoundingClientRect();
 	JoystickMouseCursorAdapter_default.moveTo(rect.left + rect.width / 2, rect.top + rect.height / 2);
 	return true;
@@ -237276,10 +240667,10 @@ function navigate(direction) {
 *
 * @return {boolean} true when one was open and is closed now
 */
-function close$1() {
+function close$3() {
 	for (let i = 0; i < MENUS.length; i++) {
 		const component = getComponent(MENUS[i].component);
-		if (MENUS[i].closable && isShown(component)) {
+		if (MENUS[i].closable && isShown$1(component)) {
 			component.remove();
 			_menuCurrent = null;
 			_menuButton = null;
@@ -237304,7 +240695,7 @@ var init_JoystickMenuNavigation = __esmMin((() => {
 	_menuButton = null;
 	JoystickMenuNavigation_default = {
 		navigate,
-		close: close$1
+		close: close$3
 	};
 }));
 //#endregion
@@ -237320,7 +240711,7 @@ var init_JoystickMenuNavigation = __esmMin((() => {
 function getMembers() {
 	const player = SessionStorage_default.Entity;
 	if (!player) return [];
-	const list = [describe("self", "self", player.GID, player.display && player.display.name, player._job, null)];
+	const list = [describe$1("self", "self", player.GID, player.display && player.display.name, player._job, null)];
 	let party = [];
 	try {
 		party = SessionStorage_default.hasParty && controller.getPartyMembers?.() || [];
@@ -237330,13 +240721,13 @@ function getMembers() {
 	for (let i = 0; i < party.length; i++) {
 		const member = party[i];
 		if (member.AID === SessionStorage_default.AID || member.AID === player.GID) continue;
-		list.push(describe("aid:" + member.AID, "party", member.AID, member.characterName, member.class_, member));
+		list.push(describe$1("aid:" + member.AID, "party", member.AID, member.characterName, member.class_, member));
 	}
-	if (SessionStorage_default.homunId) list.push(describe("homun", "homun", SessionStorage_default.homunId, null, null, null));
-	if (SessionStorage_default.mercId) list.push(describe("merc", "merc", SessionStorage_default.mercId, null, null, null));
+	if (SessionStorage_default.homunId) list.push(describe$1("homun", "homun", SessionStorage_default.homunId, null, null, null));
+	if (SessionStorage_default.mercId) list.push(describe$1("merc", "merc", SessionStorage_default.mercId, null, null, null));
 	return list;
 }
-function describe(key, kind, GID, name, job, member) {
+function describe$1(key, kind, GID, name, job, member) {
 	const offline = !!member && member.state !== 0;
 	const entity = kind === "self" ? SessionStorage_default.Entity : offline ? null : liveEntity(GID);
 	let hp = -1;
@@ -237486,16 +240877,16 @@ function getFocusEntity$1() {
 * be cast on them (Heal not on the dead, Resurrection only on them).
 */
 function getFocusForSkill() {
-	if (_open$2 && !_pending$1 && _highlight !== -1 && _entries[_highlight]) {
+	if (_open$3 && !_pending$3 && _highlight !== -1 && _entries[_highlight]) {
 		const entry = _entries[_highlight];
 		if (!judge(entry, skillContext()).ok) return null;
-		setFocus(entry);
+		setFocus$1(entry);
 		return entry.entity;
 	}
 	const focus = getFocus();
 	return focus && judge(focus, skillContext()).ok ? focus.entity : null;
 }
-function setFocus(entry) {
+function setFocus$1(entry) {
 	_focusKey = entry ? entry.key : null;
 }
 function clearFocus() {
@@ -237516,7 +240907,7 @@ function cycle(direction) {
 	let next;
 	if (index === -1) next = direction === "next" ? 0 : members.length - 1;
 	else next = (index + (direction === "next" ? 1 : -1) + members.length) % members.length;
-	setFocus(members[next]);
+	setFocus$1(members[next]);
 }
 /**
 * Whether a skill waiting for a target belongs to Support: one that takes
@@ -237561,19 +240952,19 @@ function castOn(entity) {
 * @param {string} name skill name, shown above the radial
 */
 function openPending(index, name) {
-	_pending$1 = {
+	_pending$3 = {
 		index,
 		name: name || ""
 	};
-	_open$2 = true;
+	_open$3 = true;
 	_highlight = 0;
 	_picked = -1;
 }
 function isPending() {
-	return _pending$1 !== null;
+	return _pending$3 !== null;
 }
 function pendingIndex() {
-	return _pending$1 ? _pending$1.index : -1;
+	return _pending$3 ? _pending$3.index : -1;
 }
 /**
 * Drop the pending skill and close the radial.
@@ -237581,8 +240972,8 @@ function pendingIndex() {
 * @param {boolean} [cancelSkill] also take the skill off the cursor
 */
 function cancelPending(cancelSkill) {
-	if (!_pending$1) return;
-	_pending$1 = null;
+	if (!_pending$3) return;
+	_pending$3 = null;
 	closeRadial();
 	if (cancelSkill && SkillTargetSelection_default.getFlag()) SkillTargetSelection_default.remove();
 }
@@ -237591,12 +240982,12 @@ function cancelPending(cancelSkill) {
 * yourself.
 */
 function castPendingOnSelf() {
-	_pending$1 = null;
+	_pending$3 = null;
 	closeRadial();
 	return castOn(SessionStorage_default.Entity);
 }
 function closeRadial() {
-	_open$2 = false;
+	_open$3 = false;
 	_highlight = -1;
 	_picked = -1;
 }
@@ -237616,8 +241007,8 @@ function segmentAt(x, y, count) {
 function pick(index) {
 	_picked = index;
 	const entry = _entries[index];
-	if (_pending$1 || !entry || !entry.selectable || entry.key === _focusKey) return;
-	setFocus(entry);
+	if (_pending$3 || !entry || !entry.selectable || entry.key === _focusKey) return;
+	setFocus$1(entry);
 	rumble(RUMBLE_FOCUS);
 }
 /**
@@ -237627,7 +241018,7 @@ function pick(index) {
 * @return {boolean} whether it was open
 */
 function dismiss() {
-	if (!_open$2 || _pending$1) return false;
+	if (!_open$3 || _pending$3) return false;
 	closeRadial();
 	_waitRest = true;
 	return true;
@@ -237640,11 +241031,11 @@ function dismiss() {
 * @return {boolean} whether a skill was pending (A is taken either way)
 */
 function confirmPending() {
-	if (!_pending$1) return false;
+	if (!_pending$3) return false;
 	const entry = _highlight !== -1 ? _entries[_highlight] : null;
 	if (!entry || !judge(entry, skillContext()).ok) return true;
-	setFocus(entry);
-	_pending$1 = null;
+	setFocus$1(entry);
+	_pending$3 = null;
 	closeRadial();
 	castOn(entry.entity);
 	return true;
@@ -237656,7 +241047,7 @@ function confirmPending() {
 * again.
 */
 function ownsStick() {
-	return _pending$1 !== null || JoystickTargetCategory_default.isSupport();
+	return _pending$3 !== null || JoystickTargetCategory_default.isSupport();
 }
 /**
 * One frame (JoystickCursorMotion), before aim and cursor get the stick.
@@ -237668,13 +241059,13 @@ function ownsStick() {
 * @return {boolean} true when Support took the right stick this frame
 */
 function update$2(x, y, magnitude, deadzone) {
-	if (_pending$1 && !SkillTargetSelection_default.getFlag()) {
-		_pending$1 = null;
+	if (_pending$3 && !SkillTargetSelection_default.getFlag()) {
+		_pending$3 = null;
 		closeRadial();
 	}
-	if (!SessionStorage_default.Entity || !JoystickTargetCategory_default.isSupport() && !_pending$1) {
+	if (!SessionStorage_default.Entity || !JoystickTargetCategory_default.isSupport() && !_pending$3) {
 		closeRadial();
-		release();
+		release$1();
 		return false;
 	}
 	const owns = ownsStick();
@@ -237686,7 +241077,7 @@ function update$2(x, y, magnitude, deadzone) {
 	if (pickedKey !== null) _picked = _entries.findIndex((entry) => entry.key === pickedKey);
 	if (owns) {
 		if (_highlight === -1 && highlightKey !== null) {
-			_highlight = _pending$1 ? 0 : -1;
+			_highlight = _pending$3 ? 0 : -1;
 			_picked = -1;
 		}
 		const atRest = magnitude <= Math.max(deadzone, RELEASE_MAX);
@@ -237694,7 +241085,7 @@ function update$2(x, y, magnitude, deadzone) {
 		if (magnitude >= SELECT_MIN && _entries.length > 0 && !_waitRest) {
 			const index = segmentAt(x, y, _entries.length);
 			const now = performance.now();
-			_open$2 = true;
+			_open$3 = true;
 			if (index !== _highlight || !_pushed) {
 				_highlight = index;
 				_highlightAt = now;
@@ -237703,10 +241094,10 @@ function update$2(x, y, magnitude, deadzone) {
 			if (_picked !== _highlight && now - _highlightAt >= SETTLE_MS) pick(_highlight);
 		} else if (atRest) {
 			_pushed = false;
-			if (_pending$1) _highlight = _picked !== -1 ? _picked : 0;
+			if (_pending$3) _highlight = _picked !== -1 ? _picked : 0;
 			else closeRadial();
 		}
-	} else if (!_pending$1) closeRadial();
+	} else if (!_pending$3) closeRadial();
 	draw();
 	return owns;
 }
@@ -237745,14 +241136,14 @@ function clearOverlay() {
 /**
 * Remove everything drawn (Support left, pad gone). The focus stays.
 */
-function release() {
+function release$1() {
 	clearOverlay();
 }
 /**
 * The gamepad is going away (JoystickModule.dispose): take the overlay off the page and drop
 * what was kept for drawing, so nothing outlives it. The next use builds them again.
 */
-function dispose$2() {
+function dispose$4() {
 	cancelPending(false);
 	closeRadial();
 	clearFocus();
@@ -237764,7 +241155,7 @@ function dispose$2() {
 function draw() {
 	clearOverlay();
 	const focus = JoystickTargetCategory_default.isSupport() ? getFocusEntity$1() : null;
-	if (!_open$2 && !focus) return;
+	if (!_open$3 && !focus) return;
 	const ctx = getContext();
 	if (!ctx) return;
 	const dpr = window.devicePixelRatio || 1;
@@ -237773,7 +241164,7 @@ function draw() {
 		JoystickAimMode_default.drawRing(ctx, focus, .8, FOCUS_RING);
 		_drawn = true;
 	}
-	if (_open$2) drawRadial(ctx);
+	if (_open$3) drawRadial(ctx);
 }
 function drawRadial(ctx) {
 	const player = SessionStorage_default.Entity;
@@ -237786,7 +241177,7 @@ function drawRadial(ctx) {
 	const cy = Math.max(feet[1], Math.min(feet[1] + BELOW_FEET$1 + reach, Renderer.height - reach - LABEL_ROOM));
 	const step = Math.PI * 2 / count;
 	const gap = GAP_DEG * Math.PI / 180;
-	const skill = _pending$1 ? skillContext() : null;
+	const skill = _pending$3 ? skillContext() : null;
 	for (let i = 0; i < count; i++) {
 		const entry = _entries[i];
 		const verdict = judge(entry, skill);
@@ -237834,7 +241225,7 @@ function drawRadial(ctx) {
 		if (reason) label += " - " + reason;
 		drawLabel(ctx, label, cx, cy + outer + POP_OUT + 14);
 	}
-	if (_pending$1 && _pending$1.name) drawLabel(ctx, _pending$1.name, cx, cy - outer - POP_OUT - 8);
+	if (_pending$3 && _pending$3.name) drawLabel(ctx, _pending$3.name, cx, cy - outer - POP_OUT - 8);
 	_drawn = true;
 }
 /**
@@ -238044,7 +241435,7 @@ function opaqueBounds(ctx, side) {
 		right
 	};
 }
-var SELECT_MIN, RELEASE_MAX, SETTLE_MS, R_INNER, R_OUTER_MIN, R_OUTER_PER_ENTRY, POP_OUT, GAP_DEG, ICON_SIZE, BELOW_FEET$1, LABEL_ROOM, HP_GOOD, HP_LOW, COLOR_GOOD, COLOR_MID, COLOR_LOW, FOCUS_RING, SP_BACK, SP_FILL, SP_COST, SP_SHORT, FAR_OUTLINE, RUMBLE_FOCUS, RUMBLE_CAST, REVIVE_SKILLS, PORTRAIT_BOX, PORTRAIT_RETRY_MS, _overlay, _supportCtx, _drawn, _focusKey, _open$2, _highlight, _highlightAt, _picked, _pushed, _waitRest, _entries, _pending$1, _portraits, _jobIcons, HEADGEAR, _scratch, _scratchCtx, JoystickSupportMode_default;
+var SELECT_MIN, RELEASE_MAX, SETTLE_MS, R_INNER, R_OUTER_MIN, R_OUTER_PER_ENTRY, POP_OUT, GAP_DEG, ICON_SIZE, BELOW_FEET$1, LABEL_ROOM, HP_GOOD, HP_LOW, COLOR_GOOD, COLOR_MID, COLOR_LOW, FOCUS_RING, SP_BACK, SP_FILL, SP_COST, SP_SHORT, FAR_OUTLINE, RUMBLE_FOCUS, RUMBLE_CAST, REVIVE_SKILLS, PORTRAIT_BOX, PORTRAIT_RETRY_MS, _overlay, _supportCtx, _drawn, _focusKey, _open$3, _highlight, _highlightAt, _picked, _pushed, _waitRest, _entries, _pending$3, _portraits, _jobIcons, HEADGEAR, _scratch, _scratchCtx, JoystickSupportMode_default;
 var init_JoystickSupportMode = __esmMin((() => {
 	init_SessionStorage();
 	init_EntityManager();
@@ -238100,14 +241491,14 @@ var init_JoystickSupportMode = __esmMin((() => {
 	_supportCtx = null;
 	_drawn = false;
 	_focusKey = null;
-	_open$2 = false;
+	_open$3 = false;
 	_highlight = -1;
 	_highlightAt = 0;
 	_picked = -1;
 	_pushed = false;
 	_waitRest = false;
 	_entries = [];
-	_pending$1 = null;
+	_pending$3 = null;
 	_portraits = /* @__PURE__ */ new Map();
 	_jobIcons = /* @__PURE__ */ new Map();
 	HEADGEAR = [
@@ -238122,7 +241513,7 @@ var init_JoystickSupportMode = __esmMin((() => {
 		getFocus,
 		getFocusEntity: getFocusEntity$1,
 		getFocusForSkill,
-		setFocus,
+		setFocus: setFocus$1,
 		clearFocus,
 		cycle,
 		isSupportSkill,
@@ -238136,10 +241527,10 @@ var init_JoystickSupportMode = __esmMin((() => {
 		dismiss,
 		ownsStick,
 		update: update$2,
-		release,
-		dispose: dispose$2,
+		release: release$1,
+		dispose: dispose$4,
 		segmentAt,
-		isRadialOpen: () => _open$2,
+		isRadialOpen: () => _open$3,
 		getHighlight: () => _highlight
 	};
 }));
@@ -238169,7 +241560,7 @@ function getRows() {
 	const rows = [];
 	const favorites = getFavorites();
 	if (favorites.length) rows.push(favorites);
-	const page = allEmotes().slice(_page$1 * PER_PAGE, (_page$1 + 1) * PER_PAGE);
+	const page = allEmotes().slice(_page$2 * PER_PAGE, (_page$2 + 1) * PER_PAGE);
 	for (let i = 0; i < page.length; i += COLS) rows.push(page.slice(i, i + COLS));
 	return rows;
 }
@@ -238179,19 +241570,19 @@ function hasFavoriteRow() {
 function clampSelection() {
 	const rows = getRows();
 	if (rows.length === 0) {
-		_row = 0;
-		_col = 0;
+		_row$1 = 0;
+		_col$1 = 0;
 		return;
 	}
-	_row = Math.max(0, Math.min(_row, rows.length - 1));
-	_col = Math.max(0, Math.min(_col, rows[_row].length - 1));
+	_row$1 = Math.max(0, Math.min(_row$1, rows.length - 1));
+	_col$1 = Math.max(0, Math.min(_col$1, rows[_row$1].length - 1));
 }
 /**
 * Sprite index of the selected emote, or -1.
 */
 function getSelected() {
-	const row = getRows()[_row];
-	return row && row[_col] !== void 0 ? row[_col] : -1;
+	const row = getRows()[_row$1];
+	return row && row[_col$1] !== void 0 ? row[_col$1] : -1;
 }
 /**
 * Send an emote, as typing its /command does.
@@ -238217,36 +241608,36 @@ function toggleFavorite(emo) {
 	const hadRow = hasFavoriteRow();
 	Controls_default.joyEmoteFavorites = favorites;
 	Controls_default.save();
-	if (!hadRow && favorites.length) _row++;
-	else if (hadRow && !favorites.length) _row = Math.max(0, _row - 1);
+	if (!hadRow && favorites.length) _row$1++;
+	else if (hadRow && !favorites.length) _row$1 = Math.max(0, _row$1 - 1);
 	clampSelection();
 }
-function move(direction) {
+function move$1(direction) {
 	const rows = getRows();
 	if (rows.length === 0) return;
 	switch (direction) {
 		case "up":
-			_row = (_row - 1 + rows.length) % rows.length;
+			_row$1 = (_row$1 - 1 + rows.length) % rows.length;
 			break;
 		case "down":
-			_row = (_row + 1) % rows.length;
+			_row$1 = (_row$1 + 1) % rows.length;
 			break;
 		case "left":
-			_col = (_col - 1 + rows[_row].length) % rows[_row].length;
+			_col$1 = (_col$1 - 1 + rows[_row$1].length) % rows[_row$1].length;
 			return;
 		case "right":
-			_col = (_col + 1) % rows[_row].length;
+			_col$1 = (_col$1 + 1) % rows[_row$1].length;
 			return;
 	}
-	_col = Math.min(_col, rows[_row].length - 1);
+	_col$1 = Math.min(_col$1, rows[_row$1].length - 1);
 }
 function changePage(delta) {
 	const pages = pageCount();
-	_page$1 = (_page$1 + delta + pages) % pages;
+	_page$2 = (_page$2 + delta + pages) % pages;
 	clampSelection();
 }
 function isActive() {
-	return _open$1;
+	return _open$2;
 }
 /**
 * A fresh press, or a held D-pad direction due to repeat.
@@ -238255,13 +241646,13 @@ function fires(buttons, index, repeat) {
 	const state = buttons[index];
 	if (state === "pressed") {
 		if (repeat) {
-			_repeatButton = index;
-			_repeatAt = Date.now() + REPEAT_DELAY_MS;
+			_repeatButton$1 = index;
+			_repeatAt$1 = Date.now() + REPEAT_DELAY_MS$2;
 		}
 		return true;
 	}
-	if (repeat && state === "holding" && _repeatButton === index && Date.now() >= _repeatAt) {
-		_repeatAt = Date.now() + REPEAT_EVERY_MS;
+	if (repeat && state === "holding" && _repeatButton$1 === index && Date.now() >= _repeatAt$1) {
+		_repeatAt$1 = Date.now() + REPEAT_EVERY_MS$2;
 		return true;
 	}
 	return false;
@@ -238272,45 +241663,45 @@ function fires(buttons, index, repeat) {
 * @param {Array<string>} buttons logical button states
 */
 function handleInput(buttons) {
-	if (!_open$1) return;
-	if (_repeatButton !== -1 && buttons[_repeatButton] === "unpressed") _repeatButton = -1;
-	if (fires(buttons, BTN.B, false) || fires(buttons, BTN.MENU, false)) {
-		close();
+	if (!_open$2) return;
+	if (_repeatButton$1 !== -1 && buttons[_repeatButton$1] === "unpressed") _repeatButton$1 = -1;
+	if (fires(buttons, BTN$2.B, false) || fires(buttons, BTN$2.MENU, false)) {
+		close$2();
 		return;
 	}
-	if (fires(buttons, BTN.A, false)) {
+	if (fires(buttons, BTN$2.A, false)) {
 		play(getSelected());
-		close();
+		close$2();
 		return;
 	}
-	if (fires(buttons, BTN.X, false)) play(getSelected());
-	else if (fires(buttons, BTN.Y, false)) toggleFavorite(getSelected());
-	else if (fires(buttons, BTN.LB, false)) changePage(-1);
-	else if (fires(buttons, BTN.RB, false)) changePage(1);
-	else if (fires(buttons, BTN.UP, true)) move("up");
-	else if (fires(buttons, BTN.DOWN, true)) move("down");
-	else if (fires(buttons, BTN.LEFT, true)) move("left");
-	else if (fires(buttons, BTN.RIGHT, true)) move("right");
+	if (fires(buttons, BTN$2.X, false)) play(getSelected());
+	else if (fires(buttons, BTN$2.Y, false)) toggleFavorite(getSelected());
+	else if (fires(buttons, BTN$2.LB, false)) changePage(-1);
+	else if (fires(buttons, BTN$2.RB, false)) changePage(1);
+	else if (fires(buttons, BTN$2.UP, true)) move$1("up");
+	else if (fires(buttons, BTN$2.DOWN, true)) move$1("down");
+	else if (fires(buttons, BTN$2.LEFT, true)) move$1("left");
+	else if (fires(buttons, BTN$2.RIGHT, true)) move$1("right");
 	else return;
-	render$7();
+	render$8();
 }
 /**
 * @param {function(): ?Array<number>} [anchor] the character's feet on
 *   screen; without it (or off screen) the grid sits in the lower middle
 */
-function open(anchor) {
+function open$2(anchor) {
 	_anchor = anchor || null;
-	_open$1 = true;
-	_repeatButton = -1;
-	_row = 0;
-	_col = 0;
+	_open$2 = true;
+	_repeatButton$1 = -1;
+	_row$1 = 0;
+	_col$1 = 0;
 	clampSelection();
 	loadSprites();
-	render$7();
+	render$8();
 }
-function close() {
-	_open$1 = false;
-	_repeatButton = -1;
+function close$2() {
+	_open$2 = false;
+	_repeatButton$1 = -1;
 	if (_root$16) _root$16.style.display = "none";
 }
 function loadSprites() {
@@ -238321,7 +241712,7 @@ function loadSprites() {
 			_action$4 = act;
 			_sprite$4 = spr;
 			_loading = false;
-			render$7();
+			render$8();
 		});
 	} catch {
 		_loading = false;
@@ -238369,10 +241760,10 @@ function drawEmote(canvas, emo) {
 	if (!_entity$2) _entity$2 = new Entity();
 	for (let i = 0; i < layers.length; ++i) _entity$2.renderLayer(layers[i], _sprite$4, _sprite$4, 1, [0, 0], false);
 }
-function render$7() {
+function render$8() {
 	const root = getRoot();
 	if (!root) return;
-	if (!_open$1) {
+	if (!_open$2) {
 		root.style.display = "none";
 		return;
 	}
@@ -238396,7 +241787,7 @@ function render$7() {
 			const canvas = document.createElement("canvas");
 			canvas.width = canvas.height = CELL;
 			canvas.dataset.emote = String(emo);
-			const selected = r === _row && c === _col;
+			const selected = r === _row$1 && c === _col$1;
 			Object.assign(canvas.style, {
 				width: "40px",
 				height: "40px",
@@ -238417,7 +241808,7 @@ function render$7() {
 	info.className = "info";
 	info.style.marginTop = "4px";
 	info.style.textAlign = "center";
-	info.textContent = (selected >= 0 ? "/" + Emotions_default.names[selected] : "") + "  ·  page " + (_page$1 + 1) + "/" + pageCount();
+	info.textContent = (selected >= 0 ? "/" + Emotions_default.names[selected] : "") + "  ·  page " + (_page$2 + 1) + "/" + pageCount();
 	root.appendChild(info);
 	const hint = document.createElement("div");
 	hint.style.marginTop = "2px";
@@ -238425,16 +241816,16 @@ function render$7() {
 	hint.style.color = "#999";
 	hint.style.fontSize = "11px";
 	const n = JoystickButtonMap_default.nameOf;
-	hint.textContent = n(BTN.A) + " play · " + n(BTN.X) + " play, stay · " + n(BTN.Y) + " favourite · " + n(BTN.LB) + "/" + n(BTN.RB) + " page · " + n(BTN.B) + " close";
+	hint.textContent = n(BTN$2.A) + " play · " + n(BTN$2.X) + " play, stay · " + n(BTN$2.Y) + " favourite · " + n(BTN$2.LB) + "/" + n(BTN$2.RB) + " page · " + n(BTN$2.B) + " close";
 	root.appendChild(hint);
 	JoystickScreenAnchor_default.placeBelowFeet(root, JoystickScreenAnchor_default.feetFrom(_anchor), BELOW_FEET);
 }
-function dispose$1() {
-	close();
+function dispose$3() {
+	close$2();
 	if (_root$16 && _root$16.parentNode) _root$16.parentNode.removeChild(_root$16);
 	_root$16 = null;
 }
-var COLS, PER_PAGE, MAX_FAVORITES, CELL, BELOW_FEET, REPEAT_DELAY_MS, REPEAT_EVERY_MS, BTN, _root$16, _anchor, _open$1, _page$1, _row, _col, _repeatButton, _repeatAt, _action$4, _sprite$4, _loading, _entity$2, JoystickEmoteGrid_default;
+var COLS, PER_PAGE, MAX_FAVORITES, CELL, BELOW_FEET, REPEAT_DELAY_MS$2, REPEAT_EVERY_MS$2, BTN$2, _root$16, _anchor, _open$2, _page$2, _row$1, _col$1, _repeatButton$1, _repeatAt$1, _action$4, _sprite$4, _loading, _entity$2, JoystickEmoteGrid_default;
 var init_JoystickEmoteGrid = __esmMin((() => {
 	init_Emotions();
 	init_Client();
@@ -238450,9 +241841,9 @@ var init_JoystickEmoteGrid = __esmMin((() => {
 	MAX_FAVORITES = COLS;
 	CELL = 40;
 	BELOW_FEET = 24;
-	REPEAT_DELAY_MS = 350;
-	REPEAT_EVERY_MS = 120;
-	BTN = {
+	REPEAT_DELAY_MS$2 = 350;
+	REPEAT_EVERY_MS$2 = 120;
+	BTN$2 = {
 		A: 0,
 		B: 1,
 		X: 2,
@@ -238467,24 +241858,4607 @@ var init_JoystickEmoteGrid = __esmMin((() => {
 	};
 	_root$16 = null;
 	_anchor = null;
-	_open$1 = false;
-	_page$1 = 0;
-	_row = 0;
-	_col = 0;
-	_repeatButton = -1;
-	_repeatAt = 0;
+	_open$2 = false;
+	_page$2 = 0;
+	_row$1 = 0;
+	_col$1 = 0;
+	_repeatButton$1 = -1;
+	_repeatAt$1 = 0;
 	_action$4 = null;
 	_sprite$4 = null;
 	_loading = false;
 	_entity$2 = null;
 	JoystickEmoteGrid_default = {
-		open,
-		close,
+		open: open$2,
+		close: close$2,
 		isActive,
 		handleInput,
 		getSelected,
 		getRows,
-		dispose: dispose$1
+		dispose: dispose$3
+	};
+}));
+//#endregion
+//#region src/UI/Components/Inventory/InventoryItemTransfer.js
+/**
+* Transfer an inventory item stack to the active receivers, highest priority first.
+* A receiver that declines the item lets the next one (or the caller's fallback) handle it.
+*
+* @param {object} item Inventory item
+* @param {object} components Registered UI components
+* @returns {boolean} Whether a receiver handled the request
+*/
+function transferInventoryItemStack(item, components) {
+	if (!item || !components) return false;
+	return Object.values(components).filter((component) => {
+		return component?.__active && component._host?.isConnected && component._host.style.display !== "none" && typeof component.receiveInventoryItemStack === "function";
+	}).sort((a, b) => (b.inventoryTransferPriority || 0) - (a.inventoryTransferPriority || 0)).some((receiver) => receiver.receiveInventoryItemStack(item) === true);
+}
+var InventoryItemTransferPriority;
+var init_InventoryItemTransfer = __esmMin((() => {
+	InventoryItemTransferPriority = Object.freeze({
+		TRADE: 300,
+		NPC_STORE: 400
+	});
+}));
+//#endregion
+//#region src/UI/Components/JoystickUI/JoystickDomEvents.js
+/**
+* UI/Components/JoystickUI/JoystickDomEvents.js
+*
+* The mouse events menu navigation sends to the element it has focused,
+* as a real mouse would send them there. Every window lives in a shadow
+* root and many listen on a parent (`content.addEventListener('dblclick',
+* e => e.target.closest('.item'))`), so the events bubble and are composed
+* (they leave the shadow root, and a window drag ends on its mouseup). They
+* carry the element's centre, and the button both ways: `button` and the
+* legacy `which` that handlers here still test (`event.which === 3`).
+*
+* They go to the element itself, never to whatever lies under the virtual
+* cursor: the focus decides what is pressed.
+*/
+/**
+* Centre of an element on screen.
+*
+* @param {Element} el
+* @return {{x: number, y: number}}
+*/
+function centerOf$1(el) {
+	const rect = el.getBoundingClientRect();
+	return {
+		x: rect.left + rect.width / 2,
+		y: rect.top + rect.height / 2
+	};
+}
+/**
+* Send one mouse event.
+*
+* @param {Element} el target
+* @param {string} type event type
+* @param {object} [options]
+* @param {number} [options.button] 0 left, 2 right
+* @param {boolean} [options.altKey]
+* @param {number} [options.detail] click count
+* @return {boolean} false when a listener cancelled it
+*/
+function send(el, type, options = {}) {
+	const button = options.button || 0;
+	const at = centerOf$1(el);
+	const event = new MouseEvent(type, {
+		bubbles: type !== "mouseenter" && type !== "mouseleave",
+		cancelable: true,
+		composed: true,
+		clientX: at.x,
+		clientY: at.y,
+		screenX: at.x,
+		screenY: at.y,
+		button,
+		buttons: type === "mousedown" ? button === 2 ? 2 : 1 : 0,
+		detail: options.detail || 0,
+		altKey: !!options.altKey,
+		which: button + 1
+	});
+	return el.dispatchEvent(event);
+}
+/**
+* Pointer onto or off an element: its hover image, the item name a window
+* shows under the pointer, a tooltip. `pad-hover` is for styles that cannot
+* see a synthetic hover (`:hover` stays off): ContextMenu highlights it.
+*
+* @param {Element} el
+* @param {boolean} on
+*/
+function hover(el, on) {
+	if (!el || !el.isConnected) return;
+	el.classList.toggle("pad-hover", on);
+	send(el, on ? "mouseover" : "mouseout");
+	send(el, on ? "mouseenter" : "mouseleave");
+}
+/**
+* A left click: mousedown, mouseup, click. Buttons here answer either the
+* press (WinStats' stat buttons, Storage's tabs) or the click.
+*
+* @param {Element} el
+*/
+function press$1(el) {
+	send(el, "mousedown", { detail: 1 });
+	send(el, "mouseup", { detail: 1 });
+	send(el, "click", { detail: 1 });
+}
+/**
+* A double click on an element: the second click of the pair, then
+* dblclick. Lists that confirm on a double click (NPC menus, item
+* selections) take it; so does ItemDoubleClick, which counts clicks.
+*
+* @param {Element} el
+*/
+function doubleClick(el) {
+	send(el, "mousedown", { detail: 2 });
+	send(el, "mouseup", { detail: 2 });
+	send(el, "click", { detail: 2 });
+	send(el, "dblclick", { detail: 2 });
+}
+/**
+* A right click: item and skill windows open their info window on it, and
+* with Alt held they move the stack to the other window.
+*
+* @param {Element} el
+* @param {boolean} [altKey]
+*/
+function contextMenu$1(el, altKey) {
+	send(el, "mousedown", {
+		button: 2,
+		altKey
+	});
+	send(el, "mouseup", {
+		button: 2,
+		altKey
+	});
+	send(el, "contextmenu", {
+		button: 2,
+		altKey
+	});
+}
+var JoystickDomEvents_default;
+var init_JoystickDomEvents = __esmMin((() => {
+	JoystickDomEvents_default = {
+		centerOf: centerOf$1,
+		send,
+		hover,
+		press: press$1,
+		doubleClick,
+		contextMenu: contextMenu$1
+	};
+}));
+//#endregion
+//#region src/UI/Components/JoystickUI/JoystickNumberSpinner.js
+/**
+* The number field of an amount box, or null for a text box.
+*
+* @param {ShadowRoot} root the InputBox window's root
+* @return {?HTMLInputElement}
+*/
+function numberField(root) {
+	const box = root && root.querySelector("#inputbox");
+	if (!box || !box.classList.contains("number")) return null;
+	return box.querySelector("input");
+}
+function setValue(field, value) {
+	field.value = String(value);
+	field.dispatchEvent(new Event("input", { bubbles: true }));
+}
+/**
+* One D-pad press on an amount box.
+*
+* @param {ShadowRoot} root the InputBox window's root
+* @param {string} direction 'up', 'down', 'left' or 'right'
+* @return {boolean} true when the box took the press
+*/
+function step$2(root, direction) {
+	const field = numberField(root);
+	if (!field) return false;
+	const value = Math.max(0, parseInt(field.value, 10) || 0);
+	switch (direction) {
+		case "up":
+			setValue(field, value + _step);
+			break;
+		case "down":
+			setValue(field, Math.max(0, value - _step));
+			break;
+		case "left":
+			_step = Math.min(MAX_STEP, _step * 10);
+			break;
+		case "right":
+			_step = Math.max(1, Math.round(_step / 10));
+			break;
+		default: return false;
+	}
+	return true;
+}
+/**
+* Back to steps of one, for the next box.
+*/
+function reset() {
+	_step = 1;
+}
+function getStep() {
+	return _step;
+}
+/**
+* Hints for the button bar, or none for a text box.
+*
+* @param {ShadowRoot} root
+* @return {Array<Array<string>>} [keys, what they do]
+*/
+function hints$2(root) {
+	if (!numberField(root)) return [];
+	return [["▲▼", "±" + _step.toLocaleString("en-US")], ["◀▶", "Step ×10 / ÷10"]];
+}
+var MAX_STEP, _step, JoystickNumberSpinner_default;
+var init_JoystickNumberSpinner = __esmMin((() => {
+	MAX_STEP = 1e9;
+	_step = 1;
+	JoystickNumberSpinner_default = {
+		step: step$2,
+		reset,
+		hints: hints$2,
+		getStep,
+		numberField
+	};
+}));
+//#endregion
+//#region src/UI/Components/JoystickUI/JoystickCarry.js
+/**
+* A stand-in for the browser's DataTransfer: what the handlers here use of it.
+*/
+function makeTransfer() {
+	const store = {};
+	return {
+		dropEffect: "move",
+		effectAllowed: "all",
+		types: [],
+		files: [],
+		items: [],
+		setData(type, value) {
+			store[type] = String(value);
+			if (this.types.indexOf(type) === -1) this.types.push(type);
+		},
+		getData(type) {
+			return store[type] || "";
+		},
+		clearData(type) {
+			if (type) delete store[type];
+			else Object.keys(store).forEach((key) => delete store[key]);
+		},
+		setDragImage() {}
+	};
+}
+function dragEvent(type, data) {
+	const event = new Event(type, {
+		bubbles: true,
+		cancelable: true,
+		composed: true
+	});
+	Object.defineProperty(event, "dataTransfer", { value: data });
+	return event;
+}
+/**
+* The element a window's dragstart handler looks for: the element itself if
+* draggable, else the draggable inside it (a shortcut slot's icon).
+*/
+function dragSource(el) {
+	if (!el) return null;
+	if (el.getAttribute("draggable") === "true") return el;
+	return el.querySelector("[draggable=\"true\"]");
+}
+/**
+* Whether an element can be picked up at all (it does not say whether its
+* window lets it go: an unlearned skill, say, refuses on dragstart).
+*/
+function canPickUp(el) {
+	return !!dragSource(el);
+}
+/**
+* The picture of what is carried: the first image in its icon (an item's
+* `.icon` background, a skill's <img>, a worn item's button, a slot's `.img`).
+*/
+function iconImage(source) {
+	const scopes = [source.querySelector(".icon"), source];
+	for (let i = 0; i < scopes.length; i++) {
+		if (!scopes[i]) continue;
+		const nodes = [scopes[i], ...scopes[i].querySelectorAll("*")];
+		for (let j = 0; j < nodes.length; j++) {
+			const node = nodes[j];
+			if (node.tagName === "IMG" && node.getAttribute("src")) return `url("${node.src}")`;
+			const background = node.style && node.style.backgroundImage;
+			if (background && background !== "none") return background;
+		}
+	}
+	return "";
+}
+function makeGhost(source) {
+	if (typeof document === "undefined" || !document.body) return null;
+	const ghost = document.createElement("div");
+	ghost.className = "joystick-carry-ghost";
+	const image = iconImage(source);
+	Object.assign(ghost.style, {
+		position: "fixed",
+		zIndex: 10001,
+		pointerEvents: "none",
+		width: "24px",
+		height: "24px",
+		backgroundImage: image || "none",
+		backgroundRepeat: "no-repeat",
+		backgroundPosition: "center",
+		backgroundSize: "contain",
+		opacity: "0.85",
+		display: "none"
+	});
+	document.body.appendChild(ghost);
+	return ghost;
+}
+/**
+* Pick an element up.
+*
+* @param {Element} el an item, skill or slot
+* @return {boolean} true when its window gave something to carry
+*/
+function pickUp(el) {
+	cancel$1();
+	const source = dragSource(el);
+	if (!source) return false;
+	const data = makeTransfer();
+	const start = dragEvent("dragstart", data);
+	source.dispatchEvent(start);
+	if (start.defaultPrevented || !data.getData("Text")) {
+		source.dispatchEvent(dragEvent("dragend", data));
+		delete window._OBJ_DRAG_;
+		return false;
+	}
+	_carry = {
+		source,
+		data,
+		ghost: makeGhost(source)
+	};
+	return true;
+}
+/**
+* Put what is carried down on an element: its window decides what that
+* means (move, equip, assign, ask how many).
+*
+* @param {Element} target
+* @return {boolean} false when nothing was carried
+*/
+function place(target) {
+	if (!_carry || !target) return false;
+	const data = _carry.data;
+	target.dispatchEvent(dragEvent("dragenter", data));
+	target.dispatchEvent(dragEvent("dragover", data));
+	target.dispatchEvent(dragEvent("drop", data));
+	finish$1();
+	return true;
+}
+/**
+* The drag ends at its source (the shortcut bar shows the icon again,
+* windows forget window._OBJ_DRAG_), or at the page when the source is gone.
+*/
+function finish$1() {
+	const carry = _carry;
+	_carry = null;
+	if (!carry) return;
+	if (carry.ghost && carry.ghost.parentNode) carry.ghost.parentNode.removeChild(carry.ghost);
+	const end = dragEvent("dragend", carry.data);
+	(carry.source.isConnected ? carry.source : document).dispatchEvent(end);
+	delete window._OBJ_DRAG_;
+}
+function cancel$1() {
+	finish$1();
+}
+function isCarrying() {
+	return _carry !== null;
+}
+/**
+* What is carried, as its window described it ({type, from, data}), or null.
+*/
+function payload() {
+	if (!_carry) return null;
+	try {
+		return JSON.parse(_carry.data.getData("Text"));
+	} catch {
+		return null;
+	}
+}
+/**
+* The icon follows the ring: at the top right of the focused element, or
+* hidden with nothing focused.
+*
+* @param {?{right: number, top: number}} rect
+*/
+function moveGhost(rect) {
+	const ghost = _carry && _carry.ghost;
+	if (!ghost) return;
+	if (!rect) {
+		ghost.style.display = "none";
+		return;
+	}
+	ghost.style.left = Math.round(rect.right - 8) + "px";
+	ghost.style.top = Math.round(rect.top - 16) + "px";
+	ghost.style.display = "block";
+}
+var _carry, JoystickCarry_default;
+var init_JoystickCarry = __esmMin((() => {
+	_carry = null;
+	JoystickCarry_default = {
+		pickUp,
+		place,
+		cancel: cancel$1,
+		isCarrying,
+		canPickUp,
+		payload,
+		moveGhost
+	};
+}));
+//#endregion
+//#region src/UI/Components/JoystickUI/JoystickWindowProfiles.js
+/**
+* A registered window, by name (version aliases resolve: 'Inventory' is InventoryV3).
+*/
+function component(name) {
+	try {
+		return UIManager.getComponent(name);
+	} catch {
+		return null;
+	}
+}
+/**
+* Whether an element is on screen and can be pressed.
+*/
+function shown(el) {
+	if (!el || !el.isConnected || el.hasAttribute("disabled")) return false;
+	const rect = el.getBoundingClientRect();
+	return rect.width > 0 && rect.height > 0 && getComputedStyle(el).visibility !== "hidden";
+}
+/**
+* Press the first shown element matching one of the selectors.
+*
+* @return {boolean} whether one was pressed
+*/
+function pressFirst(root, selectors) {
+	for (let i = 0; i < selectors.length; i++) {
+		const el = root.querySelector(selectors[i]);
+		if (shown(el)) {
+			JoystickDomEvents_default.press(el);
+			return true;
+		}
+	}
+	return false;
+}
+function shownIn(root, selector) {
+	return shown(root.querySelector(selector));
+}
+/**
+* A list row: moving onto it selects it, as a click does, so the window's
+* own highlight follows the ring and OK / Enter take the row that is
+* focused; A confirms it with a double click.
+*/
+function listRows(selector) {
+	return {
+		onFocus(el) {
+			if (el.matches(selector)) {
+				JoystickDomEvents_default.send(el, "mousedown", { detail: 1 });
+				JoystickDomEvents_default.send(el, "mouseup", { detail: 1 });
+			}
+		},
+		primary(el) {
+			if (!el.matches(selector)) return false;
+			JoystickDomEvents_default.doubleClick(el);
+			return true;
+		},
+		primaryLabel(el) {
+			return el.matches(selector) ? "Choose" : null;
+		}
+	};
+}
+/**
+* What A does with an inventory item: what a double click does (InventoryCommon useItem).
+*/
+function inventoryAction(item) {
+	if (!item) return "";
+	switch (item.type) {
+		case ItemType_default.WEAPON:
+		case ItemType_default.ARMOR:
+		case ItemType_default.SHADOWGEAR:
+		case ItemType_default.PETARMOR:
+		case ItemType_default.AMMO: return item.IsIdentified && !item.IsDamaged ? "Equip" : "";
+		case ItemType_default.HEALING:
+		case ItemType_default.USABLE:
+		case ItemType_default.CASH:
+		case ItemType_default.CARD:
+		case ItemType_default.DELAYCONSUME: return "Use";
+	}
+	return "";
+}
+function inventoryItem(el) {
+	const inventory = component("Inventory");
+	const index = parseInt(el.getAttribute("data-index"), 10);
+	return inventory && inventory.getItemByIndex ? inventory.getItemByIndex(index) : null;
+}
+function cartItem(el) {
+	const cart = component("CartItems");
+	const index = parseInt(el.getAttribute("data-index"), 10);
+	return cart && cart.getItemByIndex ? cart.getItemByIndex(index) : null;
+}
+/**
+* Whether a registered window is open on screen.
+*/
+function isOpen$1(name) {
+	const found = component(name);
+	const host = found && found._host;
+	return !!host && host.isConnected && host.style.display !== "none";
+}
+/**
+* A window's host, where its drop handler listens; null if it is not in the page.
+*/
+function hostOf(name) {
+	const found = component(name);
+	const host = found && found._host;
+	return host && host.isConnected ? host : null;
+}
+/**
+* The map: an item put there is dropped on the ground (MapControl).
+*/
+function ground() {
+	return typeof document !== "undefined" ? document.querySelector("canvas.ro-scene") : null;
+}
+/**
+* Pick an element up and put it down on a target at once: the target's
+* drop handler does what a mouse drag there does, asking how many first
+* when it is a stack.
+*/
+function moveTo(el, target) {
+	if (target && JoystickCarry_default.pickUp(el)) JoystickCarry_default.place(target);
+}
+/**
+* Whether the trade takes items now (not after the player has locked it).
+*/
+function tradeTakesItems() {
+	if (!isOpen$1("Trade")) return false;
+	const trade = component("Trade");
+	const send = trade.getRoot && trade.getRoot().querySelector(".box.send");
+	return !!send && !send.classList.contains("disabled");
+}
+function npcSells() {
+	const store = component("NpcStore");
+	return isOpen$1("NpcStore") && !!store.getCurrentType && store.getCurrentType() === store.Type.SELL;
+}
+/**
+* Where A sends an inventory item instead of using it, as Alt + right click
+* does: an NPC's sell list, the trade, storage. (Not the cart: merchants
+* keep it open, and A would stop using items.)
+*
+* @return {string} what A does there, '' if nowhere
+*/
+function inventoryTransfer() {
+	if (npcSells()) return "Sell";
+	if (tradeTakesItems()) return "Offer";
+	return isOpen$1("Storage") ? "Store" : "";
+}
+/**
+* The count shown on a stack's row; 1 when none is shown (a single item).
+*/
+function rowCount(el) {
+	const count = el.querySelector(".count");
+	return count && parseInt(count.textContent, 10) || 1;
+}
+/**
+* Menu entries that move an item somewhere: for a stack, all of it at once
+* and some of it (a drop on the window, which asks how many); for one item,
+* just the move.
+*
+* @param {{one: string, all: string, some: string}} labels
+* @param {number} count
+* @param {function(Element)} all
+* @param {?Element} dropOn the window that asks how many; null: no "some" entry
+*/
+function allOrSome(labels, count, all, dropOn) {
+	if (count <= 1) return [{
+		label: labels.one,
+		run: all
+	}];
+	const out = [{
+		label: labels.all,
+		run: all
+	}];
+	if (dropOn) out.push({
+		label: labels.some,
+		run: (live) => moveTo(live, dropOn)
+	});
+	return out;
+}
+/**
+* Whether an inventory item can go on a gamepad slot (what
+* JoystickInteractionService.openSelectionWindow takes).
+*/
+function slottable(item) {
+	return !!item && item.type !== ItemType_default.UNKNOWN && item.type !== ItemType_default.ETC && item.type !== ItemType_default.CARD && item.type !== ItemType_default.PETEGG && item.type !== ItemType_default.PETARMOR;
+}
+/**
+* X on an inventory item: use or equip it, send it to an open storage,
+* cart, trade or sell list (all, or some), put it on a gamepad slot, drop it.
+*/
+function inventoryActions(el, win, ctx) {
+	const inventory = component("Inventory");
+	const item = el.matches(".item[data-index]") ? inventoryItem(el) : null;
+	if (!inventory || !item) return [];
+	const count = item.count || 1;
+	const withItem = (fn) => (live) => {
+		const now = inventoryItem(live);
+		if (now) fn(now);
+	};
+	const out = [];
+	const use = inventoryAction(item);
+	if (use && inventory.useItem) out.push({
+		label: use,
+		run: withItem((it) => inventory.useItem(it))
+	});
+	if (npcSells()) out.push({
+		label: "Sell",
+		run: withItem((it) => component("NpcStore").receiveInventoryItemStack(it))
+	});
+	if (tradeTakesItems()) {
+		const trade = component("Trade");
+		out.push(...allOrSome(OFFER, count, withItem((it) => trade.receiveInventoryItemStack(it)), hostOf("Trade")));
+	}
+	if (isOpen$1("Storage")) {
+		const storage = component("Storage");
+		out.push(...allOrSome(STORE, count, withItem((it) => storage.reqAddItem(it.index, it.count || 1)), hostOf("Storage")));
+	}
+	if (isOpen$1("CartItems") && inventory.reqMoveItemToCart) out.push(...allOrSome(TO_CART, count, withItem((it) => inventory.reqMoveItemToCart(it.index, it.count || 1)), hostOf("CartItems")));
+	if (ctx && ctx.pickSlot && slottable(item)) out.push({
+		label: "Gamepad slot…",
+		run: (live) => ctx.pickSlot(live)
+	});
+	const map = ground();
+	if (map) out.push({
+		label: count > 1 ? "Drop…" : "Drop",
+		run: (live) => moveTo(live, map)
+	});
+	return out;
+}
+/**
+* X on a stored item: take it (all, or some), or send it to the cart.
+*/
+function storageActions(el) {
+	const storage = component("Storage");
+	if (!storage || !el.matches(".content .item[data-index]")) return [];
+	const index = parseInt(el.getAttribute("data-index"), 10);
+	const count = rowCount(el);
+	const out = allOrSome(TAKE, count, (live) => storage.reqRemoveItem(index, rowCount(live)), hostOf("Inventory"));
+	if (isOpen$1("CartItems") && storage.reqMoveItemToCart) out.push(...allOrSome(TO_CART, count, (live) => storage.reqMoveItemToCart(index, rowCount(live)), hostOf("CartItems")));
+	return out;
+}
+/**
+* X on an item in the cart: take it (all, or some), or store it.
+*/
+function cartActions(el) {
+	const cart = component("CartItems");
+	const item = el.matches(".content .item[data-index]") ? cartItem(el) : null;
+	if (!cart || !item) return [];
+	const count = item.count || 1;
+	const withItem = (fn) => (live) => {
+		const now = cartItem(live);
+		if (now) fn(now);
+	};
+	const out = allOrSome(TAKE, count, withItem((it) => cart.reqRemoveItem(it.index, it.count || 1)), hostOf("Inventory"));
+	if (isOpen$1("Storage")) {
+		const storage = component("Storage");
+		out.push(...allOrSome(STORE, count, withItem((it) => storage.reqAddItemFromCart(it.index, it.count || 1)), hostOf("Storage")));
+	}
+	return out;
+}
+function skillOf(el) {
+	const list = component("SkillList");
+	return list && list.getSkillById ? list.getSkillById(parseInt(el.getAttribute("data-index"), 10)) : null;
+}
+/**
+* A skill the player has and can use: what can be cast, dragged and put on a slot.
+*/
+function usableSkill(skill) {
+	return !!skill && !!skill.level && !!skill.type;
+}
+/**
+* Whether the NPC shop window shows a player's buying store.
+*/
+function isBuyingStore() {
+	const store = component("NpcStore");
+	return !!store && !!store.getCurrentType && store.getCurrentType() === store.Type.BUYING_STORE;
+}
+/**
+* Where A moves an item in a shop window of two lists: from the list on
+* offer (in a player's buying store, from the player's own matching items)
+* into the deal, and from the deal back. The window's drop handler does
+* the move, asking how many when it is a stack.
+*
+* @param {Element} el
+* @param {object} win
+* @param {boolean} buying a player's buying store
+* @return {?Element|undefined} the list to put it in; null: nowhere; undefined: not a shop item
+*/
+function dealTarget(el, win, buying) {
+	if (!el.matches(".item[data-index]")) return;
+	const box = el.closest(".InputWindow, .OutputWindow, .AvailableItemsWindow");
+	if (!box) return;
+	let name;
+	if (box.classList.contains("OutputWindow")) name = buying ? "AvailableItemsWindow" : "InputWindow";
+	else if (box.classList.contains("AvailableItemsWindow")) name = "OutputWindow";
+	else name = buying ? null : "OutputWindow";
+	const list = name ? win.root.querySelector("." + name) : null;
+	return list ? list.querySelector(".content") || list : null;
+}
+/**
+* A shop window of two lists (NPC shops, stalls and buying stores; a
+* merchant's own stall being set up): A moves an item into the deal and
+* back, as dragging it does (only some of them take a double click).
+*
+* @param {function(): boolean} [buying] whether it is a player's buying store now
+*/
+function dealLists(buying = () => false) {
+	return {
+		takesFocus: true,
+		dropZones: ".InputWindow .content, .OutputWindow .content, .AvailableItemsWindow .content",
+		primary(el, win) {
+			const target = dealTarget(el, win, buying());
+			if (target === void 0) return false;
+			if (target) moveTo(el, target);
+			return true;
+		},
+		primaryLabel(el, win) {
+			const target = dealTarget(el, win, buying());
+			if (target === void 0) return null;
+			if (!target) return "";
+			return target.closest(".OutputWindow") ? "Add" : "Remove";
+		}
+	};
+}
+/**
+* The Quest window's open tab: the one whose list is shown.
+*/
+function questTab(tabs, win) {
+	return tabs.findIndex((tab) => {
+		const list = tab.id ? win.root.querySelector("#" + tab.id + "-quest-list") : null;
+		return !!list && list.style.display === "block";
+	});
+}
+/**
+* A window's own record of its open tab (InventoryCommon, StorageCommon getTab).
+*/
+function tabOf(name) {
+	return () => {
+		const found = component(name);
+		return found && found.getTab ? found.getTab() : -1;
+	};
+}
+/**
+* The profile of a window, by component name; an empty one for the rest.
+*
+* @param {string} name
+* @return {object}
+*/
+function forName(name) {
+	for (let i = 0; i < PROFILES.length; i++) if (PROFILES[i].match.test(name || "")) return PROFILES[i];
+	return DEFAULT;
+}
+var STORE, TAKE, TO_CART, OFFER, PROFILES, DEFAULT, JoystickWindowProfiles_default;
+var init_JoystickWindowProfiles = __esmMin((() => {
+	init_UIManager();
+	init_ItemType();
+	init_InventoryItemTransfer();
+	init_JoystickDomEvents();
+	init_JoystickNumberSpinner();
+	init_JoystickCarry();
+	STORE = {
+		one: "Store",
+		all: "Store all",
+		some: "Store some…"
+	};
+	TAKE = {
+		one: "Take",
+		all: "Take all",
+		some: "Take some…"
+	};
+	TO_CART = {
+		one: "To cart",
+		all: "All to cart",
+		some: "Some to cart…"
+	};
+	OFFER = {
+		one: "Offer",
+		all: "Offer all",
+		some: "Offer some…"
+	};
+	PROFILES = [
+		{
+			match: /^(ChatBox(:.*)?|MiniMap(V\d+)?|QuestWindow|SkillTargetSelection|StatusIcons|Announce|ItemObtain|MapName|FPS|PCGoldTimer|Sense|EntityRoom|EntitySignboard)$/,
+			skip: true
+		},
+		{
+			match: /^(ItemInfo|ItemCompare|SkillDescription|CardIllustration|ItemPreview)$/,
+			info: true
+		},
+		{
+			match: /^JoystickUI$/,
+			get skip() {
+				return !JoystickCarry_default.isCarrying();
+			},
+			only: ".slot"
+		},
+		{
+			match: /^NpcBox$/,
+			dialog: true,
+			initial: [".btns .next", ".btns .close"],
+			scroll: ".content",
+			primaryLabel(el) {
+				if (el.matches(".next")) return "Next";
+				return el.matches(".close") ? "Close" : null;
+			},
+			back(win) {
+				pressFirst(win.root, [".btns .close"]);
+				return true;
+			},
+			backLabel(win) {
+				return shownIn(win.root, ".btns .close") ? "Close" : "";
+			}
+		},
+		Object.assign(listRows(".content div[data-index]"), {
+			match: /^NpcMenu$/,
+			dialog: true,
+			wrap: true,
+			initial: [".content div.selected", ".content div[data-index]"],
+			back(win) {
+				pressFirst(win.root, [".cancel"]);
+				return true;
+			},
+			backLabel() {
+				return "Cancel";
+			}
+		}),
+		{
+			match: /^InputBox$/,
+			dialog: true,
+			initial: [
+				"#inputbox:not(.number) input",
+				"ui-button",
+				"input"
+			],
+			onEnter() {
+				JoystickNumberSpinner_default.reset();
+			},
+			direction(direction, el, win) {
+				return JoystickNumberSpinner_default.step(win.root, direction);
+			},
+			primary(el, win) {
+				if (el.matches("input") && !JoystickNumberSpinner_default.numberField(win.root)) return false;
+				pressFirst(win.root, ["ui-button"]);
+				return true;
+			},
+			primaryLabel(el, win) {
+				return el.matches("input") && !JoystickNumberSpinner_default.numberField(win.root) ? "Type" : "OK";
+			},
+			back() {
+				const box = component("InputBox");
+				if (box && !box.isPersistent) box.remove();
+				return true;
+			},
+			backLabel() {
+				const box = component("InputBox");
+				return box && !box.isPersistent ? "Cancel" : "";
+			},
+			hints(el, win) {
+				return JoystickNumberSpinner_default.hints(win.root);
+			}
+		},
+		{
+			match: /^(WinMSG|WinPrompt|WinDeal|WinError)$/,
+			dialog: true,
+			initial: [".btns button"],
+			back(win) {
+				const buttons = Array.from(win.root.querySelectorAll(".btns button")).filter(shown);
+				if (buttons.length) JoystickDomEvents_default.press(buttons[buttons.length - 1]);
+				return true;
+			},
+			backLabel(win) {
+				return win.root.querySelectorAll(".btns button").length > 1 ? "Cancel" : "OK";
+			}
+		},
+		Object.assign(listRows(".item[data-index]"), {
+			match: /^(ItemSelection|MakeArrowSelection|RefineWeaponSelection|MakeItemSelection)$/,
+			dialog: true,
+			initial: [".item.select", ".item[data-index]"],
+			back(win) {
+				pressFirst(win.root, [".cancel"]);
+				return true;
+			},
+			backLabel() {
+				return "Cancel";
+			}
+		}),
+		{
+			match: /^PackageSelection$/,
+			dialog: true,
+			initial: [".groups button"],
+			back(win) {
+				pressFirst(win.root, [".cancel"]);
+				return true;
+			},
+			backLabel() {
+				return "Cancel";
+			}
+		},
+		{
+			match: /^ContextMenu$/,
+			dialog: true,
+			wrap: true,
+			only: ".menu > div",
+			initial: [".menu > div"],
+			back() {
+				const menu = component("ContextMenu");
+				if (menu) menu.remove();
+				return true;
+			},
+			backLabel() {
+				return "Close";
+			}
+		},
+		{
+			match: /^Escape$/,
+			dialog: true,
+			wrap: true,
+			only: ".container button",
+			back(win) {
+				pressFirst(win.root, [".container .cancel"]);
+				return true;
+			},
+			backLabel(win) {
+				return shownIn(win.root, ".container .cancel") ? "Cancel" : "";
+			}
+		},
+		{
+			match: /^BasicInfo(V\d+)?$/,
+			home: true,
+			items: ".buttons > div[id]"
+		},
+		Object.assign(dealLists(isBuyingStore), { match: /^NpcStore$/ }),
+		Object.assign(dealLists(), { match: /^Vending$/ }),
+		{
+			match: /^Mail$/,
+			takesFocus: true,
+			dropZones: ".container_item"
+		},
+		{
+			match: /^WriteRodex$/,
+			takesFocus: true,
+			dropZones: ".items"
+		},
+		{
+			match: /^Refine$/,
+			takesFocus: true,
+			dropZones: ".item_to_refine"
+		},
+		{
+			match: /^(Trade|VendingShop|ReadMail|Rodex|CashShop)$/,
+			takesFocus: true
+		},
+		{
+			match: /^Inventory(V\d+)?$/,
+			activeTab: tabOf("Inventory"),
+			primary(el) {
+				if (!el.matches(".item[data-index]")) return false;
+				const inventory = component("Inventory");
+				const item = inventoryItem(el);
+				if (!item) return true;
+				const transfer = inventoryTransfer();
+				if (transfer === "Store") component("Storage").reqAddItem(item.index, item.count || 1);
+				else if (transfer) transferInventoryItemStack(item, UIManager.components);
+				else if (inventory.useItem) inventory.useItem(item);
+				return true;
+			},
+			primaryLabel(el) {
+				if (!el.matches(".item[data-index]")) return null;
+				return inventoryTransfer() || inventoryAction(inventoryItem(el));
+			},
+			actions: inventoryActions
+		},
+		{
+			match: /^Storage$/,
+			takesFocus: true,
+			activeTab: tabOf("Storage"),
+			primary(el) {
+				if (!el.matches(".content .item[data-index]")) return false;
+				const storage = component("Storage");
+				if (storage && storage.reqRemoveItem) storage.reqRemoveItem(parseInt(el.getAttribute("data-index"), 10), rowCount(el));
+				return true;
+			},
+			primaryLabel(el) {
+				return el.matches(".content .item[data-index]") ? "Take" : null;
+			},
+			actions: storageActions
+		},
+		{
+			match: /^CartItems$/,
+			primary(el) {
+				if (!el.matches(".content .item[data-index]")) return false;
+				const cart = component("CartItems");
+				const item = cartItem(el);
+				if (!item) return true;
+				if (isOpen$1("Storage")) component("Storage").reqAddItemFromCart(item.index, item.count || 1);
+				else cart.reqRemoveItem(item.index, item.count || 1);
+				return true;
+			},
+			primaryLabel(el) {
+				if (!el.matches(".content .item[data-index]")) return null;
+				return isOpen$1("Storage") ? "Store" : "Take";
+			},
+			actions: cartActions
+		},
+		{
+			match: /^Equipment(V\d+)?$/,
+			exclude: ".item button",
+			primary(el) {
+				if (!el.matches(".item[data-index]")) return false;
+				const equipment = component("Equipment");
+				if (equipment && equipment.onUnEquip) equipment.onUnEquip(parseInt(el.getAttribute("data-index"), 10));
+				return true;
+			},
+			primaryLabel(el) {
+				return el.matches(".item[data-index]") ? "Unequip" : null;
+			},
+			actions(el) {
+				const equipment = component("Equipment");
+				if (!equipment || !equipment.onUnEquip || !el.matches(".item[data-index]")) return [];
+				const index = parseInt(el.getAttribute("data-index"), 10);
+				return [{
+					label: "Unequip",
+					run: () => equipment.onUnEquip(index)
+				}];
+			}
+		},
+		{
+			match: /^SkillList(V\d+)?$/,
+			primary(el) {
+				if (!el.matches(".skill[data-index]")) return false;
+				const list = component("SkillList");
+				if (list && list.useSkillID) list.useSkillID(parseInt(el.getAttribute("data-index"), 10));
+				return true;
+			},
+			primaryLabel(el) {
+				if (!el.matches(".skill[data-index]")) return null;
+				return usableSkill(skillOf(el)) ? "Use" : "";
+			},
+			actions(el, win, ctx) {
+				const list = component("SkillList");
+				if (!list || !el.matches(".skill[data-index]")) return [];
+				const id = parseInt(el.getAttribute("data-index"), 10);
+				const usable = usableSkill(skillOf(el));
+				const out = [];
+				if (usable && list.useSkillID) out.push({
+					label: "Use",
+					run: () => list.useSkillID(id)
+				});
+				if (shown(el.querySelector(".levelup"))) out.push({
+					label: "Level up",
+					run: (live) => {
+						const button = live.querySelector(".levelup");
+						if (shown(button)) JoystickDomEvents_default.press(button);
+					}
+				});
+				if (usable && ctx && ctx.pickSlot) out.push({
+					label: "Gamepad slot…",
+					run: (live) => ctx.pickSlot(live)
+				});
+				return out;
+			},
+			canMove(el) {
+				return el.matches(".skill[data-index]") ? usableSkill(skillOf(el)) : JoystickCarry_default.canPickUp(el);
+			}
+		},
+		{
+			match: /^ShortCut$/,
+			persistent: true,
+			only: ".container[data-index]",
+			primary(el) {
+				const bar = component("ShortCut");
+				if (bar && el.querySelector(".icon")) bar.onShortCut({ cmd: "EXECUTE" + el.getAttribute("data-index") });
+				return true;
+			},
+			primaryLabel(el) {
+				return el.querySelector(".icon") ? "Use" : "";
+			},
+			actions(el) {
+				const bar = component("ShortCut");
+				if (!bar || !el.querySelector(".icon")) return [];
+				const index = parseInt(el.getAttribute("data-index"), 10);
+				return [{
+					label: "Use",
+					run: () => bar.onShortCut({ cmd: "EXECUTE" + index })
+				}, {
+					label: "Clear",
+					run: () => bar.removeAt(index)
+				}];
+			}
+		},
+		{
+			match: /^Quest(V\d+)?$/,
+			items: ".quest-menu-item, .quest-item",
+			tabs: ".quest-menu-item",
+			activeTab: questTab
+		}
+	];
+	DEFAULT = Object.freeze({});
+	JoystickWindowProfiles_default = {
+		forName,
+		inventoryAction
+	};
+}));
+//#endregion
+//#region src/UI/Components/JoystickUI/JoystickFocusScan.js
+function isWindowHost(el) {
+	const root = el && el.shadowRoot;
+	if (!root) return false;
+	for (let i = 0; i < root.children.length; i++) if (root.children[i].classList && root.children[i].classList.contains("ui-component-root")) return true;
+	return false;
+}
+/**
+* Whether a host is in the page and not hidden.
+*/
+function isShown(host) {
+	if (!host || !host.isConnected || host.style.display === "none") return false;
+	const style = getComputedStyle(host);
+	return style.display !== "none" && style.visibility !== "hidden";
+}
+function zIndexOf(host) {
+	const z = parseInt(host.style.zIndex || getComputedStyle(host).zIndex, 10);
+	return isNaN(z) ? 0 : z;
+}
+/**
+* A window: its host, shadow root, name (the component name, the host's id) and profile.
+*
+* @param {HTMLElement} host
+* @return {object}
+*/
+function describe(host) {
+	return {
+		host,
+		root: host.shadowRoot,
+		name: host.id,
+		profile: JoystickWindowProfiles_default.forName(host.id)
+	};
+}
+/**
+* The open windows, topmost first.
+*
+* @return {Array<object>}
+*/
+function listWindows() {
+	if (typeof document === "undefined" || !document.body) return [];
+	const hosts = [];
+	const children = document.body.children;
+	for (let i = 0; i < children.length; i++) {
+		const el = children[i];
+		if (!NOT_WINDOWS.has(el.id) && isWindowHost(el) && isShown(el)) hosts.push(el);
+	}
+	return hosts.map((host, order) => ({
+		host,
+		order,
+		z: zIndexOf(host)
+	})).sort((a, b) => b.z - a.z || b.order - a.order).map((entry) => describe(entry.host));
+}
+/**
+* Whether a window is still open.
+*/
+function isOpen(win) {
+	return !!win && isShown(win.host);
+}
+/**
+* The window an element belongs to: the <body> child whose shadow tree holds it.
+*
+* @param {Element} el
+* @return {?object}
+*/
+function windowOf(el) {
+	let node = el;
+	while (node) {
+		const root = node.getRootNode ? node.getRootNode() : null;
+		if (!root || !root.host) return null;
+		const host = root.host;
+		if (host.parentNode === document.body && isWindowHost(host)) return NOT_WINDOWS.has(host.id) ? null : describe(host);
+		node = host;
+	}
+	return null;
+}
+/**
+* The parent of a node, stepping out of a shadow root to its host.
+*/
+function parentOf(node) {
+	if (node.parentElement) return node.parentElement;
+	const root = node.getRootNode ? node.getRootNode() : null;
+	return root && root.host ? root.host : null;
+}
+function clipsAxis(value) {
+	return value === "hidden" || value === "clip";
+}
+/**
+* Whether an `overflow: hidden` parent (up to and with the window host) cuts
+* the element off entirely. A scrolling parent does not: the element is
+* scrolled into view when focused.
+*
+* @param {Element} el
+* @param {DOMRect} rect the element's rectangle
+* @param {HTMLElement} host the window host, the last parent looked at
+* @param {Map} cache per-scan clip info by element
+* @return {boolean}
+*/
+function isClippedAway(el, rect, host, cache) {
+	let node = parentOf(el);
+	while (node) {
+		let info = cache.get(node);
+		if (!info) {
+			const style = getComputedStyle(node);
+			const x = clipsAxis(style.overflowX) || clipsAxis(style.overflow);
+			const y = clipsAxis(style.overflowY) || clipsAxis(style.overflow);
+			info = {
+				x,
+				y,
+				rect: x || y ? node.getBoundingClientRect() : null
+			};
+			cache.set(node, info);
+		}
+		if (info.y && (rect.bottom <= info.rect.top || rect.top >= info.rect.bottom)) return true;
+		if (info.x && (rect.right <= info.rect.left || rect.left >= info.rect.right)) return true;
+		if (node === host) return false;
+		node = parentOf(node);
+	}
+	return false;
+}
+/**
+* Whether an element can take the focus: shown, enabled, visible, and not clipped away.
+*
+* @param {Element} el
+* @param {HTMLElement} host its window's host
+* @param {Map} [cache] clip info, shared within one scan
+* @return {boolean}
+*/
+function isUsable(el, host, cache) {
+	if (!el || !el.isConnected) return false;
+	if (el.disabled || el.hasAttribute("disabled")) return false;
+	if (el.classList.contains("disabled") && el.matches("button, ui-button, .btn")) return false;
+	const rect = el.getBoundingClientRect();
+	if (!rect.width || !rect.height) return false;
+	const style = getComputedStyle(el);
+	if (style.visibility === "hidden" || style.pointerEvents === "none" || parseFloat(style.opacity) === 0) return false;
+	return !isClippedAway(el, rect, host, cache || /* @__PURE__ */ new Map());
+}
+/**
+* Every element in a shadow root matching a selector, and in the shadow roots nested in it.
+*/
+function collect(root, selector, out) {
+	root.querySelectorAll(selector).forEach((el) => out.push(el));
+	const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+	for (let node = walker.nextNode(); node; node = walker.nextNode()) if (node.shadowRoot) collect(node.shadowRoot, selector, out);
+	return out;
+}
+function area(rect) {
+	return Math.max(0, rect.right - rect.left) * Math.max(0, rect.bottom - rect.top);
+}
+function overlap(a, b) {
+	const w = Math.min(a.right, b.right) - Math.max(a.left, b.left);
+	const h = Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top);
+	return w > 0 && h > 0 ? w * h : 0;
+}
+/**
+* A label stands in for its control only while the control itself is not
+* shown: the CSS tabs of the skill list are labels for hidden radio buttons.
+*/
+function isRedundantLabel(el, root, host, cache) {
+	if (el.tagName !== "LABEL") return false;
+	const id = el.getAttribute("for");
+	const control = id && root.getElementById ? root.getElementById(id) : null;
+	return !!control && isUsable(control, host, cache);
+}
+/**
+* What to take in a window, and what to leave out, by its profile.
+*
+* @param {object} profile
+* @return {{selector: string, exclude: string}}
+*/
+function selectorsOf(profile) {
+	let selector = profile.only || (profile.items ? FOCUSABLE + "," + profile.items : FOCUSABLE);
+	if (profile.dropZones && JoystickCarry_default.isCarrying()) selector += "," + profile.dropZones;
+	return {
+		selector,
+		exclude: profile.exclude ? NEVER + "," + profile.exclude : NEVER
+	};
+}
+/**
+* The focusable elements of a window, in page order.
+*
+* @param {object} win from listWindows() / windowOf()
+* @return {Array<Element>}
+*/
+function focusables(win) {
+	if (!win || !win.root) return [];
+	const { selector, exclude } = selectorsOf(win.profile || {});
+	const cache = /* @__PURE__ */ new Map();
+	const seen = /* @__PURE__ */ new Set();
+	const candidates = [];
+	collect(win.root, selector, []).forEach((el) => {
+		if (seen.has(el)) return;
+		seen.add(el);
+		if (el.matches(exclude) || !isUsable(el, win.host, cache)) return;
+		if (isRedundantLabel(el, el.getRootNode(), win.host, cache)) return;
+		candidates.push(el);
+	});
+	const set = new Set(candidates);
+	const rects = /* @__PURE__ */ new Map();
+	const rectOf = (el) => {
+		if (!rects.has(el)) rects.set(el, el.getBoundingClientRect());
+		return rects.get(el);
+	};
+	const dropped = /* @__PURE__ */ new Set();
+	candidates.forEach((inner) => {
+		for (let node = inner.parentElement; node; node = node.parentElement) {
+			if (!set.has(node) || dropped.has(node)) continue;
+			const shared = overlap(rectOf(node), rectOf(inner));
+			if (shared >= SAME_BOX * area(rectOf(node)) && shared >= SAME_BOX * area(rectOf(inner))) dropped.add(node);
+		}
+	});
+	return dropped.size ? candidates.filter((el) => !dropped.has(el)) : candidates;
+}
+/**
+* Whether an element focused earlier can still keep the focus.
+*/
+function isStillFocusable(el, win) {
+	return !!win && !!el && isUsable(el, win.host);
+}
+/**
+* The focusable element at a point on screen (the virtual cursor), and its
+* window: the element there or the nearest of its parents that is one.
+*
+* @param {number} x
+* @param {number} y
+* @return {?{win: object, el: Element}}
+*/
+function focusableAt(x, y) {
+	if (typeof document === "undefined" || !document.elementFromPoint) return null;
+	const hit = deepElementFromPoint(x, y);
+	const win = hit ? windowOf(hit) : null;
+	if (!win) return null;
+	const { selector, exclude } = selectorsOf(win.profile || {});
+	const cache = /* @__PURE__ */ new Map();
+	let node = hit;
+	while (node && node !== win.host) {
+		if (node.nodeType === 1 && node.matches(selector) && !node.matches(exclude) && isUsable(node, win.host, cache)) return {
+			win,
+			el: node
+		};
+		node = parentOf(node);
+	}
+	return null;
+}
+function signature(el) {
+	const classes = Array.from(el.classList).filter((name) => !STATE_CLASSES.has(name)).sort().join(".");
+	return el.tagName.toLowerCase() + (classes ? "." + classes : "");
+}
+function attributeKey(el) {
+	for (let i = 0; i < KEY_ATTRIBUTES.length; i++) if (el.hasAttribute(KEY_ATTRIBUTES[i])) return KEY_ATTRIBUTES[i] + "=" + el.getAttribute(KEY_ATTRIBUTES[i]);
+	return el.id ? "#" + el.id : null;
+}
+/**
+* A name for an element that survives the window drawing its list again
+* (the inventory redraws all of it when one item changes): its data-index
+* or id, else what it is (tag and classes) and how many like it come first.
+*
+* @param {Element} el
+* @param {Array<Element>} list the window's focusables
+* @return {string}
+*/
+function keyOf(el, list) {
+	const own = attributeKey(el);
+	if (own) return own;
+	const sig = signature(el);
+	const holder = el.parentElement ? el.parentElement.closest(KEY_ATTRIBUTES.map((a) => "[" + a + "]").join(",")) : null;
+	if (holder) return attributeKey(holder) + ">" + sig;
+	let nth = 0;
+	for (let i = 0; i < list.length && list[i] !== el; i++) if (signature(list[i]) === sig) nth++;
+	return sig + "#" + nth;
+}
+/**
+* The element in a window's list with a key.
+*/
+function findByKey(list, key) {
+	if (!key) return null;
+	for (let i = 0; i < list.length; i++) if (keyOf(list[i], list) === key) return list[i];
+	return null;
+}
+/**
+* The first element of the list that matches one of the selectors, the
+* selectors tried in order.
+*
+* @param {Array<Element>} list
+* @param {Array<string>} selectors
+* @return {?Element}
+*/
+function findFirst(list, selectors) {
+	for (let i = 0; i < selectors.length; i++) {
+		const el = list.find((candidate) => candidate.matches(selectors[i]));
+		if (el) return el;
+	}
+	return null;
+}
+function scrollsAxis(value) {
+	return value === "auto" || value === "scroll" || value === "overlay";
+}
+/**
+* Scroll the lists an element sits in so that it can be seen. Only its own
+* window's scrolling parents move, never the page.
+*
+* @param {Element} el
+* @param {HTMLElement} host its window's host
+*/
+function reveal(el, host) {
+	let rect = el.getBoundingClientRect();
+	let node = parentOf(el);
+	while (node && node !== host) {
+		const style = getComputedStyle(node);
+		const y = scrollsAxis(style.overflowY) && node.scrollHeight > node.clientHeight;
+		const x = scrollsAxis(style.overflowX) && node.scrollWidth > node.clientWidth;
+		if (x || y) {
+			const box = node.getBoundingClientRect();
+			const ratioY = box.height ? node.offsetHeight / box.height || 1 : 1;
+			const ratioX = box.width ? node.offsetWidth / box.width || 1 : 1;
+			if (y) {
+				if (rect.top < box.top) node.scrollTop -= (box.top - rect.top) * ratioY;
+				else if (rect.bottom > box.bottom) node.scrollTop += (rect.bottom - box.bottom) * ratioY;
+			}
+			if (x) {
+				if (rect.left < box.left) node.scrollLeft -= (box.left - rect.left) * ratioX;
+				else if (rect.right > box.right) node.scrollLeft += (rect.right - box.right) * ratioX;
+			}
+			rect = el.getBoundingClientRect();
+		}
+		node = parentOf(node);
+	}
+}
+/**
+* The scrolling parent of an element that can still scroll in a direction,
+* if any: NPC text longer than its box.
+*
+* @param {Element} container the box to scroll
+* @param {string} direction 'up' or 'down'
+* @return {boolean} whether it scrolled
+*/
+function scrollBy(container, direction) {
+	if (!container || direction !== "up" && direction !== "down") return false;
+	const max = container.scrollHeight - container.clientHeight;
+	if (max <= 0) return false;
+	const step = Math.max(16, Math.round(container.clientHeight * .6));
+	const before = container.scrollTop;
+	if (direction === "up" && before > 0) container.scrollTop = Math.max(0, before - step);
+	else if (direction === "down" && before < max) container.scrollTop = Math.min(max, before + step);
+	return container.scrollTop !== before;
+}
+/**
+* The rectangle around a list of elements.
+*/
+function boundsOf(list) {
+	let bounds = null;
+	list.forEach((el) => {
+		const r = el.getBoundingClientRect();
+		if (!bounds) bounds = {
+			left: r.left,
+			top: r.top,
+			right: r.right,
+			bottom: r.bottom
+		};
+		else {
+			bounds.left = Math.min(bounds.left, r.left);
+			bounds.top = Math.min(bounds.top, r.top);
+			bounds.right = Math.max(bounds.right, r.right);
+			bounds.bottom = Math.max(bounds.bottom, r.bottom);
+		}
+	});
+	return bounds;
+}
+/**
+* Whether an element is an item, skill or slot, which has info to show.
+*/
+function isItemLike(el) {
+	return !!el && el.matches(".item, .skill, [data-index]") && !!el.querySelector(".icon, img, button");
+}
+/**
+* Where events for an item go: its icon, so that a window listening on the
+* icon (`.skill .icon`, NpcStore's `.icon`) or on the icon button
+* (Equipment's tooltip, `closest('button')`) hears them, and one listening
+* on the item (`closest('.item')`) still does.
+*/
+function eventTarget(el) {
+	if (el && el.matches(".item, .skill, [data-index]")) return el.querySelector(".icon") || el.querySelector("button") || el;
+	return el;
+}
+var FOCUSABLE, NEVER, NOT_WINDOWS, KEY_ATTRIBUTES, STATE_CLASSES, SAME_BOX, JoystickFocusScan_default;
+var init_JoystickFocusScan = __esmMin((() => {
+	init_TouchDrag();
+	init_JoystickWindowProfiles();
+	init_JoystickCarry();
+	FOCUSABLE = [
+		"button",
+		"ui-button",
+		"a[href]",
+		"input:not([type=\"hidden\"])",
+		"select",
+		"textarea",
+		"label[for]",
+		"[contenteditable=\"true\"]",
+		".checkbox",
+		".item-link",
+		".navi-link",
+		"[data-index]"
+	].join(",");
+	NEVER = [
+		".ro-custom-scrollbar",
+		".ro-custom-scrollbar *",
+		".titlebar .base"
+	].join(",");
+	NOT_WINDOWS = /* @__PURE__ */ new Set(["JoystickSelectionUI"]);
+	KEY_ATTRIBUTES = [
+		"data-index",
+		"data-id",
+		"data-group",
+		"data-tab",
+		"data-title",
+		"data-skin",
+		"data-motion"
+	];
+	STATE_CLASSES = /* @__PURE__ */ new Set([
+		"pad-hover",
+		"selected",
+		"select",
+		"active",
+		"hover",
+		"focus",
+		"on",
+		"off"
+	]);
+	SAME_BOX = .9;
+	JoystickFocusScan_default = {
+		FOCUSABLE,
+		listWindows,
+		isOpen,
+		isShown,
+		windowOf,
+		describe,
+		focusables,
+		isUsable,
+		isStillFocusable,
+		focusableAt,
+		keyOf,
+		findByKey,
+		findFirst,
+		reveal,
+		scrollBy,
+		boundsOf,
+		isItemLike,
+		eventTarget
+	};
+}));
+//#endregion
+//#region src/UI/Components/JoystickUI/JoystickSpatialNav.js
+function centerX$1(rect) {
+	return (rect.left + rect.right) / 2;
+}
+function centerY$1(rect) {
+	return (rect.top + rect.bottom) / 2;
+}
+/**
+* Whether dest lies further in the direction than src.
+*
+* @param {object} src focused rectangle
+* @param {object} dest candidate rectangle
+* @param {string} direction 'up', 'down', 'left' or 'right'
+* @return {boolean}
+*/
+function isCandidate(src, dest, direction) {
+	switch (direction) {
+		case "left": return (src.right > dest.right || src.left >= dest.right) && src.left > dest.left;
+		case "right": return (src.left < dest.left || src.right <= dest.left) && src.right < dest.right;
+		case "up": return (src.bottom > dest.bottom || src.top >= dest.bottom) && src.top > dest.top;
+		case "down": return (src.top < dest.top || src.bottom <= dest.top) && src.bottom < dest.bottom;
+	}
+	return false;
+}
+/**
+* Whether two rectangles overlap across the direction: the same row for
+* left / right, the same column for up / down.
+*/
+function inBeam(src, dest, direction) {
+	if (direction === "left" || direction === "right") return dest.bottom > src.top && dest.top < src.bottom;
+	return dest.right > src.left && dest.left < src.right;
+}
+/**
+* Whether dest lies wholly beyond src's edge in the direction.
+*/
+function isBeyond(src, dest, direction) {
+	switch (direction) {
+		case "left": return src.left >= dest.right;
+		case "right": return src.right <= dest.left;
+		case "up": return src.top >= dest.bottom;
+		case "down": return src.bottom <= dest.top;
+	}
+	return false;
+}
+/**
+* Gap between src's edge and dest's near edge, along the direction.
+*/
+function majorDistance(src, dest, direction) {
+	switch (direction) {
+		case "left": return Math.max(0, src.left - dest.right);
+		case "right": return Math.max(0, dest.left - src.right);
+		case "up": return Math.max(0, src.top - dest.bottom);
+		case "down": return Math.max(0, dest.top - src.bottom);
+	}
+	return 0;
+}
+/**
+* Distance from src's edge to dest's far edge, along the direction.
+*/
+function majorDistanceToFarEdge(src, dest, direction) {
+	switch (direction) {
+		case "left": return Math.max(1, src.left - dest.left);
+		case "right": return Math.max(1, dest.right - src.right);
+		case "up": return Math.max(1, src.top - dest.top);
+		case "down": return Math.max(1, dest.bottom - src.bottom);
+	}
+	return 1;
+}
+/**
+* Offset between the centres, across the direction.
+*/
+function minorDistance(src, dest, direction) {
+	if (direction === "left" || direction === "right") return Math.abs(centerY$1(src) - centerY$1(dest));
+	return Math.abs(centerX$1(src) - centerX$1(dest));
+}
+/**
+* Whether a, being in the beam, wins over b on that alone. Sideways, being
+* in the row always wins. Vertically only while b is not wholly closer: a
+* row of buttons right under a list still beats the far end of the list.
+*/
+function beamBeats(src, a, b, direction) {
+	const aIn = inBeam(src, a, direction);
+	if (inBeam(src, b, direction) || !aIn) return false;
+	if (!isBeyond(src, b, direction)) return true;
+	if (direction === "left" || direction === "right") return true;
+	return majorDistance(src, a, direction) < majorDistanceToFarEdge(src, b, direction);
+}
+function weightedDistance(src, dest, direction) {
+	const major = majorDistance(src, dest, direction);
+	const minor = minorDistance(src, dest, direction);
+	return MAJOR_WEIGHT * major * major + minor * minor;
+}
+/**
+* Whether a is a better move than b.
+*/
+function isBetter(src, a, b, direction) {
+	if (!b) return true;
+	if (beamBeats(src, a, b, direction)) return true;
+	if (beamBeats(src, b, a, direction)) return false;
+	return weightedDistance(src, a, direction) < weightedDistance(src, b, direction);
+}
+/**
+* The best candidate in the direction.
+*
+* @param {object} src the focused rectangle
+* @param {Array<object>} entries anything with a `rect`
+* @param {string} direction 'up', 'down', 'left' or 'right'
+* @return {?object} the entry to move to, or null if nothing lies that way
+*/
+function findNext(src, entries, direction) {
+	if (!src || DIRECTIONS$1.indexOf(direction) === -1) return null;
+	let best = null;
+	for (let i = 0; i < entries.length; i++) {
+		const rect = entries[i].rect;
+		if (!rect || !isCandidate(src, rect, direction)) continue;
+		if (isBetter(src, rect, best && best.rect, direction)) best = entries[i];
+	}
+	return best;
+}
+/**
+* Wrap around: the entry furthest the other way, in the beam if there is
+* one. Down from the last button of a menu comes back to the first.
+*
+* @param {object} src the focused rectangle
+* @param {Array<object>} entries anything with a `rect`
+* @param {string} direction the direction pressed
+* @return {?object}
+*/
+function findWrap(src, entries, direction) {
+	if (!src) return null;
+	const vertical = direction === "up" || direction === "down";
+	const sign = direction === "down" || direction === "right" ? 1 : -1;
+	let best = null;
+	let bestEdge = 0;
+	let bestInBeam = false;
+	for (let i = 0; i < entries.length; i++) {
+		const rect = entries[i].rect;
+		if (!rect) continue;
+		const beam = inBeam(src, rect, direction);
+		const edge = sign * (vertical ? centerY$1(rect) : centerX$1(rect));
+		if (!best || beam && !bestInBeam || beam === bestInBeam && edge < bestEdge) {
+			best = entries[i];
+			bestEdge = edge;
+			bestInBeam = beam;
+		}
+	}
+	return best;
+}
+/**
+* Reading order: top to bottom, then left to right. Elements whose tops
+* lie within half the smaller height of each other count as one row.
+*/
+function compareReadingOrder(a, b) {
+	const rowTolerance = Math.min(a.bottom - a.top, b.bottom - b.top) / 2;
+	if (Math.abs(a.top - b.top) > rowTolerance) return a.top - b.top;
+	return a.left - b.left;
+}
+var DIRECTIONS$1, MAJOR_WEIGHT, JoystickSpatialNav_default;
+var init_JoystickSpatialNav = __esmMin((() => {
+	DIRECTIONS$1 = [
+		"up",
+		"down",
+		"left",
+		"right"
+	];
+	MAJOR_WEIGHT = 13;
+	JoystickSpatialNav_default = {
+		DIRECTIONS: DIRECTIONS$1,
+		findNext,
+		findWrap,
+		isCandidate,
+		inBeam,
+		compareReadingOrder
+	};
+}));
+//#endregion
+//#region src/UI/Components/JoystickUI/JoystickFocusOverlay.js
+function getRing() {
+	if (_ring && _ring.parentNode) return _ring;
+	if (typeof document === "undefined" || !document.body) return null;
+	_ring = document.createElement("div");
+	_ring.className = "joystick-focus-ring";
+	Object.assign(_ring.style, {
+		position: "fixed",
+		zIndex: Z_INDEX,
+		pointerEvents: "none",
+		boxSizing: "border-box",
+		border: "2px solid #ffd740",
+		borderRadius: "4px",
+		boxShadow: "0 0 0 1px rgba(0, 0, 0, 0.6), 0 0 6px rgba(255, 215, 64, 0.8)",
+		transition: "left 60ms ease-out, top 60ms ease-out, width 60ms ease-out, height 60ms ease-out",
+		display: "none"
+	});
+	document.body.appendChild(_ring);
+	_ringKey = "";
+	return _ring;
+}
+function getHints() {
+	if (_hints && _hints.parentNode) return _hints;
+	if (typeof document === "undefined" || !document.body) return null;
+	_hints = document.createElement("div");
+	_hints.className = "joystick-focus-hints";
+	Object.assign(_hints.style, {
+		position: "fixed",
+		left: "50%",
+		transform: "translateX(-50%)",
+		zIndex: Z_INDEX,
+		pointerEvents: "none",
+		background: "rgba(0, 0, 0, 0.75)",
+		borderRadius: "6px",
+		padding: "3px 10px",
+		fontFamily: "sans-serif",
+		fontSize: "12px",
+		color: "#ddd",
+		whiteSpace: "nowrap",
+		display: "none"
+	});
+	document.body.appendChild(_hints);
+	_hintsKey = "";
+	return _hints;
+}
+/**
+* Put the ring around a rectangle on screen.
+*
+* @param {{left: number, top: number, width: number, height: number}} rect
+* @param {string} [mode] 'focus' (default) or 'carry'
+*/
+function showRing(rect, mode = "focus") {
+	const ring = getRing();
+	if (!ring || !rect) return;
+	const look = RING_STYLES[mode] || RING_STYLES.focus;
+	const left = Math.round(rect.left - RING_PAD);
+	const top = Math.round(rect.top - RING_PAD);
+	const width = Math.round(rect.width + 4);
+	const height = Math.round(rect.height + 4);
+	const key = left + "," + top + "," + width + "," + height + "," + mode;
+	if (key === _ringKey && ring.style.display !== "none") return;
+	_ringKey = key;
+	ring.style.left = left + "px";
+	ring.style.top = top + "px";
+	ring.style.width = width + "px";
+	ring.style.height = height + "px";
+	ring.style.borderColor = look.borderColor;
+	ring.style.boxShadow = look.boxShadow;
+	ring.dataset.mode = mode;
+	ring.style.display = "block";
+}
+function hideRing() {
+	if (_ring) _ring.style.display = "none";
+}
+/**
+* The bar's distance from the bottom: above the gamepad HUD when it shows.
+*/
+function hintsBottom() {
+	const hud = document.getElementById("JoystickUI");
+	if (hud && hud.style.display !== "none") {
+		const rect = hud.getBoundingClientRect();
+		if (rect.height > 0) return Math.max(8, window.innerHeight - rect.top + HINT_GAP);
+	}
+	return 8;
+}
+/**
+* Show the hint bar.
+*
+* @param {Array<Array>} entries [button, text]: a logical button (worded with the current
+*   mapping), a list of them, or a string (D-pad arrows); empty texts are left out
+*/
+function showHints(entries) {
+	const bar = getHints();
+	if (!bar) return;
+	const parts = entries.filter((entry) => entry && entry[1]).map(([keys, text]) => {
+		return [(Array.isArray(keys) ? keys : [keys]).map((key) => typeof key === "number" ? JoystickButtonMap_default.nameOf(key) : key).join("/"), text];
+	});
+	const key = JSON.stringify(parts);
+	bar.style.bottom = hintsBottom() + "px";
+	if (key === _hintsKey && bar.style.display !== "none") return;
+	_hintsKey = key;
+	bar.textContent = "";
+	parts.forEach(([names, text], i) => {
+		if (i) bar.appendChild(document.createTextNode("  ·  "));
+		const button = document.createElement("b");
+		button.style.color = "#ffd740";
+		button.textContent = names;
+		bar.appendChild(button);
+		bar.appendChild(document.createTextNode(" " + text));
+	});
+	bar.style.display = parts.length ? "block" : "none";
+}
+function hideHints() {
+	if (_hints) _hints.style.display = "none";
+	_hintsKey = "";
+}
+function hide$2() {
+	hideRing();
+	hideHints();
+}
+function dispose$2() {
+	[_ring, _hints].forEach((el) => {
+		if (el && el.parentNode) el.parentNode.removeChild(el);
+	});
+	_ring = null;
+	_hints = null;
+	_ringKey = "";
+	_hintsKey = "";
+}
+var Z_INDEX, RING_PAD, HINT_GAP, RING_STYLES, _ring, _hints, _ringKey, _hintsKey, JoystickFocusOverlay_default;
+var init_JoystickFocusOverlay = __esmMin((() => {
+	init_JoystickButtonMap();
+	Z_INDEX = 1e4;
+	RING_PAD = 2;
+	HINT_GAP = 6;
+	RING_STYLES = {
+		focus: {
+			borderColor: "#ffd740",
+			boxShadow: "0 0 0 1px rgba(0, 0, 0, 0.6), 0 0 6px rgba(255, 215, 64, 0.8)"
+		},
+		carry: {
+			borderColor: "#4fc3f7",
+			boxShadow: "0 0 0 1px rgba(0, 0, 0, 0.6), 0 0 8px rgba(79, 195, 247, 0.9)"
+		}
+	};
+	_ring = null;
+	_hints = null;
+	_ringKey = "";
+	_hintsKey = "";
+	JoystickFocusOverlay_default = {
+		showRing,
+		hideRing,
+		showHints,
+		hideHints,
+		hide: hide$2,
+		dispose: dispose$2,
+		/**
+		* How far from the bottom of the screen a bar sits to clear the gamepad
+		* HUD (the hint bar, the on-screen keyboard).
+		*/
+		bottomAboveHud: hintsBottom
+	};
+}));
+//#endregion
+//#region src/UI/Components/JoystickUI/JoystickStickFilter.js
+/**
+* Subtract the rest position, stretching each side back to the full range.
+*
+* @param {number} value raw axis value, -1..1
+* @param {number} center measured rest position
+* @return {number}
+*/
+function recenter(value, center) {
+	if (!center) return value;
+	const v = value - center;
+	const range = v > 0 ? 1 - center : 1 + center;
+	return Math.max(-1, Math.min(1, v / range));
+}
+/**
+* Treat values within the threshold as centre; rescale the rest to 0..1.
+*
+* @param {number} value axis value, -1..1
+* @param {number} threshold 0..1
+* @return {number}
+*/
+function applyThreshold(value, threshold) {
+	if (!threshold || threshold <= 0) return value;
+	const magnitude = Math.abs(value);
+	if (magnitude <= threshold || threshold >= 1) return 0;
+	return Math.sign(value) * (magnitude - threshold) / (1 - threshold);
+}
+/**
+* The stored rest positions, or null when not calibrated.
+*
+* @return {Array<number>|null}
+*/
+function getCenter() {
+	const center = Controls_default.joyStickCenter;
+	if (!Array.isArray(center) || center.length !== AXIS_COUNT || !center.every(Number.isFinite)) return null;
+	return center;
+}
+/**
+* Cleaned copy of a gamepad's axes. Axes past the two sticks pass through.
+*
+* @param {ArrayLike<number>} axes Gamepad.axes
+* @return {Array<number>}
+*/
+function filterAxes(axes) {
+	const center = getCenter();
+	const out = Array.from(axes);
+	for (let i = 0; i < Math.min(AXIS_COUNT, out.length); i++) {
+		const value = recenter(out[i], center ? center[i] : 0);
+		out[i] = applyThreshold(value, Controls_default[DRIFT_KEYS[i]]);
+	}
+	return out;
+}
+/**
+* Average rest position per axis from calibration samples, or null if a
+* stick was touched while they were taken.
+*
+* @param {Array<Array<number>>} samples raw axes, one array per read
+* @return {Array<number>|null}
+*/
+function computeCenter(samples) {
+	if (!samples.length) return null;
+	const center = [];
+	for (let i = 0; i < AXIS_COUNT; i++) {
+		let sum = 0;
+		for (const sample of samples) {
+			const value = sample[i] || 0;
+			if (Math.abs(value) > CALIBRATE_MAX_OFFSET) return null;
+			sum += value;
+		}
+		center.push(sum / samples.length);
+	}
+	return center;
+}
+function getGamepad$1() {
+	const gamepads = navigator.getGamepads ? navigator.getGamepads() : [];
+	for (let i = 0; i < gamepads.length; i++) if (gamepads[i]) return gamepads[i];
+	return null;
+}
+/**
+* Stop a running calibration without saving.
+*/
+function cancelCalibration() {
+	if (_calibration) {
+		clearInterval(_calibration);
+		_calibration = null;
+	}
+}
+/**
+* Read both sticks for a second while the player leaves them alone, and
+* store their rest positions.
+*
+* @param {function(string)} done called with 'ok', 'moved' (a stick was
+*   touched, nothing saved) or 'nopad'
+*/
+function calibrate(done) {
+	cancelCalibration();
+	if (!getGamepad$1()) {
+		done("nopad");
+		return;
+	}
+	const samples = [];
+	const startedAt = Date.now();
+	_calibration = setInterval(function() {
+		const gp = getGamepad$1();
+		if (!gp) {
+			cancelCalibration();
+			done("nopad");
+			return;
+		}
+		samples.push(Array.from(gp.axes).slice(0, AXIS_COUNT));
+		if (Date.now() - startedAt < CALIBRATE_DURATION_MS) return;
+		cancelCalibration();
+		const center = computeCenter(samples);
+		if (!center) {
+			done("moved");
+			return;
+		}
+		Controls_default.joyStickCenter = center;
+		Controls_default.save();
+		done("ok");
+	}, CALIBRATE_INTERVAL_MS);
+}
+/**
+* Forget the calibration.
+*/
+function resetCalibration() {
+	cancelCalibration();
+	Controls_default.joyStickCenter = null;
+	Controls_default.save();
+}
+var DRIFT_KEYS, AXIS_COUNT, CALIBRATE_INTERVAL_MS, CALIBRATE_DURATION_MS, CALIBRATE_MAX_OFFSET, _calibration, JoystickStickFilter_default;
+var init_JoystickStickFilter = __esmMin((() => {
+	init_Controls();
+	DRIFT_KEYS = [
+		"joyDriftLX",
+		"joyDriftLY",
+		"joyDriftRX",
+		"joyDriftRY"
+	];
+	AXIS_COUNT = DRIFT_KEYS.length;
+	CALIBRATE_INTERVAL_MS = 50;
+	CALIBRATE_DURATION_MS = 1e3;
+	CALIBRATE_MAX_OFFSET = .5;
+	_calibration = null;
+	JoystickStickFilter_default = {
+		DRIFT_KEYS,
+		recenter,
+		applyThreshold,
+		filterAxes,
+		computeCenter,
+		getCenter,
+		calibrate,
+		cancelCalibration,
+		resetCalibration
+	};
+}));
+//#endregion
+//#region src/UI/Components/JoystickUI/JoystickFocusTabs.js
+/**
+* Whether an element is one of a window's tabs.
+*
+* @param {Element} el
+* @param {object} [win] its window: its profile may name the tabs
+* @return {boolean}
+*/
+function isTab(el, win) {
+	if (!el) return false;
+	const profile = win && win.profile || {};
+	if (profile.tabs) return el.matches(profile.tabs);
+	if (!el.matches(CONTROL) || el.querySelector(INNER)) return false;
+	if (el.matches(TAB)) return true;
+	const parent = el.parentElement;
+	return !!parent && (parent.matches(STRIP) || parent.matches(".tab"));
+}
+/**
+* The strip a tab belongs to: the nearest strip around it, else what holds it.
+*/
+function stripOf(el) {
+	const parent = el.parentElement;
+	if (!parent) return null;
+	return parent.closest(STRIP) || (parent.matches(".tab") ? parent.parentElement : parent);
+}
+/**
+* The tabs that can be switched to now: shown, in page order, from the
+* focused tab's strip, else from the first strip with two tabs or more.
+*
+* @param {object} win from JoystickFocusScan
+* @param {?Element} focused the focused element
+* @return {Array<Element>} empty: the window has no tabs
+*/
+function tabsOf(win, focused) {
+	if (!win || !win.root) return [];
+	const profile = win.profile || {};
+	const cache = /* @__PURE__ */ new Map();
+	const shown = Array.from(win.root.querySelectorAll(profile.tabs || CONTROL)).filter((el) => isTab(el, win) && JoystickFocusScan_default.isUsable(el, win.host, cache));
+	if (profile.tabs) return shown.length > 1 ? shown : [];
+	const strips = /* @__PURE__ */ new Map();
+	shown.forEach((el) => {
+		const strip = stripOf(el);
+		if (!strips.has(strip)) strips.set(strip, []);
+		strips.get(strip).push(el);
+	});
+	if (focused && shown.indexOf(focused) !== -1) {
+		const own = strips.get(stripOf(focused));
+		if (own.length > 1) return own;
+	}
+	for (const list of strips.values()) if (list.length > 1) return list;
+	return [];
+}
+function isDrawnOpen(el) {
+	if (el.matches(OPEN)) return true;
+	if (el.tagName === "LABEL") {
+		const id = el.getAttribute("for");
+		const root = el.getRootNode();
+		const control = id && root.getElementById ? root.getElementById(id) : null;
+		return !!control && !!control.checked;
+	}
+	return false;
+}
+/**
+* The index of the open tab, -1 when nothing says which.
+*
+* @param {object} win
+* @param {Array<Element>} tabs from tabsOf()
+* @return {number}
+*/
+function activeIndex(win, tabs) {
+	const profile = win.profile || {};
+	if (profile.activeTab) {
+		const index = profile.activeTab(tabs, win);
+		if (index >= 0 && index < tabs.length) return index;
+	}
+	const drawn = tabs.findIndex(isDrawnOpen);
+	if (drawn !== -1) return drawn;
+	const last = _last.get(win.host);
+	return last !== void 0 && last < tabs.length ? last : -1;
+}
+/**
+* The tab one step away from the open one, past those that will not open;
+* the first or the last when none is known to be open. It wraps around.
+*
+* @param {object} win
+* @param {?Element} focused
+* @param {number} delta 1: next, -1: previous
+* @return {?{tab: Element, index: number}} null: no tabs, or none other to go to
+*/
+function step$1(win, focused, delta) {
+	const tabs = tabsOf(win, focused);
+	if (!tabs.length) return null;
+	const open = activeIndex(win, tabs);
+	let index = open;
+	for (let i = 0; i < tabs.length; i++) {
+		if (index === -1) index = delta > 0 ? 0 : tabs.length - 1;
+		else index = (index + delta + tabs.length) % tabs.length;
+		if (index === open) return null;
+		if (!tabs[index].matches(REFUSED)) return {
+			tab: tabs[index],
+			index
+		};
+	}
+	return null;
+}
+/**
+* The open tab, if it is known.
+*
+* @param {object} win
+* @return {?Element}
+*/
+function activeTab(win) {
+	const tabs = tabsOf(win, null);
+	const index = tabs.length ? activeIndex(win, tabs) : -1;
+	return index === -1 ? null : tabs[index];
+}
+/**
+* Remember the tab switched to, for windows that do not draw which is open.
+*
+* @param {object} win
+* @param {number} index
+*/
+function remember(win, index) {
+	if (win && win.host) _last.set(win.host, index);
+}
+var STRIP, TAB, CONTROL, INNER, OPEN, REFUSED, _last, JoystickFocusTabs_default;
+var init_JoystickFocusTabs = __esmMin((() => {
+	init_JoystickFocusScan();
+	STRIP = [
+		".tabs",
+		".tabs-mini",
+		".tab-manager",
+		".action_tabs",
+		"#panel-menu",
+		"[role=\"tablist\"]"
+	].join(",");
+	TAB = [
+		".tab",
+		".tab-button",
+		".tab-label",
+		".tab-label-mini",
+		"[role=\"tab\"]"
+	].join(",");
+	CONTROL = [
+		"button",
+		"ui-button",
+		"a[href]",
+		"label[for]",
+		TAB
+	].join(",");
+	INNER = "button, ui-button, a[href], label[for]";
+	OPEN = [
+		".selected",
+		".active",
+		".selectedtab",
+		"[aria-selected=\"true\"]"
+	].join(",");
+	REFUSED = ".denied, .disabled, [disabled]";
+	_last = /* @__PURE__ */ new WeakMap();
+	JoystickFocusTabs_default = {
+		isTab,
+		tabsOf,
+		activeIndex,
+		activeTab,
+		step: step$1,
+		remember
+	};
+}));
+//#endregion
+//#region src/UI/Components/JoystickUI/JoystickActionMenu.js
+/**
+* Whether the element can be picked up: what its profile says, else
+* whether it is draggable.
+*
+* @param {Element} el
+* @param {object} win
+* @return {boolean}
+*/
+function canMove(el, win) {
+	if (!el) return false;
+	const profile = win && win.profile || {};
+	if (profile.canMove) return !!profile.canMove(el, win);
+	return JoystickCarry_default.canPickUp(el);
+}
+/**
+* The entries for an element.
+*
+* @param {Element} el
+* @param {object} win
+* @param {object} ctx what entries may call: pickUp(el), info(el), pickSlot(el) (null without a slot picker)
+* @return {Array<{label: string, run: function(Element)}>}
+*/
+function entriesFor(el, win, ctx) {
+	if (!el || !win) return [];
+	const profile = win.profile || {};
+	const out = profile.actions ? (profile.actions(el, win, ctx) || []).filter(Boolean) : [];
+	if (canMove(el, win)) out.push({
+		label: "Move…",
+		run: (live) => ctx.pickUp(live)
+	});
+	if (JoystickFocusScan_default.isItemLike(el)) out.push({
+		label: "Info",
+		run: (live) => ctx.info(live)
+	});
+	return out;
+}
+function contextMenu() {
+	try {
+		return UIManager.getComponent("ContextMenu");
+	} catch {
+		return null;
+	}
+}
+/**
+* Put the menu beside a rectangle, on screen.
+*/
+function placeBeside(ui, rect) {
+	const root = ui.getRoot ? ui.getRoot() : null;
+	const box = root ? root.querySelector(".menu") : null;
+	if (!box || !rect) return;
+	const width = box.offsetWidth;
+	const height = box.offsetHeight;
+	let x = rect.right + GAP;
+	if (x + width > window.innerWidth) x = Math.max(0, rect.left - width - GAP);
+	const y = Math.max(0, Math.min(rect.top, window.innerHeight - height));
+	box.style.left = Math.round(x) + "px";
+	box.style.top = Math.round(y) + "px";
+}
+/**
+* Show entries as a menu beside the element they are for. An entry runs
+* on the element as it is then: resolve() finds it again if its window
+* drew it anew meanwhile.
+*
+* @param {Array<{label: string, run: function(Element)}>} entries
+* @param {DOMRect} rect the element's rectangle
+* @param {function(): Element} resolve
+* @return {?object} the ContextMenu component; null when there is nothing to show
+*/
+function open$1(entries, rect, resolve) {
+	const ui = contextMenu();
+	if (!ui || !entries.length) return null;
+	ui.remove();
+	ui.append();
+	entries.forEach((entry) => ui.addElement(entry.label, () => {
+		try {
+			entry.run(resolve());
+		} catch (error) {
+			console.error("[JoystickActionMenu] " + entry.label + " failed", error);
+		}
+	}));
+	placeBeside(ui, rect);
+	return ui;
+}
+var GAP, JoystickActionMenu_default;
+var init_JoystickActionMenu = __esmMin((() => {
+	init_UIManager();
+	init_JoystickFocusScan();
+	init_JoystickCarry();
+	GAP = 4;
+	JoystickActionMenu_default = {
+		canMove,
+		entriesFor,
+		open: open$1
+	};
+}));
+//#endregion
+//#region src/UI/Components/JoystickUI/JoystickValueInput.js
+function isSlider(el) {
+	return !!el && el.matches(SLIDER);
+}
+/**
+* Whether the D-pad's left and right change this element's value.
+*
+* @param {?Element} el
+* @return {boolean}
+*/
+function handles(el) {
+	return !!el && !el.disabled && el.matches(SLIDER + ", select");
+}
+function fire(el, type) {
+	el.dispatchEvent(new Event(type, { bubbles: true }));
+}
+function decimals(value) {
+	const text = String(value);
+	const dot = text.indexOf(".");
+	return dot === -1 ? 0 : text.length - dot - 1;
+}
+/**
+* Move a slider one step left or right, within its range and on its grid.
+*
+* @return {boolean} whether the value changed
+*/
+function stepSlider(el, sign) {
+	const min = el.min === "" ? 0 : parseFloat(el.min);
+	const max = el.max === "" ? 100 : parseFloat(el.max);
+	if (!(max > min)) return false;
+	let grid = parseFloat(el.step);
+	if (!(grid > 0)) grid = (max - min) / 100;
+	const stride = Math.max(grid, Math.round((max - min) / STEPS / grid) * grid);
+	const current = parseFloat(el.value);
+	const from = isNaN(current) ? min : current;
+	let next = min + Math.round((from + sign * stride - min) / grid) * grid;
+	next = Math.min(max, Math.max(min, next));
+	next = Number(next.toFixed(Math.max(decimals(grid), decimals(min))));
+	if (next === from) return false;
+	el.value = String(next);
+	fire(el, "input");
+	clearTimeout(_pending$2.get(el));
+	_pending$2.set(el, setTimeout(() => {
+		_pending$2.delete(el);
+		fire(el, "change");
+	}, CHANGE_AFTER_MS));
+	return true;
+}
+/**
+* Choose the previous or next choice of a list, past those that are off.
+* It stops at the ends.
+*
+* @return {boolean} whether the choice changed
+*/
+function stepSelect(el, sign) {
+	const options = el.options;
+	for (let i = el.selectedIndex + sign; i >= 0 && i < options.length; i += sign) if (!options[i].disabled) {
+		el.selectedIndex = i;
+		fire(el, "input");
+		fire(el, "change");
+		return true;
+	}
+	return false;
+}
+/**
+* A D-pad press on a value control: left and right change the value.
+*
+* @param {Element} el the focused element
+* @param {string} direction 'up', 'down', 'left' or 'right'
+* @return {boolean} true when the press was the control's: the focus stays
+*/
+function step(el, direction) {
+	if (!handles(el) || direction !== "left" && direction !== "right") return false;
+	const sign = direction === "right" ? 1 : -1;
+	if (isSlider(el)) stepSlider(el, sign);
+	else stepSelect(el, sign);
+	return true;
+}
+/**
+* Send now a slider's change that waits for its steps to stop (menus end).
+*/
+function flush() {
+	_pending$2.forEach((timer, el) => {
+		clearTimeout(timer);
+		fire(el, "change");
+	});
+	_pending$2.clear();
+}
+/**
+* Hints for the hint bar.
+*
+* @param {?Element} el the focused element
+* @return {Array<Array>}
+*/
+function hints$1(el) {
+	return handles(el) ? [["◀▶", "Change"]] : [];
+}
+var STEPS, CHANGE_AFTER_MS, SLIDER, _pending$2, JoystickValueInput_default;
+var init_JoystickValueInput = __esmMin((() => {
+	STEPS = 20;
+	CHANGE_AFTER_MS = 250;
+	SLIDER = "input[type=\"range\"]";
+	_pending$2 = /* @__PURE__ */ new Map();
+	JoystickValueInput_default = {
+		handles,
+		isSlider,
+		step,
+		flush,
+		hints: hints$1
+	};
+}));
+//#endregion
+//#region src/UI/Components/JoystickUI/JoystickKeyboard.js
+function prefs() {
+	if (!_prefs) {
+		_prefs = Preferences.get("JoystickKeyboard", {
+			phrases: DEFAULT_PHRASES.slice(),
+			mode: "grid"
+		}, 1);
+		if (!Array.isArray(_prefs.phrases)) _prefs.phrases = DEFAULT_PHRASES.slice();
+		_prefs.phrases = cleanPhrases(_prefs.phrases);
+		if (_prefs.mode !== "wheel") _prefs.mode = "grid";
+	}
+	return _prefs;
+}
+function cleanPhrases(list) {
+	return list.filter((phrase) => typeof phrase === "string" && phrase.length > 0).map((phrase) => phrase.slice(0, PHRASE_LENGTH_MAX)).slice(0, PHRASES_MAX);
+}
+function phrases() {
+	return prefs().phrases;
+}
+function storePhrases(list) {
+	const stored = prefs();
+	stored.phrases = cleanPhrases(list);
+	stored.save();
+}
+function mode() {
+	return prefs().mode;
+}
+function toggleMode() {
+	const stored = prefs();
+	stored.mode = stored.mode === "wheel" ? "grid" : "wheel";
+	stored.save();
+	_petal = null;
+	render$7();
+}
+/**
+* The element with the keyboard focus, through shadow roots.
+*/
+function deepActive() {
+	let el = typeof document !== "undefined" ? document.activeElement : null;
+	while (el && el.shadowRoot && el.shadowRoot.activeElement) el = el.shadowRoot.activeElement;
+	return el;
+}
+/**
+* Whether an element takes typed text.
+*
+* @param {?Element} el
+* @return {boolean}
+*/
+function isTextField(el) {
+	if (!el || el.nodeType !== 1 || el.disabled || el.readOnly) return false;
+	if (el.matches(TEXT_FIELD)) return true;
+	const editable = el.getAttribute("contenteditable");
+	return el.isContentEditable === true || editable === "" || editable === "true";
+}
+/**
+* The longest text the field takes (the chat sets maxLength on its element), 0: no limit.
+*/
+function maxLength() {
+	const max = _field ? Number(_field.maxLength) : 0;
+	return max > 0 ? max : 0;
+}
+/**
+* An editable element: type into a text node of its own, after what is
+* there. When there is only text, that text is the node's, and can be edited.
+*/
+function attachNode() {
+	if (Array.from(_field.childNodes).some((node) => node.nodeType === 1 && node.tagName !== "BR")) {
+		_prefix = _field.textContent;
+		_node = document.createTextNode("");
+	} else {
+		_prefix = "";
+		_node = document.createTextNode(_field.textContent);
+		_field.textContent = "";
+	}
+	_field.appendChild(_node);
+	_text = _node.data;
+	_caret = _text.length;
+}
+function placeCaret() {
+	if (_kind !== "value") return;
+	try {
+		_field.setSelectionRange(_caret, _caret);
+	} catch {}
+}
+/**
+* Put the text in the field, as typing would.
+*/
+function write() {
+	if (!_field) return;
+	if (_kind === "value") {
+		_field.value = _text;
+		placeCaret();
+	} else {
+		if (_node.parentNode !== _field) _field.appendChild(_node);
+		_node.data = _text;
+	}
+	_field.dispatchEvent(new Event("input", {
+		bubbles: true,
+		composed: true
+	}));
+	render$7();
+}
+/**
+* The player typed on a real keyboard as well: take the field's text as it is.
+*/
+function onFieldInput(event) {
+	if (!event.isTrusted || !_open$1) return;
+	if (_kind === "value") {
+		_text = _field.value;
+		_caret = typeof _field.selectionStart === "number" ? _field.selectionStart : _text.length;
+	} else if (_node && _node.parentNode === _field) {
+		_text = _node.data;
+		_caret = Math.min(_caret, _text.length);
+	} else attachNode();
+	render$7();
+}
+function insert(str) {
+	let add = _numeric ? str.replace(/[^0-9]/g, "") : str;
+	if (!add) return;
+	const max = maxLength();
+	if (max) {
+		const room = max - (_prefix.length + _text.length);
+		if (room <= 0) return;
+		add = add.slice(0, room);
+	}
+	_text = _text.slice(0, _caret) + add + _text.slice(_caret);
+	_caret += add.length;
+	write();
+}
+function backspace() {
+	if (_caret <= 0) return;
+	_text = _text.slice(0, _caret - 1) + _text.slice(_caret);
+	_caret--;
+	write();
+}
+function moveCaret(delta) {
+	const caret = Math.max(0, Math.min(_text.length, _caret + delta));
+	if (caret === _caret) return;
+	_caret = caret;
+	placeCaret();
+	render$7();
+}
+function isLetter(c) {
+	return c.toLocaleUpperCase() !== c.toLocaleLowerCase();
+}
+function shifted(c) {
+	if (!_shift || !isLetter(c) || c === "ß") return c;
+	return c.toLocaleUpperCase();
+}
+function typeChar(c) {
+	insert(shifted(c));
+	if (_shift === 1 && isLetter(c)) {
+		_shift = 0;
+		render$7();
+	}
+}
+function cycleShift() {
+	_shift = (_shift + 1) % 3;
+	render$7();
+}
+/**
+* Let go of the field: without the keyboard focus, the next Menu press
+* opens the chat (and the keyboard) again instead of sending.
+*/
+function release(field) {
+	if (deepActive() !== field) return;
+	field.dataset.skipRestoreFocus = "1";
+	field.blur();
+	delete field.dataset.skipRestoreFocus;
+}
+/**
+* Enter on the field, as a keyboard's: the chat sends, a box takes its answer.
+*/
+function pressEnter(field) {
+	field.dispatchEvent(new KeyboardEvent("keydown", {
+		key: "Enter",
+		code: "Enter",
+		keyCode: 13,
+		which: 13,
+		bubbles: true,
+		cancelable: true,
+		composed: true
+	}));
+}
+function isGerman() {
+	const language = typeof navigator !== "undefined" && navigator.language || "";
+	return /^de\b/i.test(language);
+}
+function charRows(page) {
+	if (page === "signs") return [
+		"1234567890",
+		"!'\"#$%&*()",
+		"-_=+/\\:;<>",
+		"[]{}^~|,.?"
+	];
+	if (page === "accents") return [
+		"äöüßéèêëàá",
+		"âçñóòôúùûí",
+		"ìîïœæøå¿¡€"
+	];
+	return isGerman() ? [
+		"1234567890",
+		"qwertzuiop",
+		"asdfghjkl@",
+		"yxcvbnm,.?"
+	] : [
+		"1234567890",
+		"qwertyuiop",
+		"asdfghjkl@",
+		"zxcvbnm,.?"
+	];
+}
+function nextPage() {
+	const page = _page$1 === "phrases" ? _lastPage : _page$1;
+	return PAGE_ORDER[(PAGE_ORDER.indexOf(page) + 1) % PAGE_ORDER.length];
+}
+function onWheel() {
+	return mode() === "wheel" && _page$1 !== "phrases";
+}
+/**
+* The keys of the grid (or the phrase list) row by row; every row is
+* ROW_UNITS keys wide.
+*/
+function currentRows() {
+	if (_page$1 === "phrases") {
+		const rows = phrases().map((text, index) => [{
+			action: "phrase",
+			index,
+			label: text,
+			width: 8.5
+		}, {
+			action: "delete",
+			index,
+			label: "✕",
+			width: 1.5
+		}]);
+		rows.push(_password ? [{
+			action: "letters",
+			label: PAGE_LABEL[_lastPage],
+			width: 5
+		}, {
+			action: "done",
+			label: "Done",
+			width: 5
+		}] : [
+			{
+				action: "letters",
+				label: PAGE_LABEL[_lastPage],
+				width: 3
+			},
+			{
+				action: "save",
+				label: "Save text",
+				width: 4
+			},
+			{
+				action: "done",
+				label: "Done",
+				width: 3
+			}
+		]);
+		return rows;
+	}
+	const rows = charRows(_page$1).map((chars) => Array.from(chars).map((value) => ({
+		action: "char",
+		value,
+		label: value,
+		width: 1
+	})));
+	rows.push([
+		{
+			action: "shift",
+			label: "⇧",
+			width: 1.5
+		},
+		{
+			action: "page",
+			label: PAGE_LABEL[nextPage()],
+			width: 1.5
+		},
+		{
+			action: "phrases",
+			label: "★",
+			width: 1.5
+		},
+		{
+			action: "space",
+			label: "Space",
+			width: 2.5
+		},
+		{
+			action: "backspace",
+			label: "⌫",
+			width: 1.5
+		},
+		{
+			action: "done",
+			label: "Done",
+			width: 1.5
+		}
+	]);
+	return rows;
+}
+function currentKey() {
+	const rows = currentRows();
+	const row = rows[Math.min(_row, rows.length - 1)];
+	return row[Math.min(_col, row.length - 1)];
+}
+function centerOf(row, col) {
+	let x = 0;
+	for (let i = 0; i < col; i++) x += row[i].width;
+	return x + row[col].width / 2;
+}
+/**
+* The key of a row nearest to a point along it.
+*/
+function nearest(row, x) {
+	let best = 0;
+	for (let i = 1; i < row.length; i++) if (Math.abs(centerOf(row, i) - x) < Math.abs(centerOf(row, best) - x)) best = i;
+	return best;
+}
+/**
+* The next key that way, wrapping around.
+*/
+function moveFocus(direction) {
+	const rows = currentRows();
+	_row = Math.min(_row, rows.length - 1);
+	const row = rows[_row];
+	_col = Math.min(_col, row.length - 1);
+	if (direction === "left" || direction === "right") _col = (_col + (direction === "right" ? 1 : -1) + row.length) % row.length;
+	else {
+		const x = centerOf(row, _col);
+		_row = (_row + (direction === "down" ? 1 : -1) + rows.length) % rows.length;
+		_col = nearest(rows[_row], x);
+	}
+	render$7();
+}
+function setPage(page) {
+	if (page === _page$1) return;
+	const rows = currentRows();
+	const row = rows[Math.min(_row, rows.length - 1)];
+	const x = centerOf(row, Math.min(_col, row.length - 1));
+	if (page === "phrases") {
+		_lastPage = _page$1;
+		_page$1 = page;
+		_row = 0;
+		_col = 0;
+	} else {
+		_page$1 = page;
+		const next = currentRows();
+		_row = Math.min(_row, next.length - 1);
+		_col = nearest(next[_row], x);
+	}
+	render$7();
+}
+function usePhrase(index) {
+	const phrase = phrases()[index];
+	if (phrase === void 0) return;
+	setPage(_lastPage);
+	insert(phrase);
+	if (mode() === "grid") {
+		const rows = currentRows();
+		_row = rows.length - 1;
+		_col = rows[_row].findIndex((key) => key.action === "done");
+		render$7();
+	}
+}
+function deletePhrase(index) {
+	const list = phrases().slice();
+	list.splice(index, 1);
+	storePhrases(list);
+	const rows = currentRows();
+	_row = Math.min(_row, rows.length - 1);
+	_col = Math.min(_col, rows[_row].length - 1);
+	render$7();
+}
+/**
+* Keep the typed text as a phrase, first in the list.
+*/
+function saveText() {
+	if (_password || !_text.trim()) return;
+	storePhrases([_text].concat(phrases().filter((phrase) => phrase !== _text)));
+	render$7();
+}
+function activate$1(key) {
+	switch (key.action) {
+		case "char":
+			typeChar(key.value);
+			break;
+		case "shift":
+			cycleShift();
+			break;
+		case "page":
+			setPage(nextPage());
+			break;
+		case "phrases":
+			setPage("phrases");
+			break;
+		case "letters":
+			setPage(_lastPage);
+			break;
+		case "space":
+			insert(" ");
+			break;
+		case "backspace":
+			backspace();
+			break;
+		case "done":
+			done();
+			break;
+		case "phrase":
+			usePhrase(key.index);
+			break;
+		case "delete":
+			deletePhrase(key.index);
+			break;
+		case "save": saveText();
+	}
+}
+/**
+* Keys pressed with the mouse or a touch screen. The press never takes the
+* focus from the field.
+*/
+function onPointerDown(event) {
+	event.preventDefault();
+	if (!_open$1 || !event.target.closest) return;
+	const key = event.target.closest(".jk-key");
+	if (key) {
+		_row = Number(key.dataset.row);
+		_col = Number(key.dataset.col);
+		activate$1(currentKey());
+		return;
+	}
+	const letter = event.target.closest(".jk-letter");
+	if (letter) typeChar(letter.dataset.char);
+}
+function ensurePanel() {
+	if (_panel && _panel.parentNode) return _panel;
+	_panel = document.createElement("div");
+	_panel.className = "joystick-keyboard";
+	Object.assign(_panel.style, {
+		position: "fixed",
+		left: "50%",
+		transform: "translateX(-50%)",
+		zIndex: 10002,
+		background: "rgba(20, 20, 24, 0.95)",
+		border: "1px solid #555",
+		borderRadius: "8px",
+		padding: "8px",
+		fontFamily: "sans-serif",
+		color: "#eee",
+		userSelect: "none",
+		boxShadow: "0 4px 12px rgba(0, 0, 0, 0.6)"
+	});
+	_panel.addEventListener("pointerdown", onPointerDown);
+	_panel.addEventListener("mousedown", (event) => event.preventDefault());
+	document.body.appendChild(_panel);
+	return _panel;
+}
+function span(text, style) {
+	const el = document.createElement("span");
+	el.textContent = text;
+	Object.assign(el.style, style || {});
+	return el;
+}
+function renderPreview$1() {
+	const box = document.createElement("div");
+	box.className = "jk-preview";
+	Object.assign(box.style, {
+		background: "#000",
+		border: "1px solid #444",
+		borderRadius: "4px",
+		padding: "4px 6px",
+		marginBottom: "6px",
+		minHeight: "18px",
+		width: "313px",
+		whiteSpace: "pre",
+		overflow: "hidden",
+		fontSize: "14px"
+	});
+	const shown = _password ? "•".repeat(_text.length) : _text;
+	if (_prefix) box.appendChild(span(_prefix, { color: "#888" }));
+	box.appendChild(span(shown.slice(0, _caret)));
+	const caret = span("", {
+		borderLeft: "2px solid #ffd740",
+		marginLeft: "-1px"
+	});
+	caret.className = "jk-caret";
+	box.appendChild(caret);
+	box.appendChild(span(shown.slice(_caret)));
+	return box;
+}
+function renderGrid() {
+	const grid = document.createElement("div");
+	grid.className = "jk-keys";
+	Object.assign(grid.style, {
+		display: "grid",
+		gridTemplateColumns: `repeat(20, ${27 / 2}px)`,
+		columnGap: "3px",
+		rowGap: "3px"
+	});
+	const rows = currentRows();
+	let first = 0;
+	let last = rows.length - 1;
+	if (_page$1 === "phrases" && rows.length - 1 > PHRASES_SHOWN) {
+		const focus = Math.min(_row, rows.length - 2);
+		first = Math.max(0, Math.min(focus - 2, rows.length - 1 - PHRASES_SHOWN));
+		last = first + PHRASES_SHOWN - 1;
+	}
+	rows.forEach((row, r) => {
+		if ((r < first || r > last) && r !== rows.length - 1) return;
+		row.forEach((key, c) => {
+			const el = document.createElement("div");
+			el.className = "jk-key";
+			el.dataset.row = String(r);
+			el.dataset.col = String(c);
+			el.textContent = key.action === "char" ? shifted(key.label) : key.label;
+			const focused = r === _row && c === _col;
+			const lit = key.action === "shift" && _shift > 0;
+			Object.assign(el.style, {
+				gridColumn: `span ${key.width * 2}`,
+				height: "26px",
+				lineHeight: "26px",
+				textAlign: key.action === "phrase" ? "left" : "center",
+				padding: key.action === "phrase" ? "0 6px" : "0",
+				overflow: "hidden",
+				textOverflow: "ellipsis",
+				whiteSpace: "nowrap",
+				fontSize: "13px",
+				borderRadius: "3px",
+				cursor: "pointer",
+				background: focused ? "#5a4a10" : "#333",
+				border: focused ? "1px solid #ffd740" : "1px solid #666",
+				color: lit ? "#ffd740" : "#eee",
+				textDecoration: lit && _shift === 2 ? "underline" : "none"
+			});
+			if (focused) el.classList.add("jk-focused");
+			grid.appendChild(el);
+		});
+	});
+	if (_page$1 === "phrases" && rows.length === 1) {
+		const empty = document.createElement("div");
+		empty.textContent = "No phrases yet: type one, then Save text.";
+		Object.assign(empty.style, {
+			gridColumn: `span 20`,
+			color: "#888",
+			fontSize: "12px"
+		});
+		grid.insertBefore(empty, grid.firstChild);
+	}
+	return grid;
+}
+function renderWheel() {
+	const size = 236;
+	const radius = 84;
+	const petalSize = 60;
+	const wheel = document.createElement("div");
+	wheel.className = "jk-wheel";
+	Object.assign(wheel.style, {
+		position: "relative",
+		width: "236px",
+		height: "236px",
+		margin: "0 auto"
+	});
+	const places = [
+		{
+			left: "50%",
+			top: "2px",
+			transform: "translateX(-50%)"
+		},
+		{
+			right: "5px",
+			top: "50%",
+			transform: "translateY(-50%)"
+		},
+		{
+			left: "50%",
+			bottom: "2px",
+			transform: "translateX(-50%)"
+		},
+		{
+			left: "5px",
+			top: "50%",
+			transform: "translateY(-50%)"
+		}
+	];
+	WHEEL[_page$1].forEach((group, i) => {
+		const angle = i * Math.PI / 4;
+		const petal = document.createElement("div");
+		petal.className = "jk-petal";
+		const selected = i === _petal;
+		if (selected) petal.classList.add("jk-selected");
+		Object.assign(petal.style, {
+			position: "absolute",
+			left: size / 2 + radius * Math.sin(angle) - petalSize / 2 + "px",
+			top: size / 2 - radius * Math.cos(angle) - petalSize / 2 + "px",
+			width: "60px",
+			height: "60px",
+			borderRadius: "50%",
+			background: selected ? "#5a4a10" : "#333",
+			border: selected ? "2px solid #ffd740" : "1px solid #666",
+			boxSizing: "border-box"
+		});
+		Array.from(group).forEach((c, slot) => {
+			const letter = span(shifted(c), {
+				position: "absolute",
+				fontSize: "14px",
+				fontWeight: "bold",
+				cursor: "pointer",
+				color: selected ? SLOT_COLOR[slot] : "#ddd",
+				...places[slot]
+			});
+			letter.className = "jk-letter";
+			letter.dataset.char = c;
+			petal.appendChild(letter);
+		});
+		wheel.appendChild(petal);
+	});
+	const n = JoystickButtonMap_default.nameOf;
+	const middle = span(n(BTN$1.Y) + " space\n" + n(BTN$1.X) + " ⌫\n" + n(BTN$1.B) + " close", {
+		position: "absolute",
+		left: "50%",
+		top: "50%",
+		transform: "translate(-50%, -50%)",
+		whiteSpace: "pre",
+		textAlign: "center",
+		fontSize: "10px",
+		color: "#999"
+	});
+	wheel.appendChild(middle);
+	return wheel;
+}
+function renderHints() {
+	const n = JoystickButtonMap_default.nameOf;
+	const parts = [
+		onWheel() ? ["Stick + " + [
+			n(BTN$1.Y),
+			n(BTN$1.B),
+			n(BTN$1.A),
+			n(BTN$1.X)
+		].join("/"), "Letter"] : [n(BTN$1.A), "Type"],
+		[n(BTN$1.X), "⌫"],
+		[n(BTN$1.Y), "Space"],
+		[n(BTN$1.LB) + "/" + n(BTN$1.RB), "Caret"],
+		[n(BTN$1.LT), "Shift"],
+		[n(BTN$1.RT), "Page"],
+		[n(BTN$1.VIEW), "Phrases"],
+		[n(BTN$1.RS), mode() === "wheel" ? "Grid" : "Wheel"],
+		[n(BTN$1.MENU), "Done"],
+		[n(BTN$1.B), "Close"]
+	];
+	const bar = document.createElement("div");
+	bar.className = "jk-hints";
+	Object.assign(bar.style, {
+		marginTop: "6px",
+		fontSize: "11px",
+		color: "#bbb",
+		width: "327px",
+		lineHeight: "15px"
+	});
+	parts.forEach(([key, text], i) => {
+		if (i) bar.appendChild(document.createTextNode("  ·  "));
+		bar.appendChild(span(key, {
+			color: "#ffd740",
+			fontWeight: "bold"
+		}));
+		bar.appendChild(document.createTextNode(" " + text));
+	});
+	return bar;
+}
+function render$7() {
+	if (!_open$1) return;
+	const panel = ensurePanel();
+	panel.style.bottom = JoystickFocusOverlay_default.bottomAboveHud() + "px";
+	panel.textContent = "";
+	const preview = renderPreview$1();
+	panel.appendChild(preview);
+	panel.appendChild(onWheel() ? renderWheel() : renderGrid());
+	panel.appendChild(renderHints());
+	const caret = preview.querySelector(".jk-caret");
+	if (caret) preview.scrollLeft = Math.max(0, caret.offsetLeft - preview.clientWidth + 24);
+}
+/**
+* A button press while the keyboard is open.
+*
+* @param {number} button logical button
+* @return {boolean} whether holding it repeats what it did
+*/
+function press(button) {
+	switch (button) {
+		case BTN$1.LB:
+			moveCaret(-1);
+			return true;
+		case BTN$1.RB:
+			moveCaret(1);
+			return true;
+		case BTN$1.LT:
+			cycleShift();
+			return false;
+		case BTN$1.RT:
+			setPage(_page$1 === "phrases" ? _lastPage : nextPage());
+			return false;
+		case BTN$1.VIEW:
+			setPage(_page$1 === "phrases" ? _lastPage : "phrases");
+			return false;
+		case BTN$1.MENU:
+			done();
+			return false;
+		case BTN$1.RS:
+			toggleMode();
+			return false;
+	}
+	if (onWheel()) {
+		if (FACE_SLOT[button] !== void 0 && _petal !== null) {
+			typeChar(WHEEL[_page$1][_petal][FACE_SLOT[button]]);
+			return false;
+		}
+		if (button === BTN$1.LEFT || button === BTN$1.RIGHT) {
+			moveCaret(button === BTN$1.RIGHT ? 1 : -1);
+			return true;
+		}
+	} else if (DIRECTIONS[button]) {
+		moveFocus(DIRECTIONS[button]);
+		return true;
+	} else if (button === BTN$1.A) {
+		activate$1(currentKey());
+		return false;
+	}
+	switch (button) {
+		case BTN$1.B:
+			close$1();
+			return false;
+		case BTN$1.X:
+			backspace();
+			return true;
+		case BTN$1.Y:
+			insert(" ");
+			return false;
+	}
+	return false;
+}
+/**
+* The stick that walks (the left one, the right one with the sticks swapped).
+*/
+function walkStick(gp) {
+	const axes = gp && gp.axes ? JoystickStickFilter_default.filterAxes(gp.axes) : [];
+	const swapped = Controls_default.joyReverseStick && axes.length >= 4;
+	return {
+		x: axes[swapped ? 2 : 0] || 0,
+		y: axes[swapped ? 3 : 1] || 0
+	};
+}
+/**
+* The wheel: the stick picks the group it points at.
+*/
+function pointWheel(gp) {
+	const { x, y } = walkStick(gp);
+	let petal = null;
+	if (Math.hypot(x, y) >= STICK_PUSH) {
+		const angle = Math.atan2(x, -y);
+		petal = (Math.round(angle / (Math.PI / 4)) + 8) % 8;
+	}
+	if (petal !== _petal) {
+		_petal = petal;
+		render$7();
+	}
+}
+/**
+* The grid: the stick moves between keys as the D-pad does.
+*/
+function moveWithStick(gp, now) {
+	const { x, y } = walkStick(gp);
+	let direction = null;
+	if (Math.max(Math.abs(x), Math.abs(y)) >= STICK_PUSH) {
+		if (Math.abs(x) > Math.abs(y)) direction = x > 0 ? "right" : "left";
+		else direction = y > 0 ? "down" : "up";
+	}
+	if (_stickDir === void 0) {
+		_stickDir = direction;
+		_stickNextAt = Infinity;
+		return;
+	}
+	if (direction !== _stickDir) {
+		_stickDir = direction;
+		if (direction) {
+			moveFocus(direction);
+			_stickNextAt = now + REPEAT_DELAY_MS$1;
+		}
+		return;
+	}
+	if (direction && now >= _stickNextAt) {
+		moveFocus(direction);
+		_stickNextAt = now + REPEAT_EVERY_MS$1;
+	}
+}
+/**
+* One animation frame while the keyboard is open (JoystickUIFocus).
+*
+* @param {Gamepad} gp
+* @param {{pressed: Array<number>}} events logical buttons pressed since the last frame
+* @param {Array<boolean>} down logical buttons down now
+* @param {number} now
+*/
+function frame$2(gp, events, down, now) {
+	if (!_open$1) return;
+	const host = _field && _field.isConnected ? _field.getRootNode().host : null;
+	if (!_field || !_field.isConnected || host && host.style.display === "none") {
+		finish();
+		return;
+	}
+	if (onWheel()) {
+		pointWheel(gp);
+		_stickDir = void 0;
+	} else moveWithStick(gp, now);
+	events.pressed.forEach((button) => {
+		if (_open$1 && press(button)) _nextAt.set(button, now + REPEAT_DELAY_MS$1);
+	});
+	_nextAt.forEach((at, button) => {
+		if (!_open$1 || !down[button]) _nextAt.delete(button);
+		else if (now >= at) {
+			if (press(button)) _nextAt.set(button, now + REPEAT_EVERY_MS$1);
+			else _nextAt.delete(button);
+		}
+	});
+}
+/**
+* Open the keyboard on a field.
+*
+* @param {Element} field
+* @return {boolean} false when the element takes no text
+*/
+function open(field) {
+	if (!isTextField(field)) return false;
+	if (_open$1) close$1();
+	_field = field;
+	_kind = field.matches(TEXT_FIELD) ? "value" : "editable";
+	_numeric = field.matches(NUMBER_FIELD) || !!field.closest("#inputbox.number");
+	_password = field.matches("input[type=\"password\"]");
+	if (_kind === "value") {
+		_node = null;
+		_prefix = "";
+		_text = field.value || "";
+		_caret = _text.length;
+	} else attachNode();
+	_page$1 = _numeric ? "signs" : "letters";
+	_lastPage = _page$1;
+	_shift = 0;
+	_row = _numeric ? 0 : 1;
+	_col = 0;
+	_petal = null;
+	_nextAt = /* @__PURE__ */ new Map();
+	_stickDir = void 0;
+	_open$1 = true;
+	field.addEventListener("input", onFieldInput);
+	if (typeof field.focus === "function" && deepActive() !== field) field.focus();
+	render$7();
+	return true;
+}
+/**
+* Close the keyboard: the field keeps its text and hears `change`.
+*/
+function finish() {
+	if (!_open$1) return;
+	_open$1 = false;
+	const field = _field;
+	_field = null;
+	_node = null;
+	_nextAt = /* @__PURE__ */ new Map();
+	_stickDir = void 0;
+	_petal = null;
+	if (_panel && _panel.parentNode) _panel.parentNode.removeChild(_panel);
+	_panel = null;
+	if (field) {
+		field.removeEventListener("input", onFieldInput);
+		if (_kind === "value" && field.isConnected) field.dispatchEvent(new Event("change", { bubbles: true }));
+	}
+}
+/**
+* Done (Menu): the text is entered, as Enter enters it. A text area takes
+* Enter as a new line, so there it is only closed.
+*/
+function done() {
+	const field = _field;
+	finish();
+	if (!field || !field.isConnected) return;
+	if (field.tagName !== "TEXTAREA") {
+		if (deepActive() !== field && typeof field.focus === "function") field.focus();
+		pressEnter(field);
+	}
+	if (field.isConnected) release(field);
+}
+/**
+* Close (B): the text stays in the field, nothing is entered.
+*/
+function close$1() {
+	const field = _field;
+	finish();
+	if (field && field.isConnected) release(field);
+}
+/**
+* The keyboard for a field that has just taken the focus: Menu (Enter)
+* opened the chat.
+*
+* @param {?Element} before the field with the focus before
+* @return {boolean} whether the keyboard opened
+*/
+function openIfFocused(before) {
+	const field = deepActive();
+	if (!field || field === before || !isTextField(field)) return false;
+	return open(field);
+}
+/**
+* The text field with the focus now, if any.
+*/
+function focusedField() {
+	const el = deepActive();
+	return isTextField(el) ? el : null;
+}
+var BTN$1, REPEAT_DELAY_MS$1, REPEAT_EVERY_MS$1, STICK_PUSH, PHRASES_SHOWN, PHRASES_MAX, PHRASE_LENGTH_MAX, DEFAULT_PHRASES, TEXT_FIELD, NUMBER_FIELD, PAGE_ORDER, PAGE_LABEL, WHEEL, FACE_SLOT, SLOT_COLOR, DIRECTIONS, _open$1, _field, _kind, _node, _prefix, _text, _caret, _numeric, _password, _page$1, _lastPage, _shift, _row, _col, _petal, _panel, _nextAt, _stickDir, _stickNextAt, _prefs, JoystickKeyboard_default;
+var init_JoystickKeyboard = __esmMin((() => {
+	init_Controls();
+	init_Preferences$1();
+	init_JoystickButtonMap();
+	init_JoystickStickFilter();
+	init_JoystickFocusOverlay();
+	BTN$1 = JoystickButtonMap_default.BUTTON;
+	REPEAT_DELAY_MS$1 = 350;
+	REPEAT_EVERY_MS$1 = 90;
+	STICK_PUSH = .5;
+	PHRASES_SHOWN = 6;
+	PHRASES_MAX = 30;
+	PHRASE_LENGTH_MAX = 255;
+	DEFAULT_PHRASES = [
+		"Hi!",
+		"Thanks!",
+		"@autoloot",
+		"@storage",
+		"@go ",
+		"@warp "
+	];
+	TEXT_FIELD = [
+		"input:not([type])",
+		"input[type=\"text\"]",
+		"input[type=\"search\"]",
+		"input[type=\"password\"]",
+		"input[type=\"email\"]",
+		"input[type=\"number\"]",
+		"input[type=\"tel\"]",
+		"input[type=\"url\"]",
+		"textarea"
+	].join(",");
+	NUMBER_FIELD = "input[type=\"number\"], [inputmode=\"numeric\"], [inputmode=\"decimal\"]";
+	PAGE_ORDER = [
+		"letters",
+		"signs",
+		"accents"
+	];
+	PAGE_LABEL = {
+		letters: "abc",
+		signs: "#+=",
+		accents: "äöü"
+	};
+	WHEEL = {
+		letters: [
+			"abcd",
+			"efgh",
+			"ijkl",
+			"mnop",
+			"qrst",
+			"uvwx",
+			"yz,.",
+			"?!@'"
+		],
+		signs: [
+			"1234",
+			"5678",
+			"90-+",
+			"=/\\:",
+			";\"#$",
+			"%&*(",
+			")_<>",
+			"[]~|"
+		],
+		accents: [
+			"äöüß",
+			"éèêë",
+			"àáâç",
+			"ñóòô",
+			"úùûí",
+			"ìîïœ",
+			"æøå€",
+			"¿¡^`"
+		]
+	};
+	FACE_SLOT = {
+		[BTN$1.Y]: 0,
+		[BTN$1.B]: 1,
+		[BTN$1.A]: 2,
+		[BTN$1.X]: 3
+	};
+	SLOT_COLOR = [
+		"#e6c229",
+		"#e04b4b",
+		"#5cb85c",
+		"#4a90e2"
+	];
+	DIRECTIONS = {
+		[BTN$1.UP]: "up",
+		[BTN$1.DOWN]: "down",
+		[BTN$1.LEFT]: "left",
+		[BTN$1.RIGHT]: "right"
+	};
+	_open$1 = false;
+	_field = null;
+	_kind = "value";
+	_node = null;
+	_prefix = "";
+	_text = "";
+	_caret = 0;
+	_numeric = false;
+	_password = false;
+	_page$1 = "letters";
+	_lastPage = "letters";
+	_shift = 0;
+	_row = 0;
+	_col = 0;
+	_petal = null;
+	_panel = null;
+	_nextAt = /* @__PURE__ */ new Map();
+	_stickNextAt = 0;
+	_prefs = null;
+	JoystickKeyboard_default = {
+		open,
+		close: close$1,
+		done,
+		frame: frame$2,
+		isOpen() {
+			return _open$1;
+		},
+		isTextField,
+		focusedField,
+		openIfFocused,
+		/**
+		* What is being typed, for tests and the settings window.
+		*/
+		getState() {
+			return {
+				field: _field,
+				text: _text,
+				caret: _caret,
+				page: _page$1,
+				shift: _shift,
+				mode: mode(),
+				petal: _petal,
+				key: _open$1 && !onWheel() ? currentKey() : null
+			};
+		},
+		/**
+		* Saved phrases, newest first.
+		*/
+		phrases() {
+			return phrases().slice();
+		},
+		/**
+		* Read the phrases and the way to type from the browser again (tests).
+		*/
+		reload() {
+			_prefs = null;
+		}
+	};
+}));
+//#endregion
+//#region src/UI/Components/JoystickUI/JoystickUIFocus.js
+function enabled$1() {
+	return Controls_default.joyUIFocus !== false;
+}
+/**
+* Whether the gamepad was used more recently than the mouse.
+*/
+function isEngaged() {
+	return _lastPadAt > 0 && _lastPadAt >= _lastMouseAt;
+}
+/**
+* Logical buttons down, from the pad's physical ones.
+*/
+function readButtons(gp) {
+	const raw = [];
+	for (let i = 0; i < JoystickButtonMap_default.BUTTON_COUNT; i++) {
+		const button = gp && gp.buttons ? gp.buttons[i] : null;
+		raw.push(button && button.pressed ? "holding" : "unpressed");
+	}
+	return JoystickButtonMap_default.toLogical(raw).slice(0, JoystickButtonMap_default.BUTTON_COUNT).map((state) => state !== "unpressed");
+}
+/**
+* Presses and releases since the last frame.
+*/
+function track(down, now) {
+	const pressed = [];
+	const released = [];
+	let count = 0;
+	for (let i = 0; i < down.length; i++) {
+		if (down[i]) count++;
+		if (down[i] && !_down[i]) {
+			pressed.push(i);
+			_downAt[i] = now;
+			_used[i] = false;
+		} else if (!down[i] && _down[i]) released.push({
+			button: i,
+			held: now - (_downAt[i] || now),
+			used: !!_used[i],
+			armed: _armed.has(i)
+		});
+		if (!down[i]) {
+			_claimed.delete(i);
+			_armed.delete(i);
+		}
+	}
+	if (pressed.length && count > 1) {
+		for (let i = 0; i < down.length; i++) if (down[i]) _used[i] = true;
+	}
+	_down = down;
+	return {
+		pressed,
+		released
+	};
+}
+function noteActivity(gp, down, now) {
+	if (down.some(Boolean)) {
+		_lastPadAt = now;
+		return;
+	}
+	const axes = gp && gp.axes ? JoystickStickFilter_default.filterAxes(gp.axes) : [];
+	const threshold = Math.max(ACTIVITY_AXIS, Controls_default.joyDeadline || 0);
+	for (let i = 0; i < axes.length; i++) if (Math.abs(axes[i]) > threshold) {
+		_lastPadAt = now;
+		return;
+	}
+}
+/**
+* Run what waited for every button to be let go: a window that reads the
+* pad itself (the slot picker) must not get the press that opened it.
+*/
+function runAfterRelease() {
+	if (!_afterRelease.length || _down.some(Boolean)) return;
+	const list = _afterRelease;
+	_afterRelease = [];
+	list.forEach((fn) => {
+		try {
+			fn();
+		} catch (error) {
+			console.error("[JoystickUIFocus] deferred action failed", error);
+		}
+	});
+}
+function afterRelease(fn) {
+	_afterRelease.push(fn);
+}
+/**
+* View: a tap turns menus on or off, a hold alone shows the info of what
+* the cursor (or the ring) is on. With another button it is a modifier,
+* handled in JoystickButtonInput and JoystickCameraMotion.
+*/
+function handleView(events, now) {
+	const view = BTN.VIEW;
+	if (events.pressed.indexOf(view) !== -1) {
+		_viewHoldFired = false;
+		_viewArmed = true;
+	}
+	const release = events.released.find((entry) => entry.button === view);
+	const armed = _viewArmed;
+	if (release) _viewArmed = false;
+	if (!armed) return;
+	if (_down[view] && !_used[view] && !_viewHoldFired && now - _downAt[view] >= HOLD_MS) {
+		_viewHoldFired = true;
+		if (_active$3 && _el && !_detached) info();
+		else JoystickMouseCursorAdapter_default.contextMenu();
+	}
+	if (release && !release.used && !_viewHoldFired && release.held < HOLD_MS) {
+		if (enabled$1()) toggle();
+		else JoystickMouseCursorAdapter_default.contextMenu();
+	}
+}
+/**
+* Whether a release ends a tap that belongs to menus.
+*/
+function isTap(entry) {
+	return entry.armed && !entry.used && entry.held < TAP_MS;
+}
+function handleButtons(events, now) {
+	const view = _down[BTN.VIEW];
+	const combo = MODIFIERS.some((button) => _down[button]);
+	if (view) _repeatButton = -1;
+	else {
+		events.pressed.forEach((button) => {
+			if (DPAD[button]) {
+				move(DPAD[button]);
+				_repeatButton = button;
+				_repeatAt = now + REPEAT_DELAY_MS;
+			}
+		});
+		if (_repeatButton !== -1) {
+			if (!_down[_repeatButton]) _repeatButton = -1;
+			else if (now >= _repeatAt) {
+				_repeatAt = now + REPEAT_EVERY_MS;
+				move(DPAD[_repeatButton]);
+			}
+		}
+	}
+	if (!view) events.pressed.forEach((button) => {
+		if (button === BTN.X || MODIFIERS.indexOf(button) !== -1) _armed.add(button);
+	});
+	if (!view && !combo && _active$3) {
+		if (events.pressed.indexOf(BTN.A) !== -1) {
+			if (JoystickCarry_default.isCarrying()) placeCarried();
+			else activate();
+		} else if (events.pressed.indexOf(BTN.B) !== -1) {
+			if (JoystickCarry_default.isCarrying()) cancelCarry();
+			else back();
+		} else if (events.pressed.indexOf(BTN.Y) !== -1) info();
+		if (events.pressed.indexOf(BTN.X) !== -1) {
+			_xHoldFired = false;
+			_xTaken = JoystickCarry_default.isCarrying();
+			if (_xTaken) placeCarried();
+		}
+	}
+	handleX(events, now, view);
+	if (!view && _active$3) events.released.forEach((entry) => {
+		if (!isTap(entry)) return;
+		if (entry.button === BTN.LT || entry.button === BTN.RT) cycleWindow(entry.button === BTN.RT ? 1 : -1);
+		else if (entry.button === BTN.LB || entry.button === BTN.RB) switchTab(entry.button === BTN.RB ? 1 : -1);
+	});
+}
+/**
+* X: held, it picks the focused element up; tapped, it opens what can be
+* done with it. Not with a shoulder button (a shortcut combo) or View.
+*/
+function handleX(events, now, view) {
+	const x = BTN.X;
+	if (_active$3 && !view && _down[x] && _armed.has(x) && !_used[x] && !_xHoldFired && !_xTaken && now - _downAt[x] >= HOLD_MS) {
+		_xHoldFired = true;
+		if (!_detached && _el && !JoystickCarry_default.isCarrying() && JoystickActionMenu_default.canMove(_el, _win)) startCarry(_el);
+	}
+	const release = events.released.find((entry) => entry.button === x);
+	if (release && isTap(release) && !_xHoldFired && !_xTaken && !view && _active$3) openActions();
+	if (release) {
+		_xHoldFired = false;
+		_xTaken = false;
+	}
+}
+/**
+* The registered component a window is, if any (popups are unregistered clones).
+*/
+function componentOf(win) {
+	const components = UIManager.components;
+	for (const name in components) {
+		const component = components[name];
+		if (component && component._host === win.host) return component;
+	}
+	return null;
+}
+/**
+* Bring a window to the front, as a click on it does.
+*/
+function raise(win) {
+	const component = componentOf(win);
+	if (component && component.focus) component.focus();
+}
+/**
+* The virtual cursor onto an element (the focused one), so that what the
+* cursor does elsewhere (a skill click over a window is meant for the
+* window) agrees with the ring.
+*/
+function parkCursor(el = _el) {
+	if (!el) return;
+	const at = JoystickDomEvents_default.centerOf(el);
+	JoystickMouseCursorAdapter_default.moveTo(at.x, at.y);
+}
+/**
+* Whether a window is passed by: never navigated, or not now (the gamepad
+* HUD, but while something is carried).
+*/
+function skipped(win) {
+	return !!win.profile.skip;
+}
+function setFocus(win, el, list, moveCursor = true) {
+	const newWindow = !_win || _win.host !== win.host;
+	if (_el && _el !== el) JoystickDomEvents_default.hover(JoystickFocusScan_default.eventTarget(_el), false);
+	_win = win;
+	_el = el;
+	_key = JoystickFocusScan_default.keyOf(el, list);
+	_ordinal = Math.max(0, list.indexOf(el));
+	_lastKey.set(win.host, _key);
+	_detached = false;
+	_visited = _visited.filter((host) => host !== win.host);
+	_visited.push(win.host);
+	if (newWindow) raise(win);
+	JoystickFocusScan_default.reveal(el, win.host);
+	JoystickDomEvents_default.hover(JoystickFocusScan_default.eventTarget(el), true);
+	if (win.profile.onFocus) win.profile.onFocus(el, win);
+	if (moveCursor) parkCursor();
+	_hintsAt = -Infinity;
+	refresh$1();
+}
+/**
+* The first element in reading order, title bar buttons (close, minimise) last.
+*/
+function firstOf(list) {
+	const body = list.filter((el) => !el.closest(".titlebar"));
+	return (body.length ? body : list).map((el) => ({
+		el,
+		rect: el.getBoundingClientRect()
+	})).sort((a, b) => JoystickSpatialNav_default.compareReadingOrder(a.rect, b.rect))[0].el;
+}
+/**
+* Move the focus into a window: where it was the last time, else where its
+* profile starts (a dialogue always starts there), else its first element.
+*
+* @return {boolean} false when the window has nothing to focus
+*/
+function focusWindow(win) {
+	const list = JoystickFocusScan_default.focusables(win);
+	if (!list.length) return false;
+	const profile = win.profile;
+	let el = null;
+	if (profile.dialog && profile.initial) el = JoystickFocusScan_default.findFirst(list, profile.initial);
+	if (!el) el = JoystickFocusScan_default.findByKey(list, _lastKey.get(win.host));
+	if (!el && profile.initial) el = JoystickFocusScan_default.findFirst(list, profile.initial);
+	if (!el) el = firstOf(list);
+	if ((!_win || _win.host !== win.host) && profile.onEnter) profile.onEnter(win);
+	setFocus(win, el, list);
+	return true;
+}
+/**
+* Where menu navigation starts when turned on by hand: a dialogue, else the
+* frontmost window the player opened, else the basic info window's menu
+* (which opens all the others), else whatever there is.
+*/
+function pickWindow(wins) {
+	const usable = (wins || JoystickFocusScan_default.listWindows()).filter((win) => !skipped(win) && JoystickFocusScan_default.focusables(win).length);
+	return usable.find((win) => win.profile.dialog) || usable.find((win) => !win.profile.home && !win.profile.persistent) || usable.find((win) => win.profile.home) || usable[0] || null;
+}
+/**
+* Windows the D-pad crosses into from the focused one: dialogues among
+* dialogues, the rest among the rest.
+*/
+function neighbours(win) {
+	const dialog = !!(win && win.profile.dialog);
+	return JoystickFocusScan_default.listWindows().filter((other) => (!win || other.host !== win.host) && !skipped(other) && !!other.profile.dialog === dialog);
+}
+function entriesOf(win, list) {
+	return list.map((el) => ({
+		el,
+		win,
+		rect: el.getBoundingClientRect()
+	}));
+}
+/**
+* The windows the shoulder triggers go through, left to right on screen.
+*/
+function navigableWindows() {
+	return JoystickFocusScan_default.listWindows().filter((win) => !skipped(win)).map((win) => ({
+		win,
+		list: JoystickFocusScan_default.focusables(win)
+	})).filter((entry) => entry.list.length).map((entry) => ({
+		win: entry.win,
+		bounds: JoystickFocusScan_default.boundsOf(entry.list)
+	})).sort((a, b) => a.bounds.left - b.bounds.left || a.bounds.top - b.bounds.top).map((entry) => entry.win);
+}
+/**
+* The focused window closed: on to another dialogue, else back to the
+* windows visited this time, else to a window the server opened (storage),
+* else out of menus if they were not turned on by hand.
+*/
+function windowGone() {
+	const gone = _win;
+	_win = null;
+	_el = null;
+	const wins = JoystickFocusScan_default.listWindows();
+	const dialog = wins.find((win) => win.profile.dialog && JoystickFocusScan_default.focusables(win).length);
+	if (dialog && focusWindow(dialog)) return;
+	for (let i = _visited.length - 1; i >= 0; i--) {
+		const host = _visited[i];
+		if (gone && host === gone.host) continue;
+		const win = wins.find((candidate) => candidate.host === host);
+		if (win && !skipped(win) && focusWindow(win)) return;
+	}
+	const opened = wins.find((win) => win.profile.takesFocus && JoystickFocusScan_default.focusables(win).length);
+	if (opened && focusWindow(opened)) return;
+	if (_frameTime < _followUntil) {
+		JoystickFocusOverlay_default.hideRing();
+		return;
+	}
+	settle(wins);
+}
+/**
+* Nowhere left to go: out of menus if they turned on by themselves, else
+* into whatever window is left.
+*/
+function settle(wins) {
+	if (_auto) {
+		exit();
+		return;
+	}
+	const any = pickWindow(wins);
+	if (!any || !focusWindow(any)) exit();
+}
+/**
+* Keep the focus on something real: the window may have closed, or drawn
+* its list again (the inventory does whenever an item changes).
+*/
+function validate(now) {
+	if (!_win) {
+		if (now >= _followUntil) settle();
+		return;
+	}
+	if (!JoystickFocusScan_default.isOpen(_win) || skipped(_win)) {
+		windowGone();
+		return;
+	}
+	if (_detached || _el && JoystickFocusScan_default.isStillFocusable(_el, _win)) return;
+	if (!_el && now - _lostAt < SCAN_EVERY_MS) return;
+	const list = JoystickFocusScan_default.focusables(_win);
+	if (!list.length) {
+		if (_el) JoystickDomEvents_default.hover(JoystickFocusScan_default.eventTarget(_el), false);
+		_el = null;
+		_lostAt = now;
+		JoystickFocusOverlay_default.hideRing();
+		return;
+	}
+	const profile = _win.profile;
+	let el = JoystickFocusScan_default.findByKey(list, _key);
+	if (!el && profile.dialog && profile.initial) el = JoystickFocusScan_default.findFirst(list, profile.initial);
+	if (!el) el = list[Math.min(_ordinal, list.length - 1)];
+	setFocus(_win, el, list);
+}
+/**
+* The right stick moved the cursor: the ring goes to what it rests on.
+* Only the stick: a skill moving the cursor onto its target leaves the ring
+* where it is.
+*/
+function followCursor() {
+	const hit = JoystickFocusScan_default.focusableAt(Mouse.screen.x, Mouse.screen.y);
+	if (hit && !skipped(hit.win)) {
+		if (hit.el !== _el) setFocus(hit.win, hit.el, JoystickFocusScan_default.focusables(hit.win), false);
+		else if (_detached) {
+			JoystickDomEvents_default.hover(JoystickFocusScan_default.eventTarget(_el), true);
+			_hintsAt = -Infinity;
+		}
+		_detached = false;
+	} else if (!_detached) {
+		if (_el) JoystickDomEvents_default.hover(JoystickFocusScan_default.eventTarget(_el), false);
+		_detached = true;
+		_hintsAt = -Infinity;
+	}
+}
+/**
+* The D-pad: the profile first (an amount box counts), then the NPC text
+* scrolls, then the focus moves.
+*/
+function move(direction) {
+	if (!_win) return;
+	const profile = _win.profile;
+	if (!_detached && _el && profile.direction && profile.direction(direction, _el, _win)) {
+		_hintsAt = -Infinity;
+		return;
+	}
+	if (!_detached && _el && JoystickValueInput_default.step(_el, direction)) {
+		_hintsAt = -Infinity;
+		return;
+	}
+	if (!_detached && profile.scroll && (direction === "up" || direction === "down")) {
+		if (JoystickFocusScan_default.scrollBy(_win.root.querySelector(profile.scroll), direction)) return;
+	}
+	const from = _detached || !_el ? {
+		left: Mouse.screen.x,
+		top: Mouse.screen.y,
+		right: Mouse.screen.x + 1,
+		bottom: Mouse.screen.y + 1
+	} : _el.getBoundingClientRect();
+	const list = JoystickFocusScan_default.focusables(_win);
+	const own = entriesOf(_win, list.filter((el) => el !== _el || _detached));
+	let next = JoystickSpatialNav_default.findNext(from, own, direction);
+	if (!next) {
+		const others = [];
+		neighbours(_win).forEach((win) => others.push(...entriesOf(win, JoystickFocusScan_default.focusables(win))));
+		next = JoystickSpatialNav_default.findNext(from, others, direction);
+	}
+	if (!next && profile.wrap) next = JoystickSpatialNav_default.findWrap(from, own, direction);
+	if (next) {
+		_tabFocus = null;
+		setFocus(next.win, next.el, next.win === _win ? list : JoystickFocusScan_default.focusables(next.win));
+	}
+}
+function pressGeneric(el) {
+	if (JoystickValueInput_default.isSlider(el)) return;
+	if (el.matches("select")) {
+		if (el.options.length) {
+			el.selectedIndex = (el.selectedIndex + 1) % el.options.length;
+			el.dispatchEvent(new Event("change", { bubbles: true }));
+		}
+		return;
+	}
+	if (el.matches("input:not([type=\"checkbox\"]):not([type=\"radio\"]):not([type=\"button\"]):not([type=\"submit\"]), textarea, [contenteditable=\"true\"]")) {
+		if (!JoystickKeyboard_default.open(el)) {
+			el.focus();
+			if (el.select) el.select();
+		}
+		return;
+	}
+	JoystickDomEvents_default.press(JoystickFocusScan_default.eventTarget(el));
+}
+/**
+* A: the profile's action, else a click on the element. Off the ring, a
+* click at the cursor.
+*/
+function activate() {
+	if (_detached) {
+		JoystickMouseCursorAdapter_default.leftClick();
+		return;
+	}
+	if (!_el || !_win) return;
+	parkCursor();
+	const profile = _win.profile;
+	_followUntil = _frameTime + FOLLOW_MS;
+	if (!(profile.primary && profile.primary(_el, _win))) pressGeneric(_el);
+	_hintsAt = -Infinity;
+}
+/**
+* A window's cancel or close button.
+*/
+function findClose(win) {
+	for (let i = 0; i < CLOSE.length; i++) {
+		const found = Array.from(win.root.querySelectorAll(CLOSE[i])).find((el) => JoystickFocusScan_default.isUsable(el, win.host));
+		if (found) return found;
+	}
+	return null;
+}
+/**
+* The info windows open now (an item's, a skill's: what Y opens), when B
+* would close them: not while a dialogue has the focus, which gets B.
+*/
+function infoToClose() {
+	if (_win && _win.profile.dialog) return [];
+	return JoystickFocusScan_default.listWindows().filter((win) => win.profile.info);
+}
+/**
+* Close a window with its own close button, else as its component.
+*/
+function closeWindow(win) {
+	if (!JoystickFocusScan_default.isOpen(win)) return;
+	const close = findClose(win);
+	if (close) {
+		JoystickDomEvents_default.press(close);
+		return;
+	}
+	const component = componentOf(win);
+	if (component && component.remove) component.remove();
+}
+/**
+* B: the info windows Y opened, all at once; else the profile's back, else
+* the window's cancel or close button, else out of menus (never from a
+* dialogue, which wants an answer).
+*/
+function back() {
+	const popups = infoToClose();
+	if (popups.length) {
+		popups.forEach(closeWindow);
+		_hintsAt = -Infinity;
+		return;
+	}
+	if (!_win) {
+		exit();
+		return;
+	}
+	const profile = _win.profile;
+	if (profile.back && profile.back(_win, _el)) {
+		_hintsAt = -Infinity;
+		return;
+	}
+	const close = findClose(_win);
+	if (close) {
+		JoystickDomEvents_default.press(close);
+		_hintsAt = -Infinity;
+		return;
+	}
+	if (!profile.dialog) exit();
+}
+/**
+* The item's or skill's info window, as a right click opens it.
+*/
+function infoOn(el) {
+	if (!el) return;
+	parkCursor(el);
+	JoystickDomEvents_default.contextMenu(JoystickFocusScan_default.eventTarget(el));
+}
+/**
+* Y: info of the focused element, or of what the cursor is on.
+*/
+function info() {
+	if (_detached) {
+		JoystickMouseCursorAdapter_default.contextMenu();
+		return;
+	}
+	infoOn(_el);
+}
+/**
+* LT / RT: the next window to the left or right.
+*/
+function cycleWindow(delta) {
+	const wins = navigableWindows();
+	if (!wins.length) return;
+	let index = _win ? wins.findIndex((win) => win.host === _win.host) : -1;
+	index = index === -1 ? 0 : (index + delta + wins.length) % wins.length;
+	if (_win && wins[index].host === _win.host && !_detached) return;
+	_tabFocus = null;
+	focusWindow(wins[index]);
+}
+/**
+* LB / RB: the window's previous or next tab. From a tab, the focus stays
+* on the tabs; from anywhere else it goes into what the tab shows, once it
+* is drawn (settleTabFocus).
+*/
+function switchTab(delta) {
+	if (!_win) return;
+	const focused = _detached ? null : _el;
+	const next = JoystickFocusTabs_default.step(_win, focused, delta);
+	if (!next) return;
+	const fromTab = !!focused && JoystickFocusTabs_default.isTab(focused, _win);
+	const before = new Set(JoystickFocusScan_default.focusables(_win));
+	JoystickDomEvents_default.press(JoystickFocusScan_default.eventTarget(next.tab));
+	JoystickFocusTabs_default.remember(_win, next.index);
+	_hintsAt = -Infinity;
+	if (fromTab) {
+		const list = JoystickFocusScan_default.focusables(_win);
+		if (list.indexOf(next.tab) !== -1) setFocus(_win, next.tab, list);
+		return;
+	}
+	_tabFocus = {
+		host: _win.host,
+		before,
+		until: _frameTime + TAB_FOCUS_MS
+	};
+}
+/**
+* After a tab switch: the focus goes to the first item the tab drew (or
+* showed), and to the open tab if it drew nothing.
+*/
+function settleTabFocus(now) {
+	const pending = _tabFocus;
+	if (!pending) return;
+	if (!_win || _win.host !== pending.host || !JoystickFocusScan_default.isOpen(_win)) {
+		_tabFocus = null;
+		return;
+	}
+	const list = JoystickFocusScan_default.focusables(_win);
+	const fresh = list.filter((el) => !pending.before.has(el) && !JoystickFocusTabs_default.isTab(el, _win) && !el.closest(".titlebar"));
+	if (fresh.length) {
+		const items = fresh.filter((el) => el.matches("[data-index], .item, .skill"));
+		_tabFocus = null;
+		setFocus(_win, firstOf(items.length ? items : fresh), list);
+		return;
+	}
+	if (now >= pending.until) {
+		_tabFocus = null;
+		const open = JoystickFocusTabs_default.activeTab(_win);
+		if (open && list.indexOf(open) !== -1) setFocus(_win, open, list);
+	}
+}
+/**
+* What action menu entries may call.
+*/
+function actionContext() {
+	return {
+		pickUp: (el) => startCarry(el),
+		info: (el) => infoOn(el),
+		pickSlot: _pickSlot ? (el) => afterRelease(() => _pickSlot(el)) : null
+	};
+}
+/**
+* The element an entry chosen later runs on: the same one, or, if its
+* window drew it anew meanwhile, the one now in its place.
+*/
+function resolver(el, win, key) {
+	return () => {
+		if (el.isConnected || !JoystickFocusScan_default.isOpen(win)) return el;
+		return JoystickFocusScan_default.findByKey(JoystickFocusScan_default.focusables(win), key) || el;
+	};
+}
+/**
+* X tapped: what can be done with the focused element, as a menu.
+*/
+function openActions() {
+	if (_detached || !_el || !_win || JoystickCarry_default.isCarrying()) return;
+	const entries = JoystickActionMenu_default.entriesFor(_el, _win, actionContext());
+	if (!entries.length) return;
+	parkCursor();
+	const menu = JoystickActionMenu_default.open(entries, _el.getBoundingClientRect(), resolver(_el, _win, _key));
+	if (menu) focusComponent(menu);
+}
+/**
+* Pick an element up (X held, Move…).
+*
+* @return {boolean} whether something is carried now
+*/
+function startCarry(el) {
+	if (!el || !JoystickCarry_default.pickUp(el)) return false;
+	_hintsAt = -Infinity;
+	refresh$1();
+	return true;
+}
+/**
+* A (or X) while carrying: put it down on the focused element, or where
+* the cursor is (the map: on the ground).
+*/
+function placeCarried() {
+	let target = null;
+	if (_detached) target = JoystickMouseCursorAdapter_default.elementAtCursor ? JoystickMouseCursorAdapter_default.elementAtCursor() : null;
+	else if (_el) {
+		parkCursor();
+		target = _el;
+	}
+	if (target) JoystickCarry_default.place(target);
+	else JoystickCarry_default.cancel();
+	_hintsAt = -Infinity;
+	refresh$1();
+}
+function cancelCarry() {
+	JoystickCarry_default.cancel();
+	_hintsAt = -Infinity;
+	refresh$1();
+}
+function genericLabel(el) {
+	if (JoystickValueInput_default.isSlider(el)) return "";
+	if (el.matches("input[type=\"checkbox\"], input[type=\"radio\"], .checkbox")) return "Toggle";
+	if (el.matches("select")) return "Next option";
+	if (el.matches("input, textarea, [contenteditable=\"true\"]")) return "Type";
+	return "Select";
+}
+function backLabel() {
+	if (infoToClose().length) return "Close info";
+	const profile = _win.profile;
+	if (profile.backLabel) return profile.backLabel(_win);
+	if (findClose(_win)) return "Close";
+	return profile.dialog ? "" : "Exit";
+}
+function hints() {
+	const list = [];
+	if (!_win) return list;
+	const tabs = JoystickFocusTabs_default.tabsOf(_win, _detached ? null : _el).length > 0;
+	if (JoystickCarry_default.isCarrying()) {
+		list.push([BTN.A, "Place"], [BTN.B, "Cancel"]);
+		if (tabs) list.push([[BTN.LB, BTN.RB], "Tab"]);
+		list.push([[BTN.LT, BTN.RT], "Window"]);
+		return list;
+	}
+	if (_detached) list.push([BTN.A, "Click"], [BTN.Y, "Info"]);
+	else if (_el) {
+		const profile = _win.profile;
+		let label = profile.primaryLabel ? profile.primaryLabel(_el, _win) : null;
+		if (label === null || label === void 0) label = genericLabel(_el);
+		list.push([BTN.A, label]);
+		list.push(...JoystickValueInput_default.hints(_el));
+		if (JoystickActionMenu_default.entriesFor(_el, _win, actionContext()).length) list.push([BTN.X, JoystickActionMenu_default.canMove(_el, _win) ? "Actions (hold: Move)" : "Actions"]);
+		if (JoystickFocusScan_default.isItemLike(_el)) list.push([BTN.Y, "Info"]);
+		if (profile.hints) list.push(...profile.hints(_el, _win));
+	}
+	const backText = backLabel();
+	list.push([BTN.B, backText]);
+	if (tabs) list.push([[BTN.LB, BTN.RB], "Tab"]);
+	list.push([[BTN.LT, BTN.RT], "Window"]);
+	if (backText !== "Exit") list.push([BTN.VIEW, "Exit"]);
+	return list;
+}
+function refresh$1(now) {
+	if (!_active$3) return;
+	const carrying = JoystickCarry_default.isCarrying();
+	if (_detached || !_el || !_el.isConnected) {
+		JoystickFocusOverlay_default.hideRing();
+		const x = Mouse.screen.x;
+		const y = Mouse.screen.y;
+		JoystickCarry_default.moveGhost(_detached ? {
+			left: x,
+			top: y,
+			right: x + 1,
+			bottom: y + 1
+		} : null);
+	} else {
+		const rect = _el.getBoundingClientRect();
+		JoystickFocusOverlay_default.showRing(rect, carrying ? "carry" : "focus");
+		JoystickCarry_default.moveGhost(rect);
+	}
+	const time = typeof now === "number" ? now : performance.now();
+	if (time - _hintsAt >= HINTS_EVERY_MS) {
+		_hintsAt = time;
+		JoystickFocusOverlay_default.showHints(hints());
+	}
+}
+/**
+* Turn menu navigation on.
+*
+* @param {?object} win the window to start in; null: the frontmost
+* @param {boolean} auto turned on by a dialogue or a window the gamepad opened, not by hand
+* @return {boolean} whether it is on now
+*/
+function enter(win, auto) {
+	if (!enabled$1()) return false;
+	const target = win || pickWindow();
+	if (!target) return false;
+	_active$3 = true;
+	_auto = !!auto;
+	_visited = [];
+	_detached = false;
+	_repeatButton = -1;
+	_skillWait = Mouse.state === Mouse.MOUSE_STATE.USESKILL;
+	if (!focusWindow(target)) {
+		exit();
+		return false;
+	}
+	return true;
+}
+function exit() {
+	if (_el) JoystickDomEvents_default.hover(JoystickFocusScan_default.eventTarget(_el), false);
+	if (_active$3) claimDown();
+	JoystickCarry_default.cancel();
+	JoystickValueInput_default.flush();
+	_active$3 = false;
+	_auto = false;
+	_win = null;
+	_el = null;
+	_key = null;
+	_detached = false;
+	_repeatButton = -1;
+	_visited = [];
+	_tabFocus = null;
+	_xHoldFired = false;
+	_xTaken = false;
+	JoystickFocusOverlay_default.hide();
+}
+function toggle() {
+	if (_active$3) exit();
+	else enter(null, false);
+}
+/**
+* Newly opened dialogues take the focus, and menu navigation turns on for
+* one if the gamepad was used last. A window that opens just after A (a
+* BasicInfo button, an Escape setting) takes the focus too.
+*
+* @param {number} now
+*/
+function scanWindows(now) {
+	const wins = JoystickFocusScan_default.listWindows();
+	const dialogs = /* @__PURE__ */ new Set();
+	const known = /* @__PURE__ */ new Set();
+	let fresh = null;
+	let opened = null;
+	wins.forEach((win) => {
+		known.add(win.host);
+		if (skipped(win)) return;
+		if (win.profile.dialog || win.profile.takesFocus) {
+			if (!JoystickFocusScan_default.focusables(win).length) return;
+			dialogs.add(win.host);
+			if (!fresh && !_dialogs.has(win.host)) fresh = win;
+		} else if (!opened && _active$3 && now < _followUntil && !_known.has(win.host)) {
+			if (JoystickFocusScan_default.focusables(win).length) opened = win;
+		}
+	});
+	_dialogs = dialogs;
+	_known = known;
+	if (fresh) {
+		if (_active$3) focusWindow(fresh);
+		else if (isEngaged()) enter(fresh, true);
+	} else if (opened) focusWindow(opened);
+}
+/**
+* The buttons down now stay away from the map until let go.
+*/
+function claimDown() {
+	for (let i = 0; i < _down.length; i++) if (_down[i]) _claimed.add(i);
+}
+/**
+* The gamepad opened a window (View + A / B / X / Y, X's menu): menu
+* navigation goes into it.
+*
+* @param {object} component a GUIComponent
+*/
+function focusComponent(component) {
+	if (!enabled$1() || !component || !component._host) return;
+	const host = component._host;
+	if (host.parentNode !== document.body || !JoystickFocusScan_default.isShown(host)) return;
+	const win = JoystickFocusScan_default.describe(host);
+	if (skipped(win)) return;
+	_known.add(host);
+	if (win.profile.dialog || win.profile.takesFocus) _dialogs.add(host);
+	if (_active$3) focusWindow(win);
+	else enter(win, true);
+}
+/**
+* One animation frame, with the pad (JoystickCursorMotion).
+*
+* @param {Gamepad} gp
+* @param {number} [now] the frame's time
+*/
+function frame$1(gp, now) {
+	const time = typeof now === "number" ? now : performance.now();
+	_frameTime = time;
+	const down = readButtons(gp);
+	const events = track(down, time);
+	noteActivity(gp, down, time);
+	runAfterRelease();
+	if (JoystickKeyboard_default.isOpen()) {
+		claimDown();
+		JoystickKeyboard_default.frame(gp, events, down, time);
+		JoystickFocusOverlay_default.hideHints();
+		_hintsAt = -Infinity;
+		return;
+	}
+	const wasActive = _active$3;
+	if (wasActive) claimDown();
+	const owned = JoystickEmoteGrid_default.isActive() || JoystickSelectionUI_default.active() || JoystickButtonMap_default.isCapturing();
+	if (!owned) handleView(events, time);
+	const waiting = Mouse.state === Mouse.MOUSE_STATE.USESKILL;
+	if (!enabled$1()) {
+		if (_active$3) exit();
+		_skillWait = waiting;
+		return;
+	}
+	if (time - _scanAt >= SCAN_EVERY_MS) {
+		_scanAt = time;
+		scanWindows(time);
+	}
+	if (!_active$3) {
+		_skillWait = waiting;
+		return;
+	}
+	if (waiting && !_skillWait) {
+		_skillWait = true;
+		exit();
+		return;
+	}
+	_skillWait = waiting;
+	settleTabFocus(time);
+	validate(time);
+	if (!_active$3) return;
+	if (!owned && wasActive) handleButtons(events, time);
+	refresh$1(time);
+}
+function onMouseMove(event) {
+	if (!event.isTrusted) return;
+	const x = event.clientX;
+	const y = event.clientY;
+	if (isNaN(_mouseX)) {
+		_mouseX = x;
+		_mouseY = y;
+		return;
+	}
+	if (Math.hypot(x - _mouseX, y - _mouseY) < MOUSE_MOVE_PX) return;
+	_mouseX = x;
+	_mouseY = y;
+	_lastMouseAt = performance.now();
+	if (_active$3) exit();
+}
+/**
+* @param {object} [options]
+* @param {function(Element): boolean} [options.pickSlot] opens the gamepad slot picker for an
+*   inventory item or a skill (JoystickInteractionService.openSelectionWindow): X's "Gamepad slot…"
+*/
+function prepare(options) {
+	_pickSlot = options && options.pickSlot || null;
+	if (_listening || typeof window === "undefined") return;
+	window.addEventListener("mousemove", onMouseMove, { passive: true });
+	_listening = true;
+}
+function dispose$1() {
+	JoystickKeyboard_default.close();
+	exit();
+	if (_listening) {
+		window.removeEventListener("mousemove", onMouseMove);
+		_listening = false;
+	}
+	JoystickFocusOverlay_default.dispose();
+	_down = [];
+	_downAt = [];
+	_used = [];
+	_claimed = /* @__PURE__ */ new Set();
+	_armed = /* @__PURE__ */ new Set();
+	_dialogs = /* @__PURE__ */ new Set();
+	_known = /* @__PURE__ */ new Set();
+	_followUntil = -Infinity;
+	_scanAt = -Infinity;
+	_hintsAt = -Infinity;
+	_lostAt = -Infinity;
+	_lastPadAt = 0;
+	_lastMouseAt = 0;
+	_mouseX = NaN;
+	_mouseY = NaN;
+	_skillWait = false;
+	_viewHoldFired = false;
+	_viewArmed = false;
+	_afterRelease = [];
+	_pickSlot = null;
+}
+var BTN, DPAD, MODIFIERS, HOLD_MS, TAP_MS, REPEAT_DELAY_MS, REPEAT_EVERY_MS, SCAN_EVERY_MS, FOLLOW_MS, TAB_FOCUS_MS, HINTS_EVERY_MS, MOUSE_MOVE_PX, ACTIVITY_AXIS, CLOSE, _active$3, _auto, _win, _el, _key, _ordinal, _detached, _visited, _lastKey, _down, _downAt, _used, _claimed, _armed, _repeatButton, _repeatAt, _viewHoldFired, _viewArmed, _xHoldFired, _xTaken, _dialogs, _known, _followUntil, _scanAt, _frameTime, _hintsAt, _lostAt, _skillWait, _tabFocus, _afterRelease, _pickSlot, _lastPadAt, _lastMouseAt, _mouseX, _mouseY, _listening, JoystickUIFocus_default;
+var init_JoystickUIFocus = __esmMin((() => {
+	init_Controls();
+	init_MouseEventHandler();
+	init_UIManager();
+	init_JoystickButtonMap();
+	init_JoystickFocusScan();
+	init_JoystickSpatialNav();
+	init_JoystickFocusOverlay();
+	init_JoystickDomEvents();
+	init_JoystickMouseCursorAdapter();
+	init_JoystickEmoteGrid();
+	init_JoystickSelectionUI();
+	init_JoystickStickFilter();
+	init_JoystickCarry();
+	init_JoystickFocusTabs();
+	init_JoystickActionMenu();
+	init_JoystickValueInput();
+	init_JoystickKeyboard();
+	BTN = JoystickButtonMap_default.BUTTON;
+	DPAD = {
+		[BTN.UP]: "up",
+		[BTN.DOWN]: "down",
+		[BTN.LEFT]: "left",
+		[BTN.RIGHT]: "right"
+	};
+	MODIFIERS = [
+		BTN.LB,
+		BTN.RB,
+		BTN.LT,
+		BTN.RT
+	];
+	HOLD_MS = 400;
+	TAP_MS = 400;
+	REPEAT_DELAY_MS = 350;
+	REPEAT_EVERY_MS = 90;
+	SCAN_EVERY_MS = 100;
+	FOLLOW_MS = 600;
+	TAB_FOCUS_MS = 600;
+	HINTS_EVERY_MS = 150;
+	MOUSE_MOVE_PX = 6;
+	ACTIVITY_AXIS = .3;
+	CLOSE = [
+		".titlebar .close",
+		"ui-button.close",
+		"button.close",
+		".btn.close",
+		".close",
+		".btn.cancel",
+		".cancel",
+		".closeswap"
+	];
+	_active$3 = false;
+	_auto = false;
+	_win = null;
+	_el = null;
+	_key = null;
+	_ordinal = 0;
+	_detached = false;
+	_visited = [];
+	_lastKey = /* @__PURE__ */ new WeakMap();
+	_down = [];
+	_downAt = [];
+	_used = [];
+	_claimed = /* @__PURE__ */ new Set();
+	_armed = /* @__PURE__ */ new Set();
+	_repeatButton = -1;
+	_repeatAt = 0;
+	_viewHoldFired = false;
+	_viewArmed = false;
+	_xHoldFired = false;
+	_xTaken = false;
+	_dialogs = /* @__PURE__ */ new Set();
+	_known = /* @__PURE__ */ new Set();
+	_followUntil = -Infinity;
+	_scanAt = -Infinity;
+	_frameTime = 0;
+	_hintsAt = -Infinity;
+	_lostAt = -Infinity;
+	_skillWait = false;
+	_tabFocus = null;
+	_afterRelease = [];
+	_pickSlot = null;
+	_lastPadAt = 0;
+	_lastMouseAt = 0;
+	_mouseX = NaN;
+	_mouseY = NaN;
+	_listening = false;
+	JoystickUIFocus_default = {
+		prepare,
+		dispose: dispose$1,
+		frame: frame$1,
+		enter(win) {
+			return enter(win || null, false);
+		},
+		exit,
+		toggle,
+		focusComponent,
+		/**
+		* The right stick moved the cursor (JoystickCursorMotion), in menus.
+		*/
+		cursorMoved() {
+			if (_active$3) {
+				followCursor();
+				refresh$1();
+			}
+		},
+		isActive() {
+			return _active$3;
+		},
+		/**
+		* Whether a button belongs to menu navigation: down while it was on, and
+		* not let go since. JoystickButtonInput keeps such a press off the map.
+		*
+		* @param {number} button logical button
+		* @return {boolean}
+		*/
+		isClaimed(button) {
+			return _active$3 || _claimed.has(button);
+		},
+		/**
+		* The focused element and window, for tests and the settings window.
+		*/
+		getFocus() {
+			return {
+				win: _win,
+				el: _el,
+				detached: _detached,
+				auto: _auto,
+				carrying: JoystickCarry_default.isCarrying()
+			};
+		}
 	};
 }));
 //#endregion
@@ -238518,6 +246492,7 @@ var init_JoystickInteractionService = __esmMin((() => {
 	init_JoystickTargetCategory();
 	init_JoystickSupportMode();
 	init_JoystickEmoteGrid();
+	init_JoystickUIFocus();
 	SELF_CAST_HOLD_MS = 300;
 	HOLD_POLL_MS = 30;
 	selfCastWatch = 0;
@@ -238785,13 +246760,17 @@ var init_JoystickInteractionService = __esmMin((() => {
 		},
 		/**
 		* Open or close a window, as its keyboard shortcut does (Alt+E, ...).
+		* A window opened this way gets the menu focus (JoystickUIFocus).
 		*
 		* @param {string} name UIManager component name
 		*/
 		toggleWindow: function(name) {
 			try {
 				const component = UIManager.getComponent(name);
-				if (component && component.onShortCut) component.onShortCut({ cmd: "TOGGLE" });
+				if (component && component.onShortCut) {
+					component.onShortCut({ cmd: "TOGGLE" });
+					JoystickUIFocus_default.focusComponent(component);
+				}
 			} catch {}
 		},
 		rightClick: function(holding) {
@@ -238945,7 +246924,7 @@ function setClickLock() {
 		clickLock = false;
 	}, lockTimeout);
 }
-var clickLock, lockTimeout, CAMERA_STEP_SMALL, CAMERA_STEP_LARGE, STICK_HOLD_MS, rsDownAt, rsHoldFired, lsDownAt, lsHoldFired, menuDownAt, menuHoldFired, GRID_BUTTONS, gridHeld, ButtonInput;
+var clickLock, lockTimeout, CAMERA_STEP_SMALL, CAMERA_STEP_LARGE, STICK_HOLD_MS, rsDownAt, rsHoldFired, lsDownAt, lsHoldFired, menuDownAt, menuHoldFired, GRID_BUTTONS, gridHeld, MENU_BUTTONS, keyboardHeld, ButtonInput;
 var init_JoystickButtonInput = __esmMin((() => {
 	init_JoystickShortcutMapper();
 	init_JoystickInteractionService();
@@ -238953,6 +246932,8 @@ var init_JoystickButtonInput = __esmMin((() => {
 	init_JoystickUIRenderer();
 	init_JoystickSelectionUI();
 	init_Controls();
+	init_JoystickUIFocus();
+	init_JoystickKeyboard();
 	clickLock = false;
 	lockTimeout = 200;
 	CAMERA_STEP_SMALL = 45;
@@ -238973,8 +246954,29 @@ var init_JoystickButtonInput = __esmMin((() => {
 		5
 	];
 	gridHeld = [];
+	MENU_BUTTONS = [
+		0,
+		1,
+		2,
+		3,
+		12,
+		13,
+		14,
+		15
+	];
+	keyboardHeld = [];
 	ButtonInput = {
 		update: function(buttons) {
+			if (JoystickKeyboard_default.isOpen()) {
+				keyboardHeld = [];
+				for (let i = 0; i < buttons.length; i++) if (buttons[i] && buttons[i] !== "unpressed") keyboardHeld.push(i);
+				menuDownAt = 0;
+				return true;
+			}
+			if (keyboardHeld.length) {
+				keyboardHeld = keyboardHeld.filter((i) => buttons[i] && buttons[i] !== "unpressed");
+				if (keyboardHeld.length) return false;
+			}
 			if (JoystickInteractionService_default.isEmoteGridOpen()) {
 				menuDownAt = buttons[9] !== "unpressed" ? menuDownAt || Date.now() : 0;
 				menuHoldFired = true;
@@ -238996,13 +246998,29 @@ var init_JoystickButtonInput = __esmMin((() => {
 			}
 			let pressed = false;
 			JoystickUIRenderer_default.updateVisuals(buttons);
-			pressed |= this._handleSpecial(buttons);
+			const world = this._withoutMenuButtons(buttons);
+			pressed |= this._handleSpecial(buttons, world);
 			pressed |= this._handleSetChange(buttons);
 			if (!pressed) {
-				pressed |= this._handleWorldActions(buttons);
+				pressed |= this._handleWorldActions(world);
 				pressed |= this._handleShortcuts(buttons);
 			}
 			return pressed;
+		},
+		/**
+		* The button states with A, B, X, Y and the D-pad let go while menu
+		* navigation has them (JoystickUIFocus): it reads them itself, every frame.
+		*/
+		_withoutMenuButtons: function(buttons) {
+			let out = buttons;
+			for (let i = 0; i < MENU_BUTTONS.length; i++) {
+				const index = MENU_BUTTONS[i];
+				if (buttons[index] && buttons[index] !== "unpressed" && JoystickUIFocus_default.isClaimed(index)) {
+					if (out === buttons) out = buttons.slice();
+					out[index] = "unpressed";
+				}
+			}
+			return out;
 		},
 		_handleWorldActions: function(btn) {
 			let pressed = false;
@@ -239091,7 +247109,11 @@ var init_JoystickButtonInput = __esmMin((() => {
 				return true;
 			}
 			if (menuDownAt) {
-				if (!menuHoldFired && !JoystickSelectionUI_default.active()) JoystickInteractionService_default.enter();
+				if (!menuHoldFired && !JoystickSelectionUI_default.active()) {
+					const typing = JoystickKeyboard_default.focusedField();
+					JoystickInteractionService_default.enter();
+					JoystickKeyboard_default.openIfFocused(typing);
+				}
 				menuDownAt = 0;
 				return true;
 			}
@@ -239109,7 +247131,13 @@ var init_JoystickButtonInput = __esmMin((() => {
 			}
 			return false;
 		},
-		_handleSpecial: function(buttons) {
+		/**
+		* View combos, and the D-pad.
+		*
+		* @param {Array<string>} buttons button states
+		* @param {Array<string>} [world] the same without what menu navigation has
+		*/
+		_handleSpecial: function(buttons, world = buttons) {
 			let pressed = false;
 			if (buttons[8] === "holding") {
 				if (buttons[12] !== "unpressed" || buttons[13] !== "unpressed" || buttons[14] !== "unpressed" || buttons[15] !== "unpressed") return true;
@@ -239133,22 +247161,22 @@ var init_JoystickButtonInput = __esmMin((() => {
 				} else if (buttons[3] === "pressed") {
 					JoystickInteractionService_default.toggleWindow("WinStats");
 					pressed = true;
-				} else pressed = JoystickInteractionService_default.showinfo();
+				}
 				if (pressed) {
 					setClickLock();
 					return pressed;
 				}
 			}
-			if (buttons[12] !== "unpressed") {
+			if (world[12] !== "unpressed") {
 				JoystickInteractionService_default.navigateDpad("up");
 				pressed = true;
-			} else if (buttons[13] !== "unpressed") {
+			} else if (world[13] !== "unpressed") {
 				JoystickInteractionService_default.navigateDpad("down");
 				pressed = true;
-			} else if (buttons[14] !== "unpressed") {
+			} else if (world[14] !== "unpressed") {
 				JoystickInteractionService_default.cycleTarget("prev");
 				pressed = true;
-			} else if (buttons[15] !== "unpressed") {
+			} else if (world[15] !== "unpressed") {
 				JoystickInteractionService_default.cycleTarget("next");
 				pressed = true;
 			}
@@ -239188,12 +247216,17 @@ var init_JoystickAxisInput = __esmMin((() => {
 	init_JoystickInteractionService();
 	init_Controls();
 	init_JoystickUIRenderer();
+	init_JoystickKeyboard();
 	REBOUND_MS = 250;
 	REBOUND_MAX = .6;
 	MOVE_MIN = .5;
 	lastMove = null;
 	lastMoveAt = 0;
 	JoystickAxisInput_default = { update: function(axes) {
+		if (JoystickKeyboard_default.isOpen()) {
+			JoystickInteractionService_default.releaseStick();
+			return true;
+		}
 		let active = false;
 		let lx = axes[0];
 		let ly = axes[1];
@@ -239221,163 +247254,6 @@ var init_JoystickAxisInput = __esmMin((() => {
 		if (active) JoystickUIRenderer_default.show();
 		return active;
 	} };
-}));
-//#endregion
-//#region src/UI/Components/JoystickUI/JoystickStickFilter.js
-/**
-* Subtract the rest position, stretching each side back to the full range.
-*
-* @param {number} value raw axis value, -1..1
-* @param {number} center measured rest position
-* @return {number}
-*/
-function recenter(value, center) {
-	if (!center) return value;
-	const v = value - center;
-	const range = v > 0 ? 1 - center : 1 + center;
-	return Math.max(-1, Math.min(1, v / range));
-}
-/**
-* Treat values within the threshold as centre; rescale the rest to 0..1.
-*
-* @param {number} value axis value, -1..1
-* @param {number} threshold 0..1
-* @return {number}
-*/
-function applyThreshold(value, threshold) {
-	if (!threshold || threshold <= 0) return value;
-	const magnitude = Math.abs(value);
-	if (magnitude <= threshold || threshold >= 1) return 0;
-	return Math.sign(value) * (magnitude - threshold) / (1 - threshold);
-}
-/**
-* The stored rest positions, or null when not calibrated.
-*
-* @return {Array<number>|null}
-*/
-function getCenter() {
-	const center = Controls_default.joyStickCenter;
-	if (!Array.isArray(center) || center.length !== AXIS_COUNT || !center.every(Number.isFinite)) return null;
-	return center;
-}
-/**
-* Cleaned copy of a gamepad's axes. Axes past the two sticks pass through.
-*
-* @param {ArrayLike<number>} axes Gamepad.axes
-* @return {Array<number>}
-*/
-function filterAxes(axes) {
-	const center = getCenter();
-	const out = Array.from(axes);
-	for (let i = 0; i < Math.min(AXIS_COUNT, out.length); i++) {
-		const value = recenter(out[i], center ? center[i] : 0);
-		out[i] = applyThreshold(value, Controls_default[DRIFT_KEYS[i]]);
-	}
-	return out;
-}
-/**
-* Average rest position per axis from calibration samples, or null if a
-* stick was touched while they were taken.
-*
-* @param {Array<Array<number>>} samples raw axes, one array per read
-* @return {Array<number>|null}
-*/
-function computeCenter(samples) {
-	if (!samples.length) return null;
-	const center = [];
-	for (let i = 0; i < AXIS_COUNT; i++) {
-		let sum = 0;
-		for (const sample of samples) {
-			const value = sample[i] || 0;
-			if (Math.abs(value) > CALIBRATE_MAX_OFFSET) return null;
-			sum += value;
-		}
-		center.push(sum / samples.length);
-	}
-	return center;
-}
-function getGamepad$1() {
-	const gamepads = navigator.getGamepads ? navigator.getGamepads() : [];
-	for (let i = 0; i < gamepads.length; i++) if (gamepads[i]) return gamepads[i];
-	return null;
-}
-/**
-* Stop a running calibration without saving.
-*/
-function cancelCalibration() {
-	if (_calibration) {
-		clearInterval(_calibration);
-		_calibration = null;
-	}
-}
-/**
-* Read both sticks for a second while the player leaves them alone, and
-* store their rest positions.
-*
-* @param {function(string)} done called with 'ok', 'moved' (a stick was
-*   touched, nothing saved) or 'nopad'
-*/
-function calibrate(done) {
-	cancelCalibration();
-	if (!getGamepad$1()) {
-		done("nopad");
-		return;
-	}
-	const samples = [];
-	const startedAt = Date.now();
-	_calibration = setInterval(function() {
-		const gp = getGamepad$1();
-		if (!gp) {
-			cancelCalibration();
-			done("nopad");
-			return;
-		}
-		samples.push(Array.from(gp.axes).slice(0, AXIS_COUNT));
-		if (Date.now() - startedAt < CALIBRATE_DURATION_MS) return;
-		cancelCalibration();
-		const center = computeCenter(samples);
-		if (!center) {
-			done("moved");
-			return;
-		}
-		Controls_default.joyStickCenter = center;
-		Controls_default.save();
-		done("ok");
-	}, CALIBRATE_INTERVAL_MS);
-}
-/**
-* Forget the calibration.
-*/
-function resetCalibration() {
-	cancelCalibration();
-	Controls_default.joyStickCenter = null;
-	Controls_default.save();
-}
-var DRIFT_KEYS, AXIS_COUNT, CALIBRATE_INTERVAL_MS, CALIBRATE_DURATION_MS, CALIBRATE_MAX_OFFSET, _calibration, JoystickStickFilter_default;
-var init_JoystickStickFilter = __esmMin((() => {
-	init_Controls();
-	DRIFT_KEYS = [
-		"joyDriftLX",
-		"joyDriftLY",
-		"joyDriftRX",
-		"joyDriftRY"
-	];
-	AXIS_COUNT = DRIFT_KEYS.length;
-	CALIBRATE_INTERVAL_MS = 50;
-	CALIBRATE_DURATION_MS = 1e3;
-	CALIBRATE_MAX_OFFSET = .5;
-	_calibration = null;
-	JoystickStickFilter_default = {
-		DRIFT_KEYS,
-		recenter,
-		applyThreshold,
-		filterAxes,
-		computeCenter,
-		getCenter,
-		calibrate,
-		cancelCalibration,
-		resetCalibration
-	};
 }));
 //#endregion
 //#region src/UI/Components/JoystickUI/JoystickInputService.js
@@ -239887,7 +247763,29 @@ function getMappingCombos() {
 			n(B.X),
 			n(B.Y)
 		].join(" / "), "Inventory / equipment / skills / status"],
-		[n(B.VIEW) + " (cursor on item/skill)", "Context menu"],
+		[n(B.VIEW) + " (hold, cursor on item/skill)", "Item / skill info"],
+		[n(B.VIEW) + " (tap)", "Menu navigation on / off"],
+		[[
+			n(B.UP),
+			n(B.DOWN),
+			n(B.LEFT),
+			n(B.RIGHT)
+		].join(" / ") + " (menus)", "Move between buttons, items and windows; left / right change sliders and lists"],
+		[n(B.LT) + " / " + n(B.RT) + " (tap, menus)", "Previous / next window"],
+		[n(B.LB) + " / " + n(B.RB) + " (tap, menus)", "Previous / next tab"],
+		[n(B.A) + " on a text field (menus)", "On-screen keyboard: " + [
+			n(B.A) + " type",
+			n(B.X) + " delete",
+			n(B.Y) + " space",
+			n(B.LB) + " / " + n(B.RB) + " caret",
+			n(B.LT) + " shift",
+			n(B.RT) + " signs",
+			n(B.VIEW) + " phrases",
+			n(B.RS) + " grid / wheel",
+			n(B.MENU) + " done",
+			n(B.B) + " close"
+		].join(", ")],
+		[n(B.X) + " (menus)", "Tap: more actions (store some, gamepad slot, drop...) - Hold: pick up; " + n(B.A) + " puts it down, " + n(B.B) + " puts it back"],
 		[n(B.LB) + " / " + n(B.RB) + " / " + n(B.LT) + " / " + n(B.RT) + " + " + faces + " (hold)", "Support: the support skill on yourself"],
 		[n(B.UP) + " / " + n(B.DOWN) + " / " + n(B.LEFT) + " / " + n(B.RIGHT) + " (emotes open)", "Choose an emote"],
 		[[
@@ -240079,6 +247977,10 @@ function onUpdateDisableVirtualMouse() {
 	Controls_default.joyDisableVirtualMouse = !!this.checked;
 	Controls_default.save();
 }
+function onUpdateUIFocus() {
+	Controls_default.joyUIFocus = !!this.checked;
+	Controls_default.save();
+}
 var JOY_RANGES, JOY_CHECKBOXES, ShortCutOption, ShortCuts$1, ShortCutsTemp, _preferences$33, MAPPING_ROLES, ShortCutOption_default;
 var init_ShortCutOption = __esmMin((() => {
 	init_KeyEventHandler();
@@ -240110,7 +248012,8 @@ var init_ShortCutOption = __esmMin((() => {
 		"joyAimHideCursor",
 		"joyReverseStick",
 		"joyAutoHide",
-		"joyDisableVirtualMouse"
+		"joyDisableVirtualMouse",
+		"joyUIFocus"
 	];
 	ShortCutOption = new GUIComponent("ShortCutOption", ShortCutOption_default$1);
 	ShortCuts$1 = ShortCutControls_default.ShortCuts;
@@ -240221,6 +248124,7 @@ var init_ShortCutOption = __esmMin((() => {
 		bindChange(".joyReverseStick", onUpdateReverseStick);
 		bindChange(".joyAutoHide", onUpdateAutoHide);
 		bindChange(".joyDisableVirtualMouse", onUpdateDisableVirtualMouse);
+		bindChange(".joyUIFocus", onUpdateUIFocus);
 		const resetBtn = root.querySelector(".button.reset");
 		if (resetBtn) resetBtn.addEventListener("click", function() {
 			resetKeysToDefault();
@@ -240324,21 +248228,21 @@ var init_ShortCutOption = __esmMin((() => {
 		}
 	};
 	MAPPING_ROLES = [
-		[JoystickButtonMap_default.BUTTON.A, "Click / confirm - selected NPC: talk, selected player: shop or menu (Support radial: cast the waiting skill on the chosen member)"],
-		[JoystickButtonMap_default.BUTTON.B, "Right click (hold on item/skill: options) - Support radial: close it, or cancel the waiting skill - player menu: close it"],
-		[JoystickButtonMap_default.BUTTON.X, "Attack target"],
-		[JoystickButtonMap_default.BUTTON.Y, "Pick up item"],
-		[JoystickButtonMap_default.BUTTON.LEFT, "Previous target (Support: party member; grid left on items)"],
-		[JoystickButtonMap_default.BUTTON.RIGHT, "Next target (Support: party member, lowest HP first; grid right on items)"],
-		[JoystickButtonMap_default.BUTTON.UP, "Previous target category (up in item grids and NPC menus)"],
-		[JoystickButtonMap_default.BUTTON.DOWN, "Next target category (down in item grids and NPC menus)"],
+		[JoystickButtonMap_default.BUTTON.A, "Click / confirm - selected NPC: talk, selected player: shop or menu (Support radial: cast the waiting skill on the chosen member) - menus: press, use, equip, put down what is carried"],
+		[JoystickButtonMap_default.BUTTON.B, "Right click (hold on item/skill: options) - Support radial: close it, or cancel the waiting skill - menus: back (info windows first), cancel, close, put back what is carried"],
+		[JoystickButtonMap_default.BUTTON.X, "Attack target - menus: tap: more actions, hold: pick up"],
+		[JoystickButtonMap_default.BUTTON.Y, "Pick up item - menus: item / skill info"],
+		[JoystickButtonMap_default.BUTTON.LEFT, "Previous target (Support: party member; grid left on items) - menus: move left (sliders and lists: lower / previous)"],
+		[JoystickButtonMap_default.BUTTON.RIGHT, "Next target (Support: party member, lowest HP first; grid right on items) - menus: move right (sliders and lists: higher / next)"],
+		[JoystickButtonMap_default.BUTTON.UP, "Previous target category (menus: move up)"],
+		[JoystickButtonMap_default.BUTTON.DOWN, "Next target category (menus: move down)"],
 		[JoystickButtonMap_default.BUTTON.LS, "Tap: clear target - Hold: sit / stand"],
 		[JoystickButtonMap_default.BUTTON.RS, () => Controls_default.joyAimEnabled ? "Tap: right stick aim/cursor - Hold: recenter cursor" : "Recenter cursor"],
-		[JoystickButtonMap_default.BUTTON.MENU, "Tap: Enter - Hold: emotes"],
-		[JoystickButtonMap_default.BUTTON.VIEW, "Camera & menu modifier"],
-		[JoystickButtonMap_default.BUTTON.LB, "Shortcuts: skill bar 1, slots 1-4"],
+		[JoystickButtonMap_default.BUTTON.MENU, "Tap: Enter (the chat opens with the on-screen keyboard) - Hold: emotes"],
+		[JoystickButtonMap_default.BUTTON.VIEW, "Tap: menu navigation - Hold: info at the cursor - Camera & window modifier"],
+		[JoystickButtonMap_default.BUTTON.LB, "Shortcuts: skill bar 1, slots 1-4 - menus (tap): previous tab"],
 		[JoystickButtonMap_default.BUTTON.LT, "Shortcuts: skill bar 1, slots 5-8"],
-		[JoystickButtonMap_default.BUTTON.RB, "Shortcuts: skill bar 2, slots 1-4"],
+		[JoystickButtonMap_default.BUTTON.RB, "Shortcuts: skill bar 2, slots 1-4 - menus (tap): next tab"],
 		[JoystickButtonMap_default.BUTTON.RT, "Shortcuts: skill bar 2, slots 5-8"]
 	];
 	ShortCutOption.mouseMode = GUIComponent.MouseMode.STOP;
@@ -245458,7 +253362,7 @@ function calculateAnimation(layer, keyIndex, result) {
 	}
 	return true;
 }
-var mat4$18, D3DBLEND, _program$22, _buffer$17, _bufferData, _matrix$6, _lastAngle, PIXEL_TO_WORLD_Z, anim, StrEffect;
+var mat4$18, D3DBLEND, _program$22, _buffer$17, _bufferData, _users, _matrix$6, _lastAngle, PIXEL_TO_WORLD_Z, anim, StrEffect;
 var init_StrEffect = __esmMin((() => {
 	init_StrEffect$2();
 	init_StrEffect$1();
@@ -245470,6 +253374,7 @@ var init_StrEffect = __esmMin((() => {
 	_program$22 = null;
 	_buffer$17 = null;
 	_bufferData = /* @__PURE__ */ new Float32Array(16);
+	_users = /* @__PURE__ */ new Set();
 	_matrix$6 = mat4$18.create();
 	_lastAngle = -1;
 	PIXEL_TO_WORLD_Z = 1 / 5;
@@ -245665,6 +253570,7 @@ var init_StrEffect = __esmMin((() => {
 			D3DBLEND[11] = gl.SRC_ALPHA_SATURATE;
 			D3DBLEND[14] = gl.CONSTANT_COLOR;
 			D3DBLEND[15] = gl.ONE_MINUS_CONSTANT_ALPHA;
+			_users.add(this);
 			this.ready = true;
 		}
 		/**
@@ -245673,6 +253579,9 @@ var init_StrEffect = __esmMin((() => {
 		* @param {object} webgl context
 		*/
 		static free(gl) {
+			this.ready = false;
+			_users.delete(this);
+			if (_users.size) return;
 			if (_program$22) {
 				gl.deleteProgram(_program$22);
 				_program$22 = null;
@@ -245681,7 +253590,6 @@ var init_StrEffect = __esmMin((() => {
 				gl.deleteBuffer(_buffer$17);
 				_buffer$17 = null;
 			}
-			this.ready = false;
 		}
 		/**
 		* Bind context
@@ -247560,29 +255468,6 @@ var init_WriteRodex = __esmMin((() => {
 	WriteRodex_default = UIManager.addComponent(WriteRodex);
 }));
 //#endregion
-//#region src/UI/Components/Inventory/InventoryItemTransfer.js
-/**
-* Transfer an inventory item stack to the active receivers, highest priority first.
-* A receiver that declines the item lets the next one (or the caller's fallback) handle it.
-*
-* @param {object} item Inventory item
-* @param {object} components Registered UI components
-* @returns {boolean} Whether a receiver handled the request
-*/
-function transferInventoryItemStack(item, components) {
-	if (!item || !components) return false;
-	return Object.values(components).filter((component) => {
-		return component?.__active && component._host?.isConnected && component._host.style.display !== "none" && typeof component.receiveInventoryItemStack === "function";
-	}).sort((a, b) => (b.inventoryTransferPriority || 0) - (a.inventoryTransferPriority || 0)).some((receiver) => receiver.receiveInventoryItemStack(item) === true);
-}
-var InventoryItemTransferPriority;
-var init_InventoryItemTransfer = __esmMin((() => {
-	InventoryItemTransferPriority = Object.freeze({
-		TRADE: 300,
-		NPC_STORE: 400
-	});
-}));
-//#endregion
 //#region src/UI/Components/Inventory/InventoryCommon.js
 function _sanitizeHtml$7(str) {
 	const whitelist = [
@@ -247963,6 +255848,15 @@ function createInventory(config) {
 		const list = Component.list;
 		for (let i = 0, count = list.length; i < count; ++i) if (list[i].index === index) return list[i];
 		return null;
+	};
+	/**
+	* The open tab (Component.TAB), its place among the tab buttons. V0 draws
+	* it as one picture, so only this says which it is (gamepad LB / RB).
+	*
+	* @returns {number}
+	*/
+	Component.getTab = function getTab() {
+		return _preferences.tab;
 	};
 	/**
 	* Get the TAB constant for a given item based on its type.
@@ -256540,6 +264434,9 @@ function onGuildInfo(pkt) {
 function onGuildAccess(pkt) {
 	Guild_default.setAccess(pkt.guildMemuFlag);
 }
+function isCurrentGuildOwner(entity, guildId) {
+	return !!entity && SessionStorage_default.Entity === entity && entity.GUID === guildId;
+}
 /**
 * Get informations about our user in the guild
 *
@@ -256565,8 +264462,9 @@ function onGuildOwnInfo(pkt) {
 		_pendingGuildSkillRequest = false;
 		GuildEngine.requestInfo(3);
 	}
+	const owner = SessionStorage_default.Entity;
 	if (pkt.GDID && pkt.emblemVersion) GuildEngine.requestGuildEmblem(pkt.GDID, pkt.emblemVersion, (image, gif) => {
-		SessionStorage_default.Entity.setEntityGuildEmblem(image, gif);
+		if (isCurrentGuildOwner(owner, pkt.GDID) && owner.GEmblemVer !== 0) owner.setEntityGuildEmblem(image, gif);
 	});
 }
 /**
@@ -256587,13 +264485,25 @@ function onGuildRelation(pkt) {
 * @param {object} pkt - PACKET.ZC.CHANGE_GUILD | PACKET.ZC.CHANGE_GUILD2
 */
 function onGuildEmblemChanged(pkt) {
+	const entity = pkt.AID === void 0 ? null : EntityManager.get(pkt.AID);
+	if (entity) {
+		const changedGuild = entity.GUID !== pkt.GDID;
+		entity.GUID = pkt.GDID;
+		entity.GEmblemVer = pkt.emblemVersion;
+		if (changedGuild || !pkt.GDID || !pkt.emblemVersion) {
+			entity.setEntityGuildEmblem(null, null);
+			if (entity.emblem) entity.emblem.display = false;
+		}
+		const emblem = _emblems[pkt.GDID];
+		if (pkt.GDID && pkt.emblemVersion && emblem?.ready && emblem.version >= pkt.emblemVersion) entity.setEntityGuildEmblem(emblem.image, emblem.gif);
+	}
+	const owner = SessionStorage_default.Entity;
+	if (owner?.GUID === pkt.GDID) owner.GEmblemVer = pkt.emblemVersion;
 	if (!pkt.GDID || !pkt.emblemVersion) return;
 	if (_emblemNotified[pkt.GDID] === pkt.emblemVersion) return;
 	_emblemNotified[pkt.GDID] = pkt.emblemVersion;
-	const isOwnGuild = pkt.GDID === SessionStorage_default.Entity.GUID;
-	if (isOwnGuild) SessionStorage_default.Entity.GEmblemVer = pkt.emblemVersion;
 	GuildEngine.requestGuildEmblem(pkt.GDID, pkt.emblemVersion, (image) => {
-		if (isOwnGuild) Guild_default.setEmblem(image);
+		if (isCurrentGuildOwner(owner, pkt.GDID) && owner.GEmblemVer !== 0) Guild_default.setEmblem(image);
 	}, () => {
 		if (_emblemNotified[pkt.GDID] === pkt.emblemVersion) delete _emblemNotified[pkt.GDID];
 	});
@@ -257060,15 +264970,16 @@ var init_Guild = __esmMin((() => {
 			const failed = onFailure || function() {};
 			if (!_emblems[guild_id]) _emblems[guild_id] = {
 				version: -1,
+				ready: false,
 				image: new Image(),
 				gif: null,
 				callback: []
 			};
-			if (SessionStorage_default.Entity.GUID === guild_id) GuildEngine.guild_id = guild_id;
+			if (SessionStorage_default.Entity?.GUID === guild_id) GuildEngine.guild_id = guild_id;
 			const emblem = _emblems[guild_id];
-			if (version <= emblem.version) {
+			if (version <= emblem.version && emblem.ready) {
 				EntityManager.forEach((entity) => {
-					if (entity.GUID === guild_id) entity.setEntityGuildEmblem(emblem.image, emblem.gif);
+					if (entity.GUID === guild_id && entity.GEmblemVer !== 0) entity.setEntityGuildEmblem(emblem.image, emblem.gif);
 				});
 				callback(emblem.image, emblem.gif);
 				return;
@@ -257091,14 +265002,15 @@ var init_Guild = __esmMin((() => {
 				xhr.timeout = 5e3;
 				const commit = (img, gifCanvas) => {
 					if (version < emblem.version) return;
-					if (version > emblem.version) {
+					if (version > emblem.version || !emblem.ready) {
 						emblem.version = version;
 						emblem.image = img;
 						emblem.gif = gifCanvas;
+						emblem.ready = true;
 					}
 					callback(emblem.image, emblem.gif);
 					EntityManager.forEach((entity) => {
-						if (entity.GUID === guild_id) entity.setEntityGuildEmblem(emblem.image, emblem.gif);
+						if (entity.GUID === guild_id && entity.GEmblemVer !== 0) entity.setEntityGuildEmblem(emblem.image, emblem.gif);
 					});
 				};
 				xhr.onload = () => {
@@ -257348,6 +265260,8 @@ var init_Guild = __esmMin((() => {
 		* @see docs/reference/guild/emblem-picker.md
 		*/
 		static sendEmblem(data) {
+			const owner = SessionStorage_default.Entity;
+			const guildId = owner.GUID;
 			if (PacketVerManager_default.value >= 20170315) {
 				function getFileType(_data) {
 					if (_data.length >= 3 && _data[0] === 71 && _data[1] === 73 && _data[2] === 70) return {
@@ -257361,7 +265275,7 @@ var init_Guild = __esmMin((() => {
 				}
 				const fileInfo = getFileType(data);
 				const formData = new FormData();
-				formData.append("GDID", SessionStorage_default.Entity.GUID);
+				formData.append("GDID", guildId);
 				formData.append("WorldName", SessionStorage_default.ServerName);
 				formData.append("AuthToken", SessionStorage_default.WebToken);
 				formData.append("AID", SessionStorage_default.AID);
@@ -257379,15 +265293,16 @@ var init_Guild = __esmMin((() => {
 					}
 					try {
 						const response = JSON.parse(xhr.responseText);
+						if (!isCurrentGuildOwner(owner, guildId)) return;
 						console.log("Emblem uploaded successfully, version:", response.version);
 						if (PacketVerManager_default.value >= 20190724) {
 							const pkt = new PACKET.CZ.REQ_ADD_NEW_EMBLEM();
-							pkt.GDID = SessionStorage_default.Entity.GUID;
+							pkt.GDID = guildId;
 							pkt.version = response.version;
 							Network.sendPacket(pkt);
 						}
-						GuildEngine.requestGuildEmblem(SessionStorage_default.Entity.GUID, response.version, (image, _gif) => {
-							Guild_default.setEmblem(image);
+						GuildEngine.requestGuildEmblem(guildId, response.version, (image, _gif) => {
+							if (isCurrentGuildOwner(owner, guildId) && owner.GEmblemVer !== 0) Guild_default.setEmblem(image);
 						});
 					} catch (e) {
 						console.error("Error parsing emblem upload response:", e);
@@ -257418,6 +265333,7 @@ var init_Guild = __esmMin((() => {
 		return function(pkt) {
 			if (!_emblems[pkt.GDID]) _emblems[pkt.GDID] = {
 				version: -1,
+				ready: false,
 				image: new Image(),
 				gif: null,
 				callback: []
@@ -257425,9 +265341,11 @@ var init_Guild = __esmMin((() => {
 			const len = new Inflate(pkt.img).getBytes(data);
 			const src = URL.createObjectURL(new Blob([data.subarray(0, len).buffer], { type: "image/bmp" }));
 			const emblem = _emblems[pkt.GDID];
+			const owner = SessionStorage_default.Entity;
 			const img = new Image();
 			img.onload = renderEmblem;
 			emblem.version = pkt.emblemVersion;
+			emblem.ready = false;
 			img.decoding = "async";
 			Texture.load(src, function() {
 				img.src = this.toDataURL();
@@ -257435,10 +265353,11 @@ var init_Guild = __esmMin((() => {
 			function renderEmblem() {
 				emblem.image = this;
 				emblem.gif = null;
-				if (pkt.GDID === GuildEngine.guild_id) Guild_default.setEmblem(this);
+				emblem.ready = true;
+				if (isCurrentGuildOwner(owner, pkt.GDID) && owner.GEmblemVer !== 0) Guild_default.setEmblem(this);
 				while (emblem.callback.length) emblem.callback.shift().call(null, this, null);
 				EntityManager.forEach((entity) => {
-					if (entity.GUID === pkt.GDID) entity.setEntityGuildEmblem(img);
+					if (entity.GUID === pkt.GDID && entity.GEmblemVer !== 0) entity.setEntityGuildEmblem(img);
 				});
 			}
 		};
@@ -265078,7 +272997,7 @@ var init_EffectManager = __esmMin((() => {
 			if (typeof Params.effect.repeat !== "undefined" && Params.effect.repeat !== null) Params.Inst.persistent = Params.effect.repeat;
 			Params.Inst.repeatEnd = Params.Init.repeatEnd ? Params.Init.repeatEnd : Params.effect.repeatEnd || 0;
 			Params.Inst.repeatDelay = Params.effect.repeatDelay ? Params.effect.repeatDelay : Params.Init.repeatDelay;
-			if (Params.effect.wav) {
+			if (Params.effect.wav && !(Params.Inst.noDelay && Params.effect.soundLoop === false)) {
 				filename = Params.effect.wav;
 				if (Params.effect.rand) filename = filename.replace("%d", Math.round(Params.effect.rand[0] + (Params.effect.rand[1] - Params.effect.rand[0]) * Math.random()));
 				Events.setTimeout(function() {
@@ -266296,8 +274215,8 @@ function init$8(gl, mapname) {
 	if (_color) _display = true;
 	else _display = false;
 	gl.clearColor(color[0], color[1], color[2], color[3]);
-	if (!_textures$2.length && _display) {
-		_textures$2.length = 8;
+	if (!_textures$5.length && _display) {
+		_textures$5.length = 8;
 		for (i = 0; i < 7; i++) loadCloudTexture(gl, i);
 	}
 }
@@ -266310,7 +274229,7 @@ function init$8(gl, mapname) {
 function loadCloudTexture(gl, i) {
 	Client.loadFile("data/texture/effect/cloud" + (i + 1) + ".tga", function(buffer) {
 		WebGL_default.texture(gl, buffer, function(texture) {
-			_textures$2[i] = texture;
+			_textures$5[i] = texture;
 		});
 	});
 }
@@ -266327,7 +274246,7 @@ function setUpCloudData() {
 			death_tick: 0
 		};
 		cloudInit(_clouds[i]);
-		_clouds[i].sprite = Math.random() * (_textures$2.length - 1) | 0;
+		_clouds[i].sprite = Math.random() * (_textures$5.length - 1) | 0;
 		_clouds[i].death_tick = _clouds[i].born_tick + Math.random() * 8e3;
 		_clouds[i].born_tick -= 2e3;
 	}
@@ -266382,7 +274301,7 @@ function render$6(gl, modelView, projection, fog, tick) {
 		else opacity = 1;
 		SpriteRenderer.zIndex = 0;
 		SpriteRenderer.color[3] = opacity;
-		SpriteRenderer.image.texture = _textures$2[cloud.sprite];
+		SpriteRenderer.image.texture = _textures$5[cloud.sprite];
 		const dt = Math.min(tick - (cloud._lastTick || cloud.born_tick), 250);
 		cloud._lastTick = tick;
 		vec3$8.scaleAndAdd(cloud.position, cloud.position, cloud.direction, dt / 25);
@@ -266393,7 +274312,7 @@ function render$6(gl, modelView, projection, fog, tick) {
 	}
 	SpriteRenderer.unbind(gl);
 }
-var MAX_CLOUDS, _clouds, _textures$2, _color, _display, Sky_default;
+var MAX_CLOUDS, _clouds, _textures$5, _color, _display, Sky_default;
 var init_Sky = __esmMin((() => {
 	init_WebGL();
 	init_WeatherEffect();
@@ -266403,7 +274322,7 @@ var init_Sky = __esmMin((() => {
 	init_gl_matrix();
 	MAX_CLOUDS = 150;
 	_clouds = new Array(MAX_CLOUDS);
-	_textures$2 = [];
+	_textures$5 = [];
 	_color = null;
 	_display = true;
 	Sky_default = {
@@ -267005,13 +274924,22 @@ function frame(time) {
 	if (!gp) {
 		JoystickAimMode_default.release();
 		JoystickSupportMode_default.release();
+		JoystickKeyboard_default.close();
+		JoystickUIFocus_default.exit();
 		frameHandle = null;
 		return;
 	}
 	frameHandle = requestAnimationFrame(frame);
 	const dt = Math.min(MAX_DT, (time - lastTime) / 1e3);
 	lastTime = time;
-	if (dt > 0) JoystickCameraMotion_default.update(gp, dt);
+	const typing = JoystickKeyboard_default.isOpen();
+	if (dt > 0 && !typing) JoystickCameraMotion_default.update(gp, dt);
+	JoystickUIFocus_default.frame(gp, time);
+	if (typing) {
+		JoystickAimMode_default.release();
+		JoystickSupportMode_default.release();
+		return;
+	}
 	if (gp.axes.length < 4 || dt <= 0) {
 		JoystickAimMode_default.release();
 		JoystickSupportMode_default.release();
@@ -267026,11 +274954,14 @@ function frame(time) {
 	}
 	const magnitude = Math.hypot(x, y);
 	const deadzone = Controls_default.joyDeadline;
-	if (JoystickSupportMode_default.update(x, y, magnitude, deadzone)) {
+	if (JoystickUIFocus_default.isActive()) {
+		JoystickAimMode_default.release();
+		JoystickSupportMode_default.release();
+	} else if (JoystickSupportMode_default.update(x, y, magnitude, deadzone)) {
 		JoystickAimMode_default.release();
 		return;
 	}
-	if (JoystickAimMode_default.isActive()) {
+	if (!JoystickUIFocus_default.isActive() && JoystickAimMode_default.isActive()) {
 		JoystickAimMode_default.update(x, y, magnitude > deadzone);
 		return;
 	}
@@ -267039,6 +274970,7 @@ function frame(time) {
 	const scaled = Math.min(1, (magnitude - deadzone) / (1 - deadzone));
 	const step = scaled * scaled * Controls_default.joySense * SENSE_TO_PX_PER_SEC * dt / magnitude;
 	JoystickMouseCursorAdapter_default.moveBy(x * step, y * step);
+	if (JoystickUIFocus_default.isActive()) JoystickUIFocus_default.cursorMoved();
 }
 /**
 * Begin the frame loop if it is armed, not already running, and a pad is
@@ -267063,6 +274995,8 @@ var init_JoystickCursorMotion = __esmMin((() => {
 	init_JoystickStickFilter();
 	init_JoystickCameraMotion();
 	init_JoystickSupportMode();
+	init_JoystickUIFocus();
+	init_JoystickKeyboard();
 	SENSE_TO_PX_PER_SEC = 10;
 	MAX_DT = .05;
 	frameHandle = null;
@@ -267092,6 +275026,7 @@ var init_JoystickCursorMotion = __esmMin((() => {
 			}
 			JoystickAimMode_default.release();
 			JoystickSupportMode_default.release();
+			JoystickUIFocus_default.exit();
 		}
 	};
 }));
@@ -267138,11 +275073,13 @@ var init_JoystickModule = __esmMin((() => {
 	init_JoystickUIRenderer();
 	init_JoystickEmoteGrid();
 	init_JoystickTargetCategory();
+	init_JoystickUIFocus();
 	JoystickModule_default = {
 		prepare: function() {
 			JoystickShortcutMapper_default.prepare();
 			JoystickInputService_default.prepare();
 			JoystickInteractionService_default.prepare();
+			JoystickUIFocus_default.prepare({ pickSlot: (el) => JoystickInteractionService_default.openSelectionWindow(el) });
 			JoystickPollingLoop_default.start();
 			JoystickCursorMotion_default.start();
 			JoystickUIRenderer_default.hide();
@@ -267151,6 +275088,7 @@ var init_JoystickModule = __esmMin((() => {
 			JoystickPollingLoop_default.stop();
 			JoystickCursorMotion_default.stop();
 			JoystickInteractionService_default.dispose();
+			JoystickUIFocus_default.dispose();
 			JoystickInputService_default.dispose();
 			JoystickUIRenderer_default.dispose();
 			JoystickEmoteGrid_default.dispose();
@@ -268175,8 +276113,10 @@ function onAnimatedModelComplete(data) {
 * Register PostProcessing Modules in pass order
 */
 function registerPostProcessModules(gl) {
-	if (WebGL_default.detectBadWebGL(gl)) GraphicsSettings.bloom = false;
-	else PostProcess.register(Bloom, gl);
+	const badWebGL = WebGL_default.detectBadWebGL(gl);
+	if (badWebGL) GraphicsSettings.bloom = false;
+	if (PostProcess.isRegistered()) return;
+	if (!badWebGL) PostProcess.register(Bloom, gl);
 	PostProcess.register(GaussianBlur, gl);
 	PostProcess.registerExternal(gl);
 	PostProcess.register(FXAA, gl);
@@ -268351,19 +276291,30 @@ var init_MapRenderer = __esmMin((() => {
 				BGM.stop();
 				this.currentMap = mapname;
 				const filename = mapname.replace(/\.gat$/i, ".rsw");
+				let faded = false;
+				const waiting = [];
+				const afterFade = (fn) => (...args) => {
+					if (faded) fn(...args);
+					else waiting.push(() => fn(...args));
+				};
+				Thread.hook("MAP_PROGRESS", afterFade(loadEvent(onProgressUpdate)));
+				Thread.hook("MAP_WORLD", afterFade(loadEvent(onWorldComplete)));
+				Thread.hook("MAP_GROUND", afterFade(loadEvent(onGroundComplete)));
+				Thread.hook("MAP_ALTITUDE", afterFade(loadEvent(onAltitudeComplete)));
+				Thread.hook("MAP_MODELS", afterFade(loadEvent(onModelsComplete)));
+				Thread.hook("MAP_ANIMATED_MODEL", afterFade(loadEvent(onAnimatedModelComplete)));
+				Thread.hook("MAP_REPLACED_MODELS", afterFade(loadEvent((models) => MapHooks_default.modelsReady(Renderer.getContext(), models))));
+				Thread.send("MAP_REPLACE_MODELS", MapHooks_default.modelNames());
+				MapRenderer._loadRequest = Thread.send("LOAD_MAP", filename, afterFade(loadStep(loadId, onMapComplete)));
 				Background.setLoading(function() {
-					if (loadId !== MapRenderer._loadId) return;
-					Thread.hook("MAP_PROGRESS", loadEvent(onProgressUpdate));
-					Thread.hook("MAP_WORLD", loadEvent(onWorldComplete));
-					Thread.hook("MAP_GROUND", loadEvent(onGroundComplete));
-					Thread.hook("MAP_ALTITUDE", loadEvent(onAltitudeComplete));
-					Thread.hook("MAP_MODELS", loadEvent(onModelsComplete));
-					Thread.hook("MAP_ANIMATED_MODEL", loadEvent(onAnimatedModelComplete));
-					Thread.hook("MAP_REPLACED_MODELS", loadEvent((models) => MapHooks_default.modelsReady(Renderer.getContext(), models)));
+					if (loadId !== MapRenderer._loadId) {
+						waiting.length = 0;
+						return;
+					}
 					MapRenderer.free();
 					Renderer.remove();
-					Thread.send("MAP_REPLACE_MODELS", MapHooks_default.modelNames());
-					MapRenderer._loadRequest = Thread.send("LOAD_MAP", filename, loadStep(loadId, onMapComplete));
+					faded = true;
+					waiting.splice(0).forEach((fn) => fn());
 				});
 				return;
 			}
@@ -268412,7 +276363,7 @@ var init_MapRenderer = __esmMin((() => {
 			SignboardManager.free();
 			SoundManager.stop();
 			BGM.stop();
-			PostProcess.clean(gl);
+			VerticalFlip.setActive(false);
 			Mouse.intersect = false;
 			Cursor.setType(Cursor.ACTION.DEFAULT);
 			this.light = null;
@@ -268514,12 +276465,12 @@ var init_MapRenderer = __esmMin((() => {
 //#endregion
 //#region src/Renderer/Camera.js
 function save$1() {
-	_pending = false;
+	_pending$1 = false;
 	if (!DB.isIndoor(Camera.currentMap)) Camera_default.zoom = Camera.zoomFinal;
 	else Camera_default.indoorZoom = Camera.zoomFinal;
 	Camera_default.save();
 }
-var mat4$10, mat3, vec2$2, vec3$1, _position$1, C_MIN_ZOOM, C_MAX_ZOOM, C_MIN_V_ANGLE_ISOMETRIC, C_MAX_V_ANGLE_ISOMETRIC, C_THIRDPERSON_TRESHOLD_ZOOM, C_MIN_V_ANGLE_3RDPERSON, C_MAX_V_ANGLE_3RDPERSON, C_MIN_V_ANGLE_1STPERSON, C_MAX_V_ANGLE_1STPERSON, C_QUAKE_MULT, _pending, Camera;
+var mat4$10, mat3, vec2$2, vec3$1, _position$1, C_MIN_ZOOM, C_MAX_ZOOM, C_MIN_V_ANGLE_ISOMETRIC, C_MAX_V_ANGLE_ISOMETRIC, C_THIRDPERSON_TRESHOLD_ZOOM, C_MIN_V_ANGLE_3RDPERSON, C_MAX_V_ANGLE_3RDPERSON, C_MIN_V_ANGLE_1STPERSON, C_MAX_V_ANGLE_1STPERSON, C_QUAKE_MULT, _pending$1, Camera;
 var init_Camera = __esmMin((() => {
 	init_KeyEventHandler();
 	init_MouseEventHandler();
@@ -268542,7 +276493,7 @@ var init_Camera = __esmMin((() => {
 	C_MIN_V_ANGLE_1STPERSON = 90;
 	C_MAX_V_ANGLE_1STPERSON = 270;
 	C_QUAKE_MULT = .1;
-	_pending = false;
+	_pending$1 = false;
 	Camera = class Camera {
 		/**
 		* Projection matrix
@@ -268651,9 +276602,9 @@ var init_Camera = __esmMin((() => {
 		* Save the camera settings
 		*/
 		static save() {
-			if (!_pending) {
+			if (!_pending$1) {
 				Events.setTimeout(save$1, 3e3);
-				_pending = true;
+				_pending$1 = true;
 			}
 		}
 		/**
@@ -270084,20 +278035,16 @@ var init_SwirlingAura$1 = __esmMin((() => {
 * @param {{r: number, g: number, b: number, dark: boolean}} color
 * @param {number} alpha
 * @param {string} [shape] 'alpha' or 'brightness' (the default): see above
+* @param {number[]} [out] written and returned instead of a new array
 * @return {number[]} r, g, b, a
 */
-function auraUniform(color, alpha, shape = "brightness") {
-	return color.dark && shape !== "alpha" ? [
-		1,
-		1,
-		1,
-		alpha
-	] : [
-		color.r,
-		color.g,
-		color.b,
-		alpha
-	];
+function auraUniform(color, alpha, shape = "brightness", out = new Array(4)) {
+	const white = color.dark && shape !== "alpha";
+	out[0] = white ? 1 : color.r;
+	out[1] = white ? 1 : color.g;
+	out[2] = white ? 1 : color.b;
+	out[3] = alpha;
+	return out;
 }
 /**
 * Switch to the blending `color` needs before drawing it. A no-op for every
@@ -270108,9 +278055,32 @@ function auraUniform(color, alpha, shape = "brightness") {
 * @param {string} [shape] 'alpha' or 'brightness' (the default): see above
 */
 function beginAuraBlend(gl, color, shape = "brightness") {
-	if (!color) return;
-	if (shape === "alpha" && (color.hat || color.dark)) gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-	else if (shape !== "alpha" && color.dark) gl.blendFunc(gl.ZERO, gl.ONE_MINUS_SRC_COLOR);
+	const blend = auraBlend(color, shape);
+	if (blend !== 0) setAuraBlend(gl, blend);
+}
+/**
+* The blending `color` needs, as beginAuraBlend switches to it.
+*
+* @param {{dark: boolean, hat: boolean}} color
+* @param {string} [shape] 'alpha' or 'brightness' (the default): see above
+* @return {number} BLEND_ADD, BLEND_ALPHA or BLEND_DARKEN
+*/
+function auraBlend(color, shape = "brightness") {
+	if (!color) return 0;
+	if (shape === "alpha" && (color.hat || color.dark)) return 1;
+	if (shape !== "alpha" && color.dark) return 2;
+	return 0;
+}
+/**
+* Switch to one of the blendings above.
+*
+* @param {WebGL2RenderingContext} gl
+* @param {number} blend BLEND_ADD, BLEND_ALPHA or BLEND_DARKEN
+*/
+function setAuraBlend(gl, blend) {
+	if (blend === 1) gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+	else if (blend === 2) gl.blendFunc(gl.ZERO, gl.ONE_MINUS_SRC_COLOR);
+	else gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
 }
 /**
 * Put back the additive blending the auras share, after beginAuraBlend.
@@ -270120,22 +278090,473 @@ function endAuraBlend(gl, color) {
 }
 var init_AuraBlend = __esmMin((() => {}));
 //#endregion
+//#region src/Renderer/Effects/AuraBatch.vs?raw
+var AuraBatch_default$1;
+var init_AuraBatch$2 = __esmMin((() => {
+	AuraBatch_default$1 = "#version 300 es\r\nprecision highp float;\r\n\r\nin vec3 aPosition;\r\nin vec2 aTextureCoord;\r\nin vec4 aColor;\r\nin float aDepthOffset;\r\n\r\nout vec2 vTextureCoord;\r\nflat out vec4 vColor;\r\n\r\nuniform mat4 uModelViewMat;\r\nuniform mat4 uProjectionMat;\r\n\r\nvoid main(void) {\r\n	gl_Position = uProjectionMat * uModelViewMat * vec4(aPosition, 1.0);\r\n	gl_Position.z -= aDepthOffset;\r\n	vTextureCoord = aTextureCoord;\r\n	vColor = aColor;\r\n}\r\n";
+}));
+//#endregion
+//#region src/Renderer/Effects/AuraBatch.fs?raw
+var AuraBatch_default;
+var init_AuraBatch$1 = __esmMin((() => {
+	AuraBatch_default = "#version 300 es\r\nprecision highp float;\r\n\r\n// AuraBatch.js puts its effect's defines here: FOG, DISCARD_CLEAR,\r\n// DISCARD_BLACK, DARKEN. Each matches what that effect's own shader does.\r\n\r\nin vec2 vTextureCoord;\r\nflat in vec4 vColor;\r\nout vec4 fragColor;\r\n\r\nuniform sampler2D uDiffuse;\r\nuniform bool uDarken;\r\n\r\nuniform bool  uFogUse;\r\nuniform float uFogNear;\r\nuniform float uFogFar;\r\nuniform vec3  uFogColor;\r\n\r\nvoid main(void) {\r\n	vec4 texColor = texture(uDiffuse, vTextureCoord);\r\n\r\n#ifdef DISCARD_CLEAR\r\n	if (texColor.a < 0.01) {\r\n		discard;\r\n	}\r\n#endif\r\n\r\n#ifdef DISCARD_BLACK\r\n	if (texColor.r < 0.01 && texColor.g < 0.01 && texColor.b < 0.01) {\r\n		discard;\r\n	}\r\n#endif\r\n\r\n#ifdef DARKEN\r\n	if (uDarken) {\r\n		float k = max(max(texColor.r, texColor.g), texColor.b) * vColor.a;\r\n		fragColor = vec4(k, k, k, 1.0);\r\n		return;\r\n	}\r\n#endif\r\n\r\n	fragColor = texColor * vColor;\r\n\r\n#ifdef FOG\r\n	if (uFogUse) {\r\n		float depth = gl_FragCoord.z / gl_FragCoord.w;\r\n		float fogFactor = smoothstep(uFogNear, uFogFar, depth);\r\n		fragColor = mix(fragColor, vec4(uFogColor, fragColor.w), fogFactor);\r\n	}\r\n#endif\r\n}\r\n";
+}));
+//#endregion
+//#region src/Renderer/Effects/AuraBatch.js
+/**
+* Load an effect texture once for every instance that asks for it, so they
+* share one GL texture (and one run in a batch). `cache` is the class's Map;
+* freeSharedTextures deletes what is in it.
+*
+* @param {Map} cache
+* @param {WebGL2RenderingContext} gl
+* @param {string} name file name under data/texture/effect/
+* @param {function} onload receives the texture
+* @param {function} [onerror] the file could not be loaded
+*/
+function sharedTexture(cache, gl, name, onload, onerror) {
+	let entry = cache.get(name);
+	if (!entry) {
+		entry = {
+			texture: null,
+			failed: false,
+			waiting: []
+		};
+		cache.set(name, entry);
+		Client.loadFile(`data/texture/effect/${name}`, (buffer) => {
+			WebGL_default.texture(gl, buffer, (texture) => {
+				if (cache.get(name) !== entry) {
+					gl.deleteTexture(texture);
+					return;
+				}
+				entry.texture = texture;
+				const waiting = entry.waiting;
+				entry.waiting = [];
+				waiting.forEach((w) => w.onload(texture));
+			});
+		}, () => {
+			entry.failed = true;
+			const waiting = entry.waiting;
+			entry.waiting = [];
+			waiting.forEach((w) => w.onerror && w.onerror());
+		});
+	}
+	if (entry.texture) onload(entry.texture);
+	else if (entry.failed) {
+		if (onerror) onerror();
+	} else entry.waiting.push({
+		onload,
+		onerror
+	});
+}
+/**
+* Delete the textures sharedTexture loaded into `cache`.
+*/
+function freeSharedTextures(cache, gl) {
+	for (const entry of cache.values()) if (entry.texture) gl.deleteTexture(entry.texture);
+	cache.clear();
+}
+var FLOATS, STRIDE, QUAD_UV, QUAD_FAN, AuraBatch;
+var init_AuraBatch = __esmMin((() => {
+	init_AuraBatch$2();
+	init_AuraBatch$1();
+	init_WebGL();
+	init_Client();
+	init_Configs();
+	init_SpriteRenderer();
+	init_AuraBlend();
+	FLOATS = 10;
+	STRIDE = 40;
+	QUAD_UV = [
+		0,
+		0,
+		1,
+		0,
+		1,
+		1,
+		0,
+		1
+	];
+	QUAD_FAN = [
+		0,
+		1,
+		2,
+		2,
+		3,
+		0
+	];
+	AuraBatch = class {
+		/**
+		* @param {object} options the effect's fragment shader, as defines
+		* @param {boolean} [options.fog] fog, as SpriteRenderer draws it
+		* @param {boolean} [options.discardClear] discard texels with alpha under 0.01
+		* @param {boolean} [options.discardBlack] discard black texels
+		* @param {boolean} [options.darken] BLEND_DARKEN draws grey from the texture's brightness
+		* @param {boolean} [options.mergeAdditive] draw each texture's additive triangles together (see above)
+		*/
+		constructor(options) {
+			const { mergeAdditive, ...defines } = options;
+			this.mergeAdditive = !!mergeAdditive;
+			this.defines = Object.keys(defines).filter((key) => defines[key]).map((key) => `#define ${key.replace(/[A-Z]/g, (c) => `_${c}`).toUpperCase()}\n`).join("");
+			this.vertices = new Float32Array(FLOATS * 1024);
+			this.indices = /* @__PURE__ */ new Uint32Array(1536);
+			this.vertexCount = 0;
+			this.indexCount = 0;
+			this.runs = [];
+			this.runCount = 0;
+			this.mergedIndices = /* @__PURE__ */ new Uint32Array(0);
+			this.mergedRuns = [];
+			this.mergedRunCount = 0;
+			this.textureRun = /* @__PURE__ */ new Map();
+			this.modelView = /* @__PURE__ */ new Float32Array(16);
+			this.projection = /* @__PURE__ */ new Float32Array(16);
+			this.fog = {
+				use: false,
+				near: 0,
+				far: 0,
+				color: /* @__PURE__ */ new Float32Array(3)
+			};
+			this.active = false;
+			this.gl = null;
+			this.program = null;
+			this.vao = null;
+			this.vertexBuffer = null;
+			this.indexBuffer = null;
+		}
+		/**
+		* Start recording the frame's instances. Call in the class's beforeRender.
+		*
+		* @param {WebGL2RenderingContext} gl
+		* @param {mat4} modelView
+		* @param {mat4} projection
+		* @param {object} fog
+		*/
+		begin(gl, modelView, projection, fog) {
+			this.vertexCount = 0;
+			this.indexCount = 0;
+			this.runCount = 0;
+			this.active = Configs.get("auraBatching", true) !== false && typeof gl.createVertexArray === "function";
+			if (!this.active) return;
+			this.modelView.set(modelView);
+			this.projection.set(projection);
+			this.fog.use = !!(fog.use && fog.exist);
+			this.fog.near = fog.near;
+			this.fog.far = fog.far;
+			this.fog.color.set(fog.color);
+		}
+		/**
+		* Room for `vertices` more vertices and `indices` more indices, in the run
+		* of `texture` drawn with `blend`. Returns the index of the first new vertex.
+		*/
+		reserve(texture, blend, vertices, indices) {
+			if ((this.vertexCount + vertices) * FLOATS > this.vertices.length) {
+				const grown = new Float32Array(Math.max(this.vertices.length * 2, (this.vertexCount + vertices) * FLOATS));
+				grown.set(this.vertices.subarray(0, this.vertexCount * FLOATS));
+				this.vertices = grown;
+			}
+			if (this.indexCount + indices > this.indices.length) {
+				const grown = new Uint32Array(Math.max(this.indices.length * 2, this.indexCount + indices));
+				grown.set(this.indices.subarray(0, this.indexCount));
+				this.indices = grown;
+			}
+			let run = this.runCount ? this.runs[this.runCount - 1] : null;
+			if (!run || run.texture !== texture || run.blend !== blend) {
+				run = this.runs[this.runCount];
+				if (!run) run = this.runs[this.runCount] = {
+					texture: null,
+					blend: 0,
+					first: 0,
+					count: 0
+				};
+				run.texture = texture;
+				run.blend = blend;
+				run.first = this.indexCount;
+				run.count = 0;
+				this.runCount++;
+			}
+			run.count += indices;
+			return this.vertexCount;
+		}
+		/**
+		* Write one vertex.
+		*/
+		vertex(x, y, z, u, v, r, g, b, a, depth) {
+			const d = this.vertices;
+			let o = this.vertexCount * FLOATS;
+			d[o++] = x;
+			d[o++] = y;
+			d[o++] = z;
+			d[o++] = u;
+			d[o++] = v;
+			d[o++] = r;
+			d[o++] = g;
+			d[o++] = b;
+			d[o++] = a;
+			d[o] = depth;
+			this.vertexCount++;
+		}
+		/**
+		* Record a quad.
+		*
+		* @param {WebGLTexture} texture
+		* @param {number} blend AuraBlend's BLEND_*
+		* @param {Array} points four corners [x, y, z] in world space, textured (0,0) (1,0) (1,1) (0,1)
+		* @param {Array} order the six corners of its two triangles
+		* @param {number} r colour, as the effect gave its shader's uColor
+		* @param {number} g
+		* @param {number} b
+		* @param {number} a
+		* @param {number} depth what the effect took off gl_Position.z
+		*/
+		quad(texture, blend, points, order, r, g, b, a, depth) {
+			const base = this.reserve(texture, blend, 4, 6);
+			for (let k = 0; k < 4; k++) {
+				const p = points[k];
+				this.vertex(p[0], p[1], p[2], QUAD_UV[k * 2], QUAD_UV[k * 2 + 1], r, g, b, a, depth);
+			}
+			for (let i = 0; i < 6; i++) this.indices[this.indexCount++] = base + order[i];
+		}
+		/**
+		* Record an indexed mesh, moved by (x, y, z).
+		*
+		* @param {WebGLTexture} texture
+		* @param {number} blend AuraBlend's BLEND_*
+		* @param {Float32Array} vertices x, y, z, u, v each
+		* @param {number} vertexCount
+		* @param {Uint16Array} indices
+		* @param {number} x
+		* @param {number} y
+		* @param {number} z
+		* @param {number} r colour, as the effect gave its shader's uColor
+		* @param {number} g
+		* @param {number} b
+		* @param {number} a
+		* @param {number} depth what the effect took off gl_Position.z
+		*/
+		mesh(texture, blend, vertices, vertexCount, indices, x, y, z, r, g, b, a, depth) {
+			const base = this.reserve(texture, blend, vertexCount, indices.length);
+			for (let i = 0, o = 0; i < vertexCount; i++, o += 5) this.vertex(vertices[o] + x, vertices[o + 1] + y, vertices[o + 2] + z, vertices[o + 3], vertices[o + 4], r, g, b, a, depth);
+			for (let i = 0; i < indices.length; i++) this.indices[this.indexCount++] = base + indices[i];
+		}
+		/**
+		* Draw what was recorded. Call in the class's afterRender, which then puts
+		* its blending back.
+		*
+		* @param {WebGL2RenderingContext} gl
+		*/
+		flush(gl) {
+			if (!this.active) return;
+			this.active = false;
+			if (!this.runCount) return;
+			if (!this.program || this.gl !== gl) this.init(gl);
+			const uniform = this.program.uniform;
+			gl.useProgram(this.program);
+			gl.uniformMatrix4fv(uniform.uModelViewMat, false, this.modelView);
+			gl.uniformMatrix4fv(uniform.uProjectionMat, false, this.projection);
+			gl.uniform1i(uniform.uFogUse, this.fog.use);
+			gl.uniform1f(uniform.uFogNear, this.fog.near);
+			gl.uniform1f(uniform.uFogFar, this.fog.far);
+			gl.uniform3fv(uniform.uFogColor, this.fog.color);
+			gl.activeTexture(gl.TEXTURE0);
+			gl.uniform1i(uniform.uDiffuse, 0);
+			gl.bindVertexArray(this.vao);
+			gl.bindBuffer(gl.ARRAY_BUFFER, this.vertexBuffer);
+			gl.bufferData(gl.ARRAY_BUFFER, this.vertices.subarray(0, this.vertexCount * FLOATS), gl.STREAM_DRAW);
+			let runs = this.runs;
+			let runCount = this.runCount;
+			let indices = this.indices;
+			if (this.mergeAdditive && this.merge()) {
+				runs = this.mergedRuns;
+				runCount = this.mergedRunCount;
+				indices = this.mergedIndices;
+			}
+			gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices.subarray(0, this.indexCount), gl.STREAM_DRAW);
+			SpriteRenderer.runWithDepth(true, false, false, function() {
+				let blend = -1;
+				for (let i = 0; i < runCount; i++) {
+					const run = runs[i];
+					if (run.blend !== blend) {
+						blend = run.blend;
+						setAuraBlend(gl, blend);
+						if (uniform.uDarken) gl.uniform1i(uniform.uDarken, blend === 2);
+					}
+					gl.bindTexture(gl.TEXTURE_2D, run.texture);
+					gl.drawElements(gl.TRIANGLES, run.count, gl.UNSIGNED_INT, run.first * 4);
+				}
+			});
+			gl.bindVertexArray(null);
+			for (let i = 0; i < this.runCount; i++) this.runs[i].texture = null;
+			for (let i = 0; i < this.mergedRunCount; i++) this.mergedRuns[i].texture = null;
+			this.runCount = 0;
+			this.mergedRunCount = 0;
+			this.vertexCount = 0;
+			this.indexCount = 0;
+		}
+		/**
+		* Regroup the recorded runs for mergeAdditive into mergedRuns and
+		* mergedIndices: each span of consecutive BLEND_ADD runs becomes one run
+		* per texture, in the order the textures first appear in it, with that
+		* texture's triangles in the order they were recorded. Other runs stay
+		* as they are, where they are. Returns false when nothing would merge.
+		*
+		* @return {boolean}
+		*/
+		merge() {
+			const runs = this.runs;
+			const runCount = this.runCount;
+			if (this.mergedIndices.length < this.indexCount) this.mergedIndices = new Uint32Array(this.indices.length);
+			const textureRun = this.textureRun;
+			let merged = 0;
+			let offset = 0;
+			for (let start = 0; start < runCount;) {
+				if (runs[start].blend !== 0) {
+					const run = runs[start];
+					const target = this.mergedRun(merged++, run.texture, run.blend, offset);
+					this.copyIndices(run, offset);
+					target.count = run.count;
+					offset += run.count;
+					start++;
+					continue;
+				}
+				let end = start;
+				const first = merged;
+				for (; end < runCount && runs[end].blend === 0; end++) {
+					const run = runs[end];
+					let target = textureRun.get(run.texture);
+					if (target === void 0) {
+						target = this.mergedRun(merged++, run.texture, 0, 0);
+						textureRun.set(run.texture, target);
+					}
+					target.count += run.count;
+				}
+				for (let i = first; i < merged; i++) {
+					const target = this.mergedRuns[i];
+					target.first = offset;
+					offset += target.count;
+					target.count = 0;
+				}
+				for (let i = start; i < end; i++) {
+					const run = runs[i];
+					const target = textureRun.get(run.texture);
+					this.copyIndices(run, target.first + target.count);
+					target.count += run.count;
+				}
+				textureRun.clear();
+				start = end;
+			}
+			this.mergedRunCount = merged;
+			return merged < runCount;
+		}
+		/**
+		* Copy a recorded run's indices into mergedIndices at `offset`, without
+		* the garbage of a subarray a run.
+		*/
+		copyIndices(run, offset) {
+			const indices = this.indices;
+			const out = this.mergedIndices;
+			for (let i = run.first, end = run.first + run.count; i < end; i++) out[offset++] = indices[i];
+		}
+		/**
+		* mergedRuns[index], set to start empty at `first`.
+		*/
+		mergedRun(index, texture, blend, first) {
+			let run = this.mergedRuns[index];
+			if (!run) run = this.mergedRuns[index] = {
+				texture: null,
+				blend: 0,
+				first: 0,
+				count: 0
+			};
+			run.texture = texture;
+			run.blend = blend;
+			run.first = first;
+			run.count = 0;
+			return run;
+		}
+		/**
+		* Create the program, the buffers and the vertex array.
+		*/
+		init(gl) {
+			if (this.program && this.gl === gl) return;
+			this.gl = gl;
+			const fragment = AuraBatch_default.replace(/^(#version[^\n]*\n)/, `$1${this.defines}`);
+			this.program = WebGL_default.createShaderProgram(gl, AuraBatch_default$1, fragment);
+			this.vertexBuffer = gl.createBuffer();
+			this.indexBuffer = gl.createBuffer();
+			this.vao = gl.createVertexArray();
+			const attribute = this.program.attribute;
+			gl.bindVertexArray(this.vao);
+			gl.bindBuffer(gl.ARRAY_BUFFER, this.vertexBuffer);
+			gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.indexBuffer);
+			gl.enableVertexAttribArray(attribute.aPosition);
+			gl.vertexAttribPointer(attribute.aPosition, 3, gl.FLOAT, false, STRIDE, 0);
+			gl.enableVertexAttribArray(attribute.aTextureCoord);
+			gl.vertexAttribPointer(attribute.aTextureCoord, 2, gl.FLOAT, false, STRIDE, 12);
+			gl.enableVertexAttribArray(attribute.aColor);
+			gl.vertexAttribPointer(attribute.aColor, 4, gl.FLOAT, false, STRIDE, 20);
+			gl.enableVertexAttribArray(attribute.aDepthOffset);
+			gl.vertexAttribPointer(attribute.aDepthOffset, 1, gl.FLOAT, false, STRIDE, 36);
+			gl.bindVertexArray(null);
+		}
+		/**
+		* Delete the program and the buffers. Call in the class's static free.
+		*/
+		free(gl) {
+			if (this.program) {
+				gl.deleteProgram(this.program);
+				gl.deleteBuffer(this.vertexBuffer);
+				gl.deleteBuffer(this.indexBuffer);
+				gl.deleteVertexArray(this.vao);
+			}
+			this.program = null;
+			this.vao = null;
+			this.vertexBuffer = null;
+			this.indexBuffer = null;
+			this.gl = null;
+			this.active = false;
+			this.runCount = 0;
+			this.mergedRunCount = 0;
+			this.textureRun.clear();
+			this.vertexCount = 0;
+			this.indexCount = 0;
+		}
+	};
+}));
+//#endregion
 //#region src/Renderer/Effects/SwirlingAura.js
-var mat4$8, _program$10, _modelMatrix, E_DIVISION, FULL_DISPLAY_ANGLE, DEG_TO_RAD$2, SwirlingAura;
+var mat4$8, _program$10, _modelMatrix, E_DIVISION, FULL_DISPLAY_ANGLE, DEG_TO_RAD$2, VERTICES_PER_BAND, _batch$3, _textures$4, BAND_INDICES, SwirlingAura;
 var init_SwirlingAura = __esmMin((() => {
 	init_SwirlingAura$2();
 	init_SwirlingAura$1();
 	init_WebGL();
 	init_gl_matrix();
-	init_Client();
 	init_Altitude();
 	init_SpriteRenderer();
 	init_AuraBlend();
+	init_AuraBatch();
 	mat4$8 = gl_matrix_default.mat4;
 	_modelMatrix = mat4$8.create();
 	E_DIVISION = 21;
 	FULL_DISPLAY_ANGLE = 315;
 	DEG_TO_RAD$2 = Math.PI / 180;
+	VERTICES_PER_BAND = 42;
+	_batch$3 = new AuraBatch({
+		fog: true,
+		discardClear: true,
+		discardBlack: true
+	});
+	_textures$4 = /* @__PURE__ */ new Map();
+	BAND_INDICES = (function() {
+		const indices = [];
+		for (let k = 0; k < 20; k++) {
+			const i0 = k * 2;
+			const i1 = k * 2 + 1;
+			const i2 = k * 2 + 2;
+			const i3 = k * 2 + 3;
+			indices.push(i0, i1, i2, i1, i3, i2);
+		}
+		return new Uint16Array(indices);
+	})();
 	SwirlingAura = class {
 		/**
 		* @param {object} color optional tint from AuraTiers.auraColor, over the blue or green
@@ -270172,6 +278593,12 @@ var init_SwirlingAura = __esmMin((() => {
 			});
 			this.basicAngle = FULL_DISPLAY_ANGLE / 20;
 			this.vertices = /* @__PURE__ */ new Float32Array(210);
+			this.rgba = [
+				0,
+				0,
+				0,
+				0
+			];
 			this.buffers = null;
 			this.indexBuffer = null;
 			this.indexCount = 0;
@@ -270227,23 +278654,18 @@ var init_SwirlingAura = __esmMin((() => {
 			}
 		}
 		/**
-		* Generate index buffer
-		*/
-		generateIndices() {
-			const indices = [];
-			for (let k = 0; k < 20; k++) {
-				const i0 = k * 2;
-				const i1 = k * 2 + 1;
-				const i2 = k * 2 + 2;
-				const i3 = k * 2 + 3;
-				indices.push(i0, i1, i2, i1, i3, i2);
-			}
-			return new Uint16Array(indices);
-		}
-		/**
 		* Initialize instance
 		*/
 		init(gl) {
+			sharedTexture(_textures$4, gl, this.textureName, (texture) => {
+				this.texture = texture;
+				this.ready = true;
+			});
+		}
+		/**
+		* The band buffers, for drawing without the batch
+		*/
+		createBuffers(gl) {
 			this.buffers = [];
 			for (let i = 0; i < this.bands.length; i++) {
 				const buf = gl.createBuffer();
@@ -270251,17 +278673,10 @@ var init_SwirlingAura = __esmMin((() => {
 				gl.bufferData(gl.ARRAY_BUFFER, this.vertices.byteLength, gl.DYNAMIC_DRAW);
 				this.buffers.push(buf);
 			}
-			const indices = this.generateIndices();
 			this.indexBuffer = gl.createBuffer();
 			gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.indexBuffer);
-			gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW);
-			this.indexCount = indices.length;
-			Client.loadFile(`data/texture/effect/${this.textureName}`, (buffer) => {
-				WebGL_default.texture(gl, buffer, (texture) => {
-					this.texture = texture;
-					this.ready = true;
-				});
-			});
+			gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, BAND_INDICES, gl.STATIC_DRAW);
+			this.indexCount = BAND_INDICES.length;
 		}
 		/**
 		* Free instance resources
@@ -270284,6 +278699,11 @@ var init_SwirlingAura = __esmMin((() => {
 			const uniform = _program$10.uniform;
 			const attribute = _program$10.attribute;
 			const groundZ = Altitude.getCellHeight(this.position[0], this.position[1]);
+			if (_batch$3.active) {
+				this.record(tick, groundZ);
+				return;
+			}
+			if (!this.buffers) this.createBuffers(gl);
 			mat4$8.identity(_modelMatrix);
 			mat4$8.translate(_modelMatrix, _modelMatrix, [
 				this.position[0] + .5,
@@ -270317,6 +278737,25 @@ var init_SwirlingAura = __esmMin((() => {
 			endAuraBlend(gl, this.color);
 		}
 		/**
+		* Record the three bands in the batch, as render draws them
+		*/
+		record(tick, groundZ) {
+			const process = (tick - this.tick) / 25;
+			const blend = auraBlend(this.color, "alpha");
+			const color = auraUniform(this.color, this.alphaB, "alpha", this.rgba);
+			const x = this.position[0] + .5;
+			const y = -groundZ;
+			const z = this.position[1] + .5;
+			for (let ec = 0; ec < this.bands.length; ec++) {
+				const band = this.bands[ec];
+				if (!band.life) continue;
+				band.rotStart = (band.initialRotStart + process * band.spinSpeed) % 360;
+				this.updateHeightProfile(band, process);
+				this.fillBandMesh(band);
+				_batch$3.mesh(this.texture, blend, this.vertices, VERTICES_PER_BAND, BAND_INDICES, x, y, z, color[0], color[1], color[2], color[3], .01 + ec * .001);
+			}
+		}
+		/**
 		* Initialize static resources
 		*/
 		static init(gl) {
@@ -270332,6 +278771,8 @@ var init_SwirlingAura = __esmMin((() => {
 				gl.deleteProgram(_program$10);
 				_program$10 = null;
 			}
+			_batch$3.free(gl);
+			freeSharedTextures(_textures$4, gl);
 			this.ready = false;
 		}
 		/**
@@ -270349,11 +278790,13 @@ var init_SwirlingAura = __esmMin((() => {
 			gl.uniform3fv(uniform.uFogColor, fog.color);
 			gl.activeTexture(gl.TEXTURE0);
 			gl.uniform1i(uniform.uDiffuse, 0);
+			_batch$3.begin(gl, modelView, projection, fog);
 		}
 		/**
 		* After render cleanup
 		*/
 		static afterRender(gl) {
+			_batch$3.flush(gl);
 			gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
 			gl.disableVertexAttribArray(_program$10.attribute.aPosition);
 			gl.disableVertexAttribArray(_program$10.attribute.aTextureCoord);
@@ -270431,15 +278874,38 @@ function calculateSize(self, aura, auraAngle, i) {
 	const endY = sin * (aura[i].distance * .8 + riseFactor);
 	return [Math.abs(endX - startX), Math.abs(endY - startY)];
 }
-var _program$9, _buffer$8, GroundAura;
+var _program$9, _buffer$8, _batch$2, _textures$3, GROUND_ORDER, GROUND_CORNERS, GroundAura;
 var init_GroundAura = __esmMin((() => {
 	init_GroundAura$2();
 	init_GroundAura$1();
 	init_WebGL();
-	init_Client();
 	init_Altitude();
 	init_SpriteRenderer();
 	init_AuraBlend();
+	init_AuraBatch();
+	_batch$2 = new AuraBatch({
+		discardClear: true,
+		darken: true
+	});
+	_textures$3 = /* @__PURE__ */ new Map();
+	GROUND_ORDER = [
+		0,
+		1,
+		3,
+		1,
+		2,
+		3
+	];
+	GROUND_CORNERS = [
+		-.5,
+		-.5,
+		.5,
+		-.5,
+		.5,
+		.5,
+		-.5,
+		.5
+	];
 	GroundAura = class {
 		/**
 		* @param {object} color optional tint from AuraTiers.auraColor; white when left out
@@ -270482,6 +278948,39 @@ var init_GroundAura = __esmMin((() => {
 			this.sinCache = {};
 			this._lastTick = tick;
 			this._accumTime = 0;
+			this.worldPos = [
+				0,
+				0,
+				0
+			];
+			this.rgba = [
+				0,
+				0,
+				0,
+				0
+			];
+			this.points = [
+				[
+					0,
+					0,
+					0
+				],
+				[
+					0,
+					0,
+					0
+				],
+				[
+					0,
+					0,
+					0
+				],
+				[
+					0,
+					0,
+					0
+				]
+			];
 		}
 		/**
 		* Initialize instance
@@ -270495,11 +278994,9 @@ var init_GroundAura = __esmMin((() => {
 				this.shape = "brightness";
 				this.init(gl);
 			};
-			Client.loadFile(`data/texture/effect/${this.textureName}`, (buffer) => {
-				WebGL_default.texture(gl, buffer, (texture) => {
-					this.texture = texture;
-					this.ready = true;
-				});
+			sharedTexture(_textures$3, gl, this.textureName, (texture) => {
+				this.texture = texture;
+				this.ready = true;
 			}, onerror);
 		}
 		/**
@@ -270510,7 +279007,6 @@ var init_GroundAura = __esmMin((() => {
 		}
 		render(gl, tick) {
 			const uniform = _program$9.uniform;
-			gl.bindTexture(gl.TEXTURE_2D, this.texture);
 			const RAG_TICK_MS = 25;
 			const dt = Math.min(tick - (this._lastTick || tick), 250);
 			this._lastTick = tick;
@@ -270536,11 +279032,15 @@ var init_GroundAura = __esmMin((() => {
 				}
 			}
 			const groundZ = Altitude.getCellHeight(this.position[0], this.position[1]);
-			const worldPos = [
-				this.position[0],
-				this.position[1],
-				groundZ + .05
-			];
+			const worldPos = this.worldPos;
+			worldPos[0] = this.position[0];
+			worldPos[1] = this.position[1];
+			worldPos[2] = groundZ + .05;
+			if (_batch$2.active) {
+				this.record(worldPos);
+				return;
+			}
+			gl.bindTexture(gl.TEXTURE_2D, this.texture);
 			gl.uniform3fv(uniform.uWorldPosition, worldPos);
 			const self = this;
 			beginAuraBlend(gl, this.color, this.shape);
@@ -270557,6 +279057,29 @@ var init_GroundAura = __esmMin((() => {
 				}
 			});
 			endAuraBlend(gl, this.color);
+		}
+		/**
+		* Record the quads in the batch, placed as GroundAura.vs places them
+		*/
+		record(worldPos) {
+			const blend = auraBlend(this.color, this.shape);
+			const color = auraUniform(this.color, .8, this.shape, this.rgba);
+			for (let i = 0; i < this.aura.length; i++) {
+				if (!this.aura[i].life) continue;
+				const sizeX = this.aura[i].size[0] / 35;
+				const sizeY = this.aura[i].size[1] / 35;
+				const angle = i * 23 * Math.PI / 180;
+				const cos = Math.cos(angle);
+				const sin = Math.sin(angle);
+				for (let k = 0; k < 4; k++) {
+					const x = GROUND_CORNERS[k * 2] * sizeX;
+					const z = GROUND_CORNERS[k * 2 + 1] * sizeY;
+					this.points[k][0] = worldPos[0] + .5 + (x * cos - z * sin);
+					this.points[k][1] = -worldPos[2];
+					this.points[k][2] = worldPos[1] + .5 + (x * sin + z * cos);
+				}
+				_batch$2.quad(this.texture, blend, this.points, GROUND_ORDER, color[0], color[1], color[2], color[3], (1 + i) * .01);
+			}
 		}
 		/**
 		* Initialize static resources
@@ -270582,6 +279105,8 @@ var init_GroundAura = __esmMin((() => {
 				gl.deleteBuffer(_buffer$8);
 				_buffer$8 = null;
 			}
+			_batch$2.free(gl);
+			freeSharedTextures(_textures$3, gl);
 			this.ready = false;
 		}
 		/**
@@ -270605,11 +279130,13 @@ var init_GroundAura = __esmMin((() => {
 			gl.enableVertexAttribArray(attribute.aTextureCoord);
 			gl.vertexAttribPointer(attribute.aPosition, 3, gl.FLOAT, false, 20, 0);
 			gl.vertexAttribPointer(attribute.aTextureCoord, 2, gl.FLOAT, false, 20, 12);
+			_batch$2.begin(gl, modelView, projection, fog);
 		}
 		/**
 		* After render cleanup
 		*/
 		static afterRender(gl) {
+			_batch$2.flush(gl);
 			gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
 			gl.disableVertexAttribArray(_program$9.attribute.aPosition);
 			gl.disableVertexAttribArray(_program$9.attribute.aTextureCoord);
@@ -270639,21 +279166,19 @@ function wrapDegrees(angle) {
 	return angle;
 }
 /**
-* Advance a phase angle toward a random target, reseed when reached.
-* Returns { angle, target }
+* Advance phase `i` toward its random target, reseed the target when reached.
+* Writes in place: this runs 16 times a column a frame for every aura.
 */
-function advancePhase(current, target, stepScale = 1) {
+function advancePhase(phases, targets, i, stepScale = 1) {
+	const current = phases[i];
+	const target = targets[i];
 	let diff = target - current;
 	diff = (diff + 540) % 360 - 180;
 	const step = (2 + Math.random()) * stepScale;
 	if (Math.abs(diff) <= step) {
-		current = target;
-		target = randRange(0, 360);
-	} else current = wrapDegrees(current + Math.sign(diff) * step);
-	return {
-		angle: current,
-		target
-	};
+		phases[i] = target;
+		targets[i] = randRange(0, 360);
+	} else phases[i] = wrapDegrees(current + Math.sign(diff) * step);
 }
 function pickColor(flag1) {
 	if (flag1 === 1) return {
@@ -270682,16 +279207,16 @@ function createAnchor(isGhost, seedMaxUnits) {
 		z: 0
 	};
 }
-var DEG_TO_RAD$1, GAME_TO_WORLD, NUM_COLUMNS, ANCHORS_PER_COL, BASE_LIFT$1, REF_RADIUS, REF_SPEED, REF_DRIFT_K, REF_SEED_MAX, REF_RESET_Y, REF_ALPHA_OFFSET, REF_ALPHA_GAIN, ANCHOR_SIGNS, ANCHOR_PHASE_OFFSETS, debugConfig, _program$8, _buffer$7, BILLBOARD_CORNERS, Level99Bubble;
+var DEG_TO_RAD$1, GAME_TO_WORLD, NUM_COLUMNS, ANCHORS_PER_COL, BASE_LIFT$1, REF_RADIUS, REF_SPEED, REF_DRIFT_K, REF_SEED_MAX, REF_RESET_Y, REF_ALPHA_OFFSET, REF_ALPHA_GAIN, ANCHOR_SIGNS, ANCHOR_PHASE_OFFSETS, debugConfig, _program$8, _buffer$7, _batch$1, _textures$2, BILLBOARD_CORNERS, Level99Bubble;
 var init_Level99Bubble = __esmMin((() => {
 	init_Level99Bubble$2();
 	init_Level99Bubble$1();
 	init_WebGL();
-	init_Client();
 	init_Camera();
 	init_Altitude();
 	init_SpriteRenderer();
 	init_AuraBlend();
+	init_AuraBatch();
 	DEG_TO_RAD$1 = Math.PI / 180;
 	GAME_TO_WORLD = .1 * 2.2;
 	NUM_COLUMNS = 4;
@@ -270753,6 +279278,8 @@ var init_Level99Bubble = __esmMin((() => {
 		alphaGain: REF_ALPHA_GAIN,
 		floorLimit: Math.abs(REF_RESET_Y)
 	};
+	_batch$1 = new AuraBatch({ fog: true });
+	_textures$2 = /* @__PURE__ */ new Map();
 	BILLBOARD_CORNERS = [
 		{
 			x: -1,
@@ -270807,6 +279334,17 @@ var init_Level99Bubble = __esmMin((() => {
 				this.columns.push(column);
 			}
 			this.quadData = /* @__PURE__ */ new Float32Array(30);
+			this.basePos = [
+				0,
+				0,
+				0
+			];
+			this.rgba = [
+				0,
+				0,
+				0,
+				0
+			];
 			this.tmpPoints = [
 				[
 					0,
@@ -270831,11 +279369,9 @@ var init_Level99Bubble = __esmMin((() => {
 			];
 		}
 		init(gl) {
-			Client.loadFile(`data/texture/effect/${this.textureName}`, (buffer) => {
-				WebGL_default.texture(gl, buffer, (texture) => {
-					this.texture = texture;
-					this.ready = true;
-				});
+			sharedTexture(_textures$2, gl, this.textureName, (texture) => {
+				this.texture = texture;
+				this.ready = true;
 			});
 		}
 		free(gl) {
@@ -270856,11 +279392,7 @@ var init_Level99Bubble = __esmMin((() => {
 		* Update all phases in a column (advance toward random targets)
 		*/
 		updatePhases(column, stepScale = 1) {
-			for (let i = 0; i < 16; i++) {
-				const result = advancePhase(column.phases[i], column.phaseTargets[i], stepScale);
-				column.phases[i] = result.angle;
-				column.phaseTargets[i] = result.target;
-			}
+			for (let i = 0; i < 16; i++) advancePhase(column.phases, column.phaseTargets, i, stepScale);
 		}
 		/**
 		* Update a single anchor within a column
@@ -270927,11 +279459,10 @@ var init_Level99Bubble = __esmMin((() => {
 			if (!this.ready || !this.texture) return;
 			const uniform = _program$8.uniform;
 			const groundZ = Altitude.getCellHeight(this.position[0], this.position[1]);
-			const basePos = [
-				this.position[0] + .5,
-				-groundZ - BASE_LIFT$1,
-				this.position[1] + .5
-			];
+			const basePos = this.basePos;
+			basePos[0] = this.position[0] + .5;
+			basePos[1] = -groundZ - BASE_LIFT$1;
+			basePos[2] = this.position[1] + .5;
 			const viewPitch = Camera.angle[0];
 			const viewYaw = Camera.angle[1];
 			const beta = (360 - viewPitch + 90) % 360 * DEG_TO_RAD$1;
@@ -270940,7 +279471,10 @@ var init_Level99Bubble = __esmMin((() => {
 			const cosBeta = Math.cos(beta);
 			const sinAlpha = Math.sin(alpha);
 			const cosAlpha = Math.cos(alpha);
-			gl.bindTexture(gl.TEXTURE_2D, this.texture);
+			const batched = _batch$1.active;
+			const blend = auraBlend(this.color, "alpha");
+			const rgb = auraUniform(this.color, 1, "alpha", this.rgba);
+			if (!batched) gl.bindTexture(gl.TEXTURE_2D, this.texture);
 			if (debugConfig.showRedBg) this.renderBackground(gl, basePos);
 			const radius = this.baseRadius * GAME_TO_WORLD * debugConfig.scaleMult;
 			const RAG_TICK_MS = 25;
@@ -270975,6 +279509,10 @@ var init_Level99Bubble = __esmMin((() => {
 					if (anchor.y > 0) continue;
 					const alphaValue = this.computeAlpha(anchor.y);
 					if (alphaValue <= 0) continue;
+					if (batched) {
+						for (let pass = 0; pass < this.passCount; pass++) _batch$1.quad(this.texture, blend, this.tmpPoints, QUAD_FAN, rgb[0], rgb[1], rgb[2], alphaValue, .01 + ec * .002 + ai * 1e-4 + pass * 5e-5);
+						continue;
+					}
 					this.fillQuad(this.tmpPoints, this.quadData);
 					gl.bufferSubData(gl.ARRAY_BUFFER, 0, this.quadData);
 					const self = this;
@@ -271137,6 +279675,8 @@ var init_Level99Bubble = __esmMin((() => {
 				gl.deleteBuffer(_buffer$7);
 				_buffer$7 = null;
 			}
+			_batch$1.free(gl);
+			freeSharedTextures(_textures$2, gl);
 			this.ready = false;
 		}
 		static beforeRender(gl, modelView, projection, fog) {
@@ -271158,8 +279698,10 @@ var init_Level99Bubble = __esmMin((() => {
 			gl.enableVertexAttribArray(attribute.aTextureCoord);
 			gl.vertexAttribPointer(attribute.aPosition, 3, gl.FLOAT, false, 20, 0);
 			gl.vertexAttribPointer(attribute.aTextureCoord, 2, gl.FLOAT, false, 20, 12);
+			_batch$1.begin(gl, modelView, projection, fog);
 		}
 		static afterRender(gl) {
+			_batch$1.flush(gl);
 			gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
 			gl.disableVertexAttribArray(_program$8.attribute.aPosition);
 			gl.disableVertexAttribArray(_program$8.attribute.aTextureCoord);
@@ -271180,7 +279722,7 @@ function loadTexture$2(gl, name) {
 function bubbleName(frame) {
 	return `w_bubble${String(frame + 1).padStart(2, "0")}.tga`;
 }
-var DEG_TO_RAD, BASE_LIFT, BUBBLE_FRAMES, FRAME_MS, RINGS, GROUND_RINGS, CORNERS, _program$7, _buffer$6, _textures$1, MaxLevelAura;
+var DEG_TO_RAD, BASE_LIFT, BUBBLE_FRAMES, FRAME_MS, RINGS, GROUND_RINGS, CORNERS, _program$7, _buffer$6, _textures$1, _batch, MaxLevelAura;
 var init_MaxLevelAura = __esmMin((() => {
 	init_Level99Bubble$2();
 	init_Level99Bubble$1();
@@ -271188,6 +279730,7 @@ var init_MaxLevelAura = __esmMin((() => {
 	init_Client();
 	init_Altitude();
 	init_SpriteRenderer();
+	init_AuraBatch();
 	init_AuraBlend();
 	DEG_TO_RAD = Math.PI / 180;
 	BASE_LIFT = .05;
@@ -271241,6 +279784,10 @@ var init_MaxLevelAura = __esmMin((() => {
 		}
 	];
 	_textures$1 = /* @__PURE__ */ new Map();
+	_batch = new AuraBatch({
+		fog: true,
+		mergeAdditive: true
+	});
 	MaxLevelAura = class {
 		/**
 		* @param {vec3} position entity position (kept by reference, so it follows)
@@ -271259,6 +279806,7 @@ var init_MaxLevelAura = __esmMin((() => {
 			};
 			this.startTick = tick || 0;
 			this.quadData = /* @__PURE__ */ new Float32Array(30);
+			this.rgba = new Array(4);
 			this.points = [
 				[
 					0,
@@ -271320,6 +279868,12 @@ var init_MaxLevelAura = __esmMin((() => {
 		}
 		draw(gl, texture, alpha, zIndex) {
 			if (!texture) return;
+			if (_batch.active) {
+				const rgba = auraUniform(this.color, alpha, "alpha", this.rgba);
+				_batch.quad(texture, auraBlend(this.color, "alpha"), this.points, QUAD_FAN, rgba[0], rgba[1], rgba[2], rgba[3], zIndex);
+				return;
+			}
+			this.fillQuad(this.points);
 			const uniform = _program$7.uniform;
 			gl.bindTexture(gl.TEXTURE_2D, texture);
 			gl.bufferSubData(gl.ARRAY_BUFFER, 0, this.quadData);
@@ -271336,6 +279890,11 @@ var init_MaxLevelAura = __esmMin((() => {
 				-groundZ - BASE_LIFT,
 				this.position[1] + .5
 			];
+			if (_batch.active) {
+				if (this.part === "rings") this.renderRings(gl, base, elapsed);
+				else this.renderBubbles(gl, base, elapsed);
+				return;
+			}
 			const self = this;
 			beginAuraBlend(gl, this.color, "alpha");
 			SpriteRenderer.runWithDepth(true, false, false, function() {
@@ -271358,7 +279917,6 @@ var init_MaxLevelAura = __esmMin((() => {
 					this.points[k][1] = base[1] - .01 * (i + 1);
 					this.points[k][2] = base[2] + x * sin + z * cos;
 				}
-				this.fillQuad(this.points);
 				this.draw(gl, _textures$1.get(ring.texture), 1, .002 * (i + 1));
 			}
 		}
@@ -271388,7 +279946,6 @@ var init_MaxLevelAura = __esmMin((() => {
 					this.points[3][0] = x0;
 					this.points[3][1] = base[1];
 					this.points[3][2] = z0;
-					this.fillQuad(this.points);
 					const texture = _textures$1.get(bubbleName((frame + b * 3 + r * 9) % BUBBLE_FRAMES));
 					this.draw(gl, texture, .55, .01 + r * .002 + b * 1e-4);
 				}
@@ -271411,6 +279968,7 @@ var init_MaxLevelAura = __esmMin((() => {
 				gl.deleteBuffer(_buffer$6);
 				_buffer$6 = null;
 			}
+			_batch.free(gl);
 			for (const texture of _textures$1.values()) if (texture) gl.deleteTexture(texture);
 			_textures$1.clear();
 			this.ready = false;
@@ -271434,8 +279992,10 @@ var init_MaxLevelAura = __esmMin((() => {
 			gl.enableVertexAttribArray(attribute.aTextureCoord);
 			gl.vertexAttribPointer(attribute.aPosition, 3, gl.FLOAT, false, 20, 0);
 			gl.vertexAttribPointer(attribute.aTextureCoord, 2, gl.FLOAT, false, 20, 12);
+			_batch.begin(gl, modelView, projection, fog);
 		}
 		static afterRender(gl) {
+			_batch.flush(gl);
 			gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
 			gl.disableVertexAttribArray(_program$7.attribute.aPosition);
 			gl.disableVertexAttribArray(_program$7.attribute.aTextureCoord);
@@ -291193,6 +299753,863 @@ var init_EffectTable = __esmMin((() => {
 			type: "STR",
 			file: "help_angel/help_angel_bottom/help_angel_bottom",
 			texturePath: "help_angel/help_angel_bottom/",
+			renderBeforeEntities: true
+		}],
+		ef_druid_werewolf: [{
+			type: "STR",
+			file: "druid/dr_werewolf/werewolf/werewolf",
+			texturePath: "druid/dr_werewolf/werewolf/",
+			min: "druid/dr_werewolf/werewolf/min_werewolf",
+			wav: "effect/druid/dr_werewolf"
+		}],
+		ef_druid_wereraptor: [{
+			type: "STR",
+			file: "druid/dr_wereraptor/wereraptor/wereraptor",
+			texturePath: "druid/dr_wereraptor/wereraptor/",
+			min: "druid/dr_wereraptor/wereraptor/min_wereraptor",
+			wav: "effect/druid/dr_wereraptor"
+		}],
+		ef_druid_enrage_wolf: [{
+			type: "STR",
+			file: "druid/dr_enrage_wolf/enrage_wolf/enrage_wolf",
+			texturePath: "druid/dr_enrage_wolf/enrage_wolf/",
+			min: "druid/dr_enrage_wolf/enrage_wolf/min_enrage_wolf",
+			wav: "effect/druid/dr_enrage_wolf"
+		}],
+		ef_druid_enrage_raptor: [{
+			type: "STR",
+			file: "druid/dr_enrage_raptor/enrage_raptor/enrage_raptor",
+			texturePath: "druid/dr_enrage_raptor/enrage_raptor/",
+			min: "druid/dr_enrage_raptor/enrage_raptor/min_enrage_raptor",
+			wav: "effect/druid/dr_enrage_raptor"
+		}],
+		ef_druid_blood_howling: [{
+			type: "STR",
+			file: "druid/dr_blood_howling/blood_howling/blood_howling",
+			texturePath: "druid/dr_blood_howling/blood_howling/",
+			min: "druid/dr_blood_howling/blood_howling/min_blood_howling",
+			wav: "effect/druid/dr_blood_howling"
+		}],
+		ef_druid_preening: [{
+			type: "STR",
+			file: "druid/dr_preening/preening/preening",
+			texturePath: "druid/dr_preening/preening/",
+			min: "druid/dr_preening/preening/min_preening",
+			wav: "effect/druid/dr_preening"
+		}],
+		ef_druid_truth_of_ice: [{
+			type: "STR",
+			file: "druid/dr_truth_of_ice/truth_of_ice/truth_of_ice",
+			texturePath: "druid/dr_truth_of_ice/truth_of_ice/",
+			min: "druid/dr_truth_of_ice/truth_of_ice/min_truth_of_ice",
+			wav: "effect/druid/dr_truth_of_ice"
+		}, {
+			type: "STR",
+			file: "druid/dr_truth_of_ice/truth_of_ice_bottom/truth_of_ice_bottom",
+			texturePath: "druid/dr_truth_of_ice/truth_of_ice_bottom/",
+			min: "druid/dr_truth_of_ice/truth_of_ice_bottom/min_truth_of_ice_bottom",
+			renderBeforeEntities: true
+		}],
+		ef_druid_truth_of_wind: [{
+			type: "STR",
+			file: "druid/dr_truth_of_wind/truth_of_wind/truth_of_wind",
+			texturePath: "druid/dr_truth_of_wind/truth_of_wind/",
+			min: "druid/dr_truth_of_wind/truth_of_wind/min_truth_of_wind",
+			wav: "effect/druid/dr_truth_of_wind"
+		}, {
+			type: "STR",
+			file: "druid/dr_truth_of_wind/truth_of_wind_bottom/truth_of_wind_bottom",
+			texturePath: "druid/dr_truth_of_wind/truth_of_wind_bottom/",
+			min: "druid/dr_truth_of_wind/truth_of_wind_bottom/min_truth_of_wind_bottom",
+			renderBeforeEntities: true
+		}],
+		ef_druid_truth_of_earth: [{
+			type: "STR",
+			file: "druid/dr_truth_of_earth/truth_of_earth/truth_of_earth",
+			texturePath: "druid/dr_truth_of_earth/truth_of_earth/",
+			min: "druid/dr_truth_of_earth/truth_of_earth/min_truth_of_earth",
+			wav: "effect/druid/dr_truth_of_earth"
+		}, {
+			type: "STR",
+			file: "druid/dr_truth_of_earth/truth_of_earth_bottom/truth_of_earth_bottom",
+			texturePath: "druid/dr_truth_of_earth/truth_of_earth_bottom/",
+			min: "druid/dr_truth_of_earth/truth_of_earth_bottom/min_truth_of_earth_bottom",
+			renderBeforeEntities: true
+		}],
+		ef_druid_nature_shield: [{
+			type: "STR",
+			file: "druid/dr_nature_shield/nature_shield/nature_shield",
+			texturePath: "druid/dr_nature_shield/nature_shield/",
+			min: "druid/dr_nature_shield/nature_shield/min_nature_shield",
+			wav: "effect/druid/dr_nature_shield"
+		}],
+		ef_druid_nature_protection: [{
+			type: "STR",
+			file: "druid/dr_nature_protection/nature_protection/nature_protection",
+			texturePath: "druid/dr_nature_protection/nature_protection/"
+		}],
+		ef_druid_hit_wolf: [{
+			type: "STR",
+			file: "druid/dr_hit/dr_hit_werewolf/dr_hit_werewolf",
+			texturePath: "druid/dr_hit/dr_hit_werewolf/",
+			min: "druid/dr_hit/dr_hit_werewolf/min_dr_hit_werewolf"
+		}],
+		ef_druid_hit_raptor: [{
+			type: "STR",
+			file: "druid/dr_hit/dr_hit_wereraptor/dr_hit_wereraptor",
+			texturePath: "druid/dr_hit/dr_hit_wereraptor/",
+			min: "druid/dr_hit/dr_hit_wereraptor/min_dr_hit_wereraptor"
+		}],
+		ef_druid_ice_hit: [{
+			type: "STR",
+			file: "druid/dr_ice_hit/ice_hit/ice_hit",
+			texturePath: "druid/dr_ice_hit/ice_hit/",
+			min: "druid/dr_ice_hit/ice_hit/min_ice_hit"
+		}],
+		ef_druid_ice_cast: [{
+			type: "STR",
+			file: "druid/ice_cast/ice_cast/ice_cast",
+			texturePath: "druid/ice_cast/ice_cast/",
+			min: "druid/ice_cast/ice_cast/min_ice_cast",
+			wav: "effect/druid/ice_cast"
+		}, {
+			type: "STR",
+			file: "druid/ice_cast/ice_cast_bottom/ice_cast_bottom",
+			texturePath: "druid/ice_cast/ice_cast_bottom/",
+			min: "druid/ice_cast/ice_cast_bottom/min_ice_cast_bottom",
+			renderBeforeEntities: true
+		}],
+		ef_druid_thunder_cast: [{
+			type: "STR",
+			file: "druid/thundering_cast/thundering_cast/thundering_cast",
+			texturePath: "druid/thundering_cast/thundering_cast/",
+			min: "druid/thundering_cast/thundering_cast/min_thundering_cast",
+			wav: "effect/druid/thundering_cast"
+		}],
+		ef_druid_thunder_hit_g: [{
+			type: "STR",
+			file: "druid/thundering_attack/thundering_attack_g/thundering_attack_g",
+			texturePath: "druid/thundering_attack/thundering_attack_g/",
+			min: "druid/thundering_attack/thundering_attack_g/min_thundering_attack_g"
+		}],
+		ef_druid_thunder_hit_y: [{
+			type: "STR",
+			file: "druid/thundering_attack/thundering_attack_y/thundering_attack_y",
+			texturePath: "druid/thundering_attack/thundering_attack_y/",
+			min: "druid/thundering_attack/thundering_attack_y/min_thundering_attack_y"
+		}],
+		ef_druid_nomercy_claw: [{
+			type: "STR",
+			file: "druid/dr_nomercy_claw/nomercy_claw/nomercy_claw",
+			texturePath: "druid/dr_nomercy_claw/nomercy_claw/",
+			min: "druid/dr_nomercy_claw/nomercy_claw/min_nomercy_claw",
+			wav: "effect/druid/dr_nomercy_claw"
+		}],
+		ef_druid_cruel_bite: [{
+			type: "STR",
+			file: "druid/dr_cruel_bite/cruel_bite/cruel_bite",
+			texturePath: "druid/dr_cruel_bite/cruel_bite/",
+			min: "druid/dr_cruel_bite/cruel_bite/min_cruel_bite",
+			wav: "effect/druid/dr_cruel_bite"
+		}],
+		ef_druid_hunger: [{
+			type: "STR",
+			file: "druid/dr_hunger/hunger/hunger",
+			texturePath: "druid/dr_hunger/hunger/",
+			min: "druid/dr_hunger/hunger/min_hunger",
+			wav: "effect/druid/dr_hunger"
+		}],
+		ef_druid_hunger_target: [{
+			type: "STR",
+			file: "druid/dr_hunger/hunger_target/hunger_target",
+			texturePath: "druid/dr_hunger/hunger_target/",
+			min: "druid/dr_hunger/hunger_target/min_hunger_target"
+		}],
+		ef_druid_shooting_feather: [{
+			type: "STR",
+			file: "druid/dr_shooting_feather/shooting_feather/shooting_feather",
+			texturePath: "druid/dr_shooting_feather/shooting_feather/",
+			min: "druid/dr_shooting_feather/shooting_feather/min_shooting_feather",
+			wav: "effect/druid/dr_shooting_feather"
+		}],
+		ef_druid_shooting_feather_hit: [{
+			type: "STR",
+			file: "druid/dr_shooting_feather/shooting_feather_attack/shooting_feather_attack",
+			texturePath: "druid/dr_shooting_feather/shooting_feather_attack/",
+			min: "druid/dr_shooting_feather/shooting_feather_attack/min_shooting_feather_attack"
+		}],
+		ef_druid_flicking_tonado: [{
+			type: "STR",
+			file: "druid/dr_flicking_tonado/flicking_tonado/flicking_tonado",
+			texturePath: "druid/dr_flicking_tonado/flicking_tonado/",
+			min: "druid/dr_flicking_tonado/flicking_tonado/min_flicking_tonado",
+			wav: "effect/druid/dr_flicking_tonado"
+		}, {
+			type: "STR",
+			file: "druid/dr_flicking_tonado/flicking_tonado_bottom/flicking_tonado_bottom",
+			texturePath: "druid/dr_flicking_tonado/flicking_tonado_bottom/",
+			min: "druid/dr_flicking_tonado/flicking_tonado_bottom/min_flicking_tonado_bottom",
+			renderBeforeEntities: true
+		}],
+		ef_druid_low_flight: [{
+			type: "STR",
+			file: "druid/dr_low_flight/low_flight_horizon/low_flight_horizon",
+			texturePath: "druid/dr_low_flight/low_flight_horizon/",
+			min: "druid/dr_low_flight/low_flight_horizon/min_low_flight_horizon",
+			wav: "effect/druid/dr_low_flight"
+		}, {
+			type: "STR",
+			file: "druid/dr_low_flight/low_flight_bottom/low_flight_bottom",
+			texturePath: "druid/dr_low_flight/low_flight_bottom/",
+			min: "druid/dr_low_flight/low_flight_bottom/min_low_flight_bottom",
+			renderBeforeEntities: true
+		}],
+		ef_druid_low_flight_up: [{
+			type: "STR",
+			file: "druid/dr_low_flight/low_flight_vertical/low_flight_vertical",
+			texturePath: "druid/dr_low_flight/low_flight_vertical/",
+			min: "druid/dr_low_flight/low_flight_vertical/min_low_flight_vertical"
+		}],
+		ef_druid_ice_totem: [{
+			type: "STR",
+			file: "druid/dr_ice_totem/ice_totem/ice_totem",
+			texturePath: "druid/dr_ice_totem/ice_totem/",
+			min: "druid/dr_ice_totem/ice_totem/min_ice_totem",
+			wav: "effect/druid/dr_ice_totem"
+		}],
+		ef_druid_ice_cloud: [{
+			type: "STR",
+			file: "druid/dr_ice_cloud/ice_cloud/ice_cloud",
+			texturePath: "druid/dr_ice_cloud/ice_cloud/",
+			min: "druid/dr_ice_cloud/ice_cloud/min_ice_cloud",
+			wav: "effect/druid/dr_ice_cloud"
+		}],
+		ef_druid_cutting_wind: [{
+			type: "STR",
+			file: "druid/dr_cutting_wind/cutting_wind/cutting_wind",
+			texturePath: "druid/dr_cutting_wind/cutting_wind/",
+			min: "druid/dr_cutting_wind/cutting_wind/min_cutting_wind",
+			wav: "effect/druid/dr_cutting_wind"
+		}],
+		ef_druid_cutting_wind_hit: [{
+			type: "STR",
+			file: "druid/dr_cutting_wind/cutting_wind_hit/cutting_wind_hit",
+			texturePath: "druid/dr_cutting_wind/cutting_wind_hit/",
+			min: "druid/dr_cutting_wind/cutting_wind_hit/min_cutting_wind_hit"
+		}],
+		ef_druid_wind_bomb: [{
+			type: "STR",
+			file: "druid/dr_wind_bomb/wind_bomb_main/wind_bomb_main",
+			texturePath: "druid/dr_wind_bomb/wind_bomb_main/",
+			min: "druid/dr_wind_bomb/wind_bomb_main/min_wind_bomb_main",
+			wav: "effect/druid/dr_wind_bomb"
+		}, {
+			type: "STR",
+			file: "druid/dr_wind_bomb/wind_bomb_tornado/wind_bomb_tornado",
+			texturePath: "druid/dr_wind_bomb/wind_bomb_tornado/",
+			min: "druid/dr_wind_bomb/wind_bomb_tornado/min_wind_bomb_tornado"
+		}],
+		ef_druid_wind_bomb_hit: [{
+			type: "STR",
+			file: "druid/dr_wind_bomb/wind_bomb_hit/wind_bomb_hit",
+			texturePath: "druid/dr_wind_bomb/wind_bomb_hit/",
+			min: "druid/dr_wind_bomb/wind_bomb_hit/min_wind_bomb_hit"
+		}],
+		ef_druid_earth_flower: [{
+			type: "STR",
+			file: "druid/dr_earth_flower/earth_flower/earth_flower",
+			texturePath: "druid/dr_earth_flower/earth_flower/",
+			min: "druid/dr_earth_flower/earth_flower/min_earth_flower",
+			wav: "effect/druid/dr_earth_flower"
+		}, {
+			type: "STR",
+			file: "druid/dr_earth_flower/earth_flower_bottom/earth_flower_bottom",
+			texturePath: "druid/dr_earth_flower/earth_flower_bottom/",
+			min: "druid/dr_earth_flower/earth_flower_bottom/min_earth_flower_bottom",
+			renderBeforeEntities: true
+		}],
+		ef_druid_around_flower: [{
+			type: "STR",
+			file: "druid/dr_around_flower/around_flower/around_flower",
+			texturePath: "druid/dr_around_flower/around_flower/",
+			min: "druid/dr_around_flower/around_flower/min_around_flower",
+			wav: "effect/druid/dr_around_flower"
+		}, {
+			type: "STR",
+			file: "druid/dr_around_flower/around_flower_bottom/around_flower_bottom",
+			texturePath: "druid/dr_around_flower/around_flower_bottom/",
+			min: "druid/dr_around_flower/around_flower_bottom/min_around_flower_bottom",
+			renderBeforeEntities: true
+		}],
+		ef_druid_nasty_slash: [{
+			type: "STR",
+			file: "druid/kr_nasty_slash/nasty_slash/nasty_slash",
+			texturePath: "druid/kr_nasty_slash/nasty_slash/",
+			min: "druid/kr_nasty_slash/nasty_slash/min_nasty_slash",
+			wav: "effect/druid/kr_nasty_slash"
+		}],
+		ef_druid_double_slash: [{
+			type: "STR",
+			file: "druid/kr_double_slash/double_slash/double_slash",
+			texturePath: "druid/kr_double_slash/double_slash/",
+			min: "druid/kr_double_slash/double_slash/min_double_slash",
+			wav: "effect/druid/kr_double_slash"
+		}],
+		ef_druid_claw_wave: [{
+			type: "STR",
+			file: "druid/kr_claw_wave/claw_wave/claw_wave",
+			texturePath: "druid/kr_claw_wave/claw_wave/",
+			min: "druid/kr_claw_wave/claw_wave/min_claw_wave",
+			wav: "effect/druid/kr_claw_wave"
+		}],
+		ef_druid_chop_chop: [{
+			type: "STR",
+			file: "druid/kr_chop_chop/chop_chop/chop_chop",
+			texturePath: "druid/kr_chop_chop/chop_chop/",
+			min: "druid/kr_chop_chop/chop_chop/min_chop_chop",
+			wav: "effect/druid/kr_chop_chop"
+		}],
+		ef_druid_chop_chop_hit: [{
+			type: "STR",
+			file: "druid/kr_chop_chop/chop_chop_sub/chop_chop_sub",
+			texturePath: "druid/kr_chop_chop/chop_chop_sub/",
+			min: "druid/kr_chop_chop/chop_chop_sub/min_chop_chop_sub"
+		}],
+		ef_druid_iron_howling: [{
+			type: "STR",
+			file: "druid/kr_iron_howling/iron_howling/iron_howling",
+			texturePath: "druid/kr_iron_howling/iron_howling/",
+			min: "druid/kr_iron_howling/iron_howling/min_iron_howling",
+			wav: "effect/druid/kr_iron_howling"
+		}],
+		ef_druid_sharpen_gust: [{
+			type: "STR",
+			file: "druid/kr_sharpen_gust/sharpen_gust/sharpen_gust",
+			texturePath: "druid/kr_sharpen_gust/sharpen_gust/",
+			min: "druid/kr_sharpen_gust/sharpen_gust/min_sharpen_gust",
+			wav: "effect/druid/kr_sharpen_gust"
+		}, {
+			type: "STR",
+			file: "druid/kr_sharpen_gust/sharpen_gust_bottom/sharpen_gust_bottom",
+			texturePath: "druid/kr_sharpen_gust/sharpen_gust_bottom/",
+			min: "druid/kr_sharpen_gust/sharpen_gust_bottom/min_sharpen_gust_bottom",
+			renderBeforeEntities: true
+		}],
+		ef_druid_sharpen_hail: [{
+			type: "STR",
+			file: "druid/kr_sharpen_hail/sharpen_hail/sharpen_hail",
+			texturePath: "druid/kr_sharpen_hail/sharpen_hail/",
+			min: "druid/kr_sharpen_hail/sharpen_hail/min_sharpen_hail",
+			wav: "effect/druid/kr_sharpen_hail"
+		}, {
+			type: "STR",
+			file: "druid/kr_sharpen_hail/sharpen_hail_bottom/sharpen_hail_bottom",
+			texturePath: "druid/kr_sharpen_hail/sharpen_hail_bottom/",
+			min: "druid/kr_sharpen_hail/sharpen_hail_bottom/min_sharpen_hail_bottom",
+			renderBeforeEntities: true
+		}],
+		ef_druid_sharpen_hail_shot: [{
+			type: "STR",
+			file: "druid/kr_sharpen_hail/sharpen_hail_shot/sharpen_hail_shot",
+			texturePath: "druid/kr_sharpen_hail/sharpen_hail_shot/",
+			min: "druid/kr_sharpen_hail/sharpen_hail_shot/min_sharpen_hail_shot"
+		}, {
+			type: "STR",
+			file: "druid/kr_sharpen_hail/sharpen_hail_shot_bottom/sharpen_hail_shot_bottom",
+			texturePath: "druid/kr_sharpen_hail/sharpen_hail_shot_bottom/",
+			min: "druid/kr_sharpen_hail/sharpen_hail_shot_bottom/min_sharpen_hail_shot_bottom",
+			renderBeforeEntities: true
+		}],
+		ef_druid_typhoon_wing: [{
+			type: "STR",
+			file: "druid/kr_typhoon_wing/typhoon_wing_5x5/typhoon_wing_5x5",
+			texturePath: "druid/kr_typhoon_wing/typhoon_wing_5x5/",
+			min: "druid/kr_typhoon_wing/typhoon_wing_5x5/min_typhoon_wing_5x5",
+			wav: "effect/druid/kr_typhoon_wing"
+		}, {
+			type: "STR",
+			file: "druid/kr_typhoon_wing/typhoon_wing_5x5_bottom/typhoon_wing_5x5_bottom",
+			texturePath: "druid/kr_typhoon_wing/typhoon_wing_5x5_bottom/",
+			min: "druid/kr_typhoon_wing/typhoon_wing_5x5_bottom/min_typhoon_wing_5x5_bottom",
+			renderBeforeEntities: true
+		}],
+		ef_druid_feather_sprinkle: [{
+			type: "STR",
+			file: "druid/kr_feather_sprinkle/feather_sprinkle/feather_sprinkle",
+			texturePath: "druid/kr_feather_sprinkle/feather_sprinkle/",
+			min: "druid/kr_feather_sprinkle/feather_sprinkle/min_feather_sprinkle",
+			wav: "effect/druid/kr_feather_sprinkle"
+		}, {
+			type: "STR",
+			file: "druid/kr_feather_sprinkle/feather_sprinkle_bottom/feather_sprinkle_bottom",
+			texturePath: "druid/kr_feather_sprinkle/feather_sprinkle_bottom/",
+			min: "druid/kr_feather_sprinkle/feather_sprinkle_bottom/min_feather_sprinkle_bottom",
+			renderBeforeEntities: true
+		}],
+		ef_druid_wind_veil: [{
+			type: "STR",
+			file: "druid/kr_wind_veil/wild_veil/wild_veil",
+			texturePath: "druid/kr_wind_veil/wild_veil/",
+			min: "druid/kr_wind_veil/wild_veil/min_wild_veil",
+			wav: "effect/druid/kr_wind_veil"
+		}, {
+			type: "STR",
+			file: "druid/kr_wind_veil/wild_veil_bottom/wild_veil_bottom",
+			texturePath: "druid/kr_wind_veil/wild_veil_bottom/",
+			min: "druid/kr_wind_veil/wild_veil_bottom/min_wild_veil_bottom",
+			renderBeforeEntities: true
+		}],
+		ef_druid_ice_pillar_start: [{
+			type: "STR",
+			file: "druid/kr_ice_pillar/ice_pillar_start/ice_pillar_start",
+			texturePath: "druid/kr_ice_pillar/ice_pillar_start/",
+			min: "druid/kr_ice_pillar/ice_pillar_start/min_ice_pillar_start",
+			wav: "effect/druid/kr_ice_pillar_start"
+		}, {
+			type: "STR",
+			file: "druid/kr_ice_pillar/ice_pillar_start_bottom/ice_pillar_start_bottom",
+			texturePath: "druid/kr_ice_pillar/ice_pillar_start_bottom/",
+			min: "druid/kr_ice_pillar/ice_pillar_start_bottom/min_ice_pillar_start_bottom",
+			renderBeforeEntities: true
+		}],
+		ef_druid_ice_pillar_loop: [{
+			type: "STR",
+			file: "druid/kr_ice_pillar/ice_pillar_loop/ice_pillar_loop",
+			texturePath: "druid/kr_ice_pillar/ice_pillar_loop/",
+			min: "druid/kr_ice_pillar/ice_pillar_loop/min_ice_pillar_loop"
+		}, {
+			type: "STR",
+			file: "druid/kr_ice_pillar/ice_pillar_loop_bottom/ice_pillar_loop_bottom",
+			texturePath: "druid/kr_ice_pillar/ice_pillar_loop_bottom/",
+			min: "druid/kr_ice_pillar/ice_pillar_loop_bottom/min_ice_pillar_loop_bottom",
+			renderBeforeEntities: true
+		}],
+		ef_druid_ice_splash: [{
+			type: "STR",
+			file: "druid/kr_ice_splash/ice_splash/ice_splash",
+			texturePath: "druid/kr_ice_splash/ice_splash/",
+			min: "druid/kr_ice_splash/ice_splash/min_ice_splash",
+			wav: "effect/druid/kr_ice_splash"
+		}],
+		ef_druid_thundering_focus_g: [{
+			type: "STR",
+			file: "druid/kr_thundering_focus/thundering_focus_g/thundering_focus_g",
+			texturePath: "druid/kr_thundering_focus/thundering_focus_g/",
+			min: "druid/kr_thundering_focus/thundering_focus_g/min_thundering_focus_g",
+			wav: "effect/druid/kr_thundering_focus_g"
+		}],
+		ef_druid_thundering_focus_y: [{
+			type: "STR",
+			file: "druid/kr_thundering_focus/thundering_focus_y/thundering_focus_y",
+			texturePath: "druid/kr_thundering_focus/thundering_focus_y/",
+			min: "druid/kr_thundering_focus/thundering_focus_y/min_thundering_focus_y",
+			wav: "effect/druid/kr_thundering_focus_y"
+		}],
+		ef_druid_thundering_orb_g: [{
+			type: "STR",
+			file: "druid/kr_thundering_orb/thundering_orb_g/thundering_orb_g",
+			texturePath: "druid/kr_thundering_orb/thundering_orb_g/",
+			min: "druid/kr_thundering_orb/thundering_orb_g/min_thundering_orb_g",
+			wav: "effect/druid/kr_thundering_orb_g"
+		}, {
+			type: "STR",
+			file: "druid/kr_thundering_orb/thundering_orb_g_bottom/thundering_orb_g_bottom",
+			texturePath: "druid/kr_thundering_orb/thundering_orb_g_bottom/",
+			min: "druid/kr_thundering_orb/thundering_orb_g_bottom/min_thundering_orb_g_bottom",
+			renderBeforeEntities: true
+		}],
+		ef_druid_thundering_orb_y: [{
+			type: "STR",
+			file: "druid/kr_thundering_orb/thundering_orb_y/thundering_orb_y",
+			texturePath: "druid/kr_thundering_orb/thundering_orb_y/",
+			min: "druid/kr_thundering_orb/thundering_orb_y/min_thundering_orb_y",
+			wav: "effect/druid/kr_thundering_orb_y"
+		}, {
+			type: "STR",
+			file: "druid/kr_thundering_orb/thundering_orb_y_bottom/thundering_orb_y_bottom",
+			texturePath: "druid/kr_thundering_orb/thundering_orb_y_bottom/",
+			min: "druid/kr_thundering_orb/thundering_orb_y_bottom/min_thundering_orb_y_bottom",
+			renderBeforeEntities: true
+		}],
+		ef_druid_thundering_call_g: [{
+			type: "STR",
+			file: "druid/kr_thundering_call/thundering_call_g_3x3/thundering_call_g_3x3",
+			texturePath: "druid/kr_thundering_call/thundering_call_g_3x3/",
+			min: "druid/kr_thundering_call/thundering_call_g_3x3/min_thundering_call_g_3x3",
+			wav: "effect/druid/kr_thundering_call_g"
+		}, {
+			type: "STR",
+			file: "druid/kr_thundering_call/thundering_call_g_3x3_bottom/thundering_call_g_3x3_bottom",
+			texturePath: "druid/kr_thundering_call/thundering_call_g_3x3_bottom/",
+			min: "druid/kr_thundering_call/thundering_call_g_3x3_bottom/min_thundering_call_g_3x3_bottom",
+			renderBeforeEntities: true
+		}],
+		ef_druid_thundering_call_y: [{
+			type: "STR",
+			file: "druid/kr_thundering_call/thundering_call_y_3x3/thundering_call_y_3x3",
+			texturePath: "druid/kr_thundering_call/thundering_call_y_3x3/",
+			min: "druid/kr_thundering_call/thundering_call_y_3x3/min_thundering_call_y_3x3",
+			wav: "effect/druid/kr_thundering_call_y"
+		}, {
+			type: "STR",
+			file: "druid/kr_thundering_call/thundering_call_y_3x3_bottom/thundering_call_y_3x3_bottom",
+			texturePath: "druid/kr_thundering_call/thundering_call_y_3x3_bottom/",
+			min: "druid/kr_thundering_call/thundering_call_y_3x3_bottom/min_thundering_call_y_3x3_bottom",
+			renderBeforeEntities: true
+		}],
+		ef_druid_earth_drill: [{
+			type: "STR",
+			file: "druid/kr_earth_drill/earth_drill/earth_drill",
+			texturePath: "druid/kr_earth_drill/earth_drill/",
+			min: "druid/kr_earth_drill/earth_drill/min_earth_drill",
+			wav: "effect/druid/kr_earth_drill"
+		}, {
+			type: "STR",
+			file: "druid/kr_earth_drill/earth_drill_bottom/earth_drill_bottom",
+			texturePath: "druid/kr_earth_drill/earth_drill_bottom/",
+			min: "druid/kr_earth_drill/earth_drill_bottom/min_earth_drill_bottom",
+			renderBeforeEntities: true
+		}],
+		ef_druid_earth_stamp: [{
+			type: "STR",
+			file: "druid/kr_earth_stamp/earth_stamp/earth_stamp",
+			texturePath: "druid/kr_earth_stamp/earth_stamp/",
+			min: "druid/kr_earth_stamp/earth_stamp/min_earth_stamp",
+			wav: "effect/druid/kr_earth_stamp"
+		}, {
+			type: "STR",
+			file: "druid/kr_earth_stamp/earth_stamp_bottom/earth_stamp_bottom",
+			texturePath: "druid/kr_earth_stamp/earth_stamp_bottom/",
+			min: "druid/kr_earth_stamp/earth_stamp_bottom/min_earth_stamp_bottom",
+			renderBeforeEntities: true
+		}],
+		ef_druid_ground_bloom: [{
+			type: "STR",
+			file: "druid/kr_ground_bloom/ground_bloom/ground_bloom",
+			texturePath: "druid/kr_ground_bloom/ground_bloom/",
+			min: "druid/kr_ground_bloom/ground_bloom/min_ground_bloom",
+			wav: "effect/druid/kr_ground_bloom"
+		}, {
+			type: "STR",
+			file: "druid/kr_ground_bloom/ground_bloom_bottom/ground_bloom_bottom",
+			texturePath: "druid/kr_ground_bloom/ground_bloom_bottom/",
+			min: "druid/kr_ground_bloom/ground_bloom_bottom/min_ground_bloom_bottom",
+			renderBeforeEntities: true
+		}],
+		ef_druid_pulse_of_madness: [{
+			type: "STR",
+			file: "druid/at_pulse_of_madness/pulse_of_madness/pulse_of_madness",
+			texturePath: "druid/at_pulse_of_madness/pulse_of_madness/",
+			min: "druid/at_pulse_of_madness/pulse_of_madness/min_pulse_of_madness",
+			wav: "effect/druid/at_pulse_of_madness"
+		}],
+		ef_druid_alpha_phase: [{
+			type: "STR",
+			file: "druid/at_alpha_phase/alpha_phase/alpha_phase",
+			texturePath: "druid/at_alpha_phase/alpha_phase/",
+			min: "druid/at_alpha_phase/alpha_phase/min_alpha_phase",
+			wav: "effect/druid/at_alpha_phase"
+		}],
+		ef_druid_apex_phase: [{
+			type: "STR",
+			file: "druid/at_apex_phase/apex_phase/apex_phase",
+			texturePath: "druid/at_apex_phase/apex_phase/",
+			min: "druid/at_apex_phase/apex_phase/min_apex_phase",
+			wav: "effect/druid/at_apex_phase"
+		}],
+		ef_druid_flip_flap: [{
+			type: "STR",
+			file: "druid/at_flip_flap/flip_flap/flip_flap",
+			texturePath: "druid/at_flip_flap/flip_flap/",
+			min: "druid/at_flip_flap/flip_flap/min_flip_flap",
+			wav: "effect/druid/at_flip_flap"
+		}],
+		ef_druid_nature_harmony: [{
+			type: "STR",
+			file: "druid/at_nature_harmony/nature_harmony/nature_harmony",
+			texturePath: "druid/at_nature_harmony/nature_harmony/",
+			min: "druid/at_nature_harmony/nature_harmony/min_nature_harmony",
+			wav: "effect/druid/at_nature_harmony"
+		}],
+		ef_druid_primal_claw: [{
+			type: "STR",
+			file: "druid/at_primal_claw/primal_claw/primal_claw",
+			texturePath: "druid/at_primal_claw/primal_claw/",
+			min: "druid/at_primal_claw/primal_claw/min_primal_claw",
+			wav: "effect/druid/at_primal_claw"
+		}],
+		ef_druid_feral_claw: [{
+			type: "STR",
+			file: "druid/at_feral_claw/feral_claw/feral_claw",
+			texturePath: "druid/at_feral_claw/feral_claw/",
+			min: "druid/at_feral_claw/feral_claw/min_feral_claw",
+			wav: "effect/druid/at_feral_claw"
+		}],
+		ef_druid_alpha_claw: [{
+			type: "STR",
+			file: "druid/at_alpha_claw/alpha_claw/alpha_claw",
+			texturePath: "druid/at_alpha_claw/alpha_claw/",
+			min: "druid/at_alpha_claw/alpha_claw/min_alpha_claw",
+			wav: "effect/druid/at_alpha_claw"
+		}],
+		ef_druid_savage_lunge: [{
+			type: "STR",
+			file: "druid/at_savage_lunge/savage_lunge/savage_lunge",
+			texturePath: "druid/at_savage_lunge/savage_lunge/",
+			min: "druid/at_savage_lunge/savage_lunge/min_savage_lunge",
+			wav: "effect/druid/at_savage_lunge"
+		}, {
+			type: "STR",
+			file: "druid/at_savage_lunge/savage_lunge_bottom/savage_lunge_bottom",
+			texturePath: "druid/at_savage_lunge/savage_lunge_bottom/",
+			min: "druid/at_savage_lunge/savage_lunge_bottom/min_savage_lunge_bottom",
+			renderBeforeEntities: true
+		}],
+		ef_druid_frenzy_fang: [{
+			type: "STR",
+			file: "druid/at_frenzy_fang/frenzy_fang/frenzy_fang",
+			texturePath: "druid/at_frenzy_fang/frenzy_fang/",
+			min: "druid/at_frenzy_fang/frenzy_fang/min_frenzy_fang",
+			wav: "effect/druid/at_frenzy_fang"
+		}],
+		ef_druid_pinion_shot: [{
+			type: "STR",
+			file: "druid/at_pinion_shot/pinion_shot/pinion_shot",
+			texturePath: "druid/at_pinion_shot/pinion_shot/",
+			min: "druid/at_pinion_shot/pinion_shot/min_pinion_shot",
+			wav: "effect/druid/at_pinion_shot"
+		}],
+		ef_druid_quill_spear: [{
+			type: "STR",
+			file: "druid/at_quill_spear/quill_spear_3x7/quill_spear_3x7",
+			texturePath: "druid/at_quill_spear/quill_spear_3x7/",
+			min: "druid/at_quill_spear/quill_spear_3x7/min_quill_spear_3x7",
+			wav: "effect/druid/at_quill_spear"
+		}],
+		ef_druid_quill_spear_s: [{
+			type: "STR",
+			file: "druid/at_quill_spear/quill_spear_5x7/quill_spear_5x7",
+			texturePath: "druid/at_quill_spear/quill_spear_5x7/",
+			min: "druid/at_quill_spear/quill_spear_5x7/min_quill_spear_5x7",
+			wav: "effect/druid/at_quill_spear"
+		}],
+		ef_druid_tempest_flap: [{
+			type: "STR",
+			file: "druid/at_tempest_flap/tempest_flap/tempest_flap",
+			texturePath: "druid/at_tempest_flap/tempest_flap/",
+			min: "druid/at_tempest_flap/tempest_flap/min_tempest_flap",
+			wav: "effect/druid/at_tempest_flap"
+		}, {
+			type: "STR",
+			file: "druid/at_tempest_flap/tempest_flap_bottom/tempest_flap_bottom",
+			texturePath: "druid/at_tempest_flap/tempest_flap_bottom/",
+			min: "druid/at_tempest_flap/tempest_flap_bottom/min_tempest_flap_bottom",
+			renderBeforeEntities: true
+		}],
+		ef_druid_tempest_flap_cast: [{
+			type: "STR",
+			file: "druid/at_tempest_flap/tempest_flap_cast/tempest_flap_cast",
+			texturePath: "druid/at_tempest_flap/tempest_flap_cast/",
+			min: "druid/at_tempest_flap/tempest_flap_cast/min_tempest_flap_cast"
+		}],
+		ef_druid_aero_sync: [{
+			type: "STR",
+			file: "druid/at_aero_sync/aero_sync_main/aero_sync_main",
+			texturePath: "druid/at_aero_sync/aero_sync_main/",
+			min: "druid/at_aero_sync/aero_sync_main/min_aero_sync_main",
+			wav: "effect/druid/at_aero_sync"
+		}, {
+			type: "STR",
+			file: "druid/at_aero_sync/aero_sync_main_bottom/aero_sync_main_bottom",
+			texturePath: "druid/at_aero_sync/aero_sync_main_bottom/",
+			min: "druid/at_aero_sync/aero_sync_main_bottom/min_aero_sync_main_bottom",
+			renderBeforeEntities: true
+		}],
+		ef_druid_aero_sync_self: [{
+			type: "STR",
+			file: "druid/at_aero_sync/aero_sync_sync/aero_sync_sync",
+			texturePath: "druid/at_aero_sync/aero_sync_sync/",
+			min: "druid/at_aero_sync/aero_sync_sync/min_aero_sync_sync"
+		}],
+		ef_druid_zephyr_link: [{
+			type: "STR",
+			file: "druid/at_zephyr_link/zephyr_link/zephyr_link",
+			texturePath: "druid/at_zephyr_link/zephyr_link/",
+			min: "druid/at_zephyr_link/zephyr_link/min_zephyr_link",
+			wav: "effect/druid/at_zephyr_link"
+		}, {
+			type: "STR",
+			file: "druid/at_zephyr_link/zephyr_link_bottom/zephyr_link_bottom",
+			texturePath: "druid/at_zephyr_link/zephyr_link_bottom/",
+			min: "druid/at_zephyr_link/zephyr_link_bottom/min_zephyr_link_bottom",
+			renderBeforeEntities: true
+		}],
+		ef_druid_glacier_monolith_start: [{
+			type: "STR",
+			file: "druid/at_glacier_monolith/glacier_monolith_start/glacier_monolith_start",
+			texturePath: "druid/at_glacier_monolith/glacier_monolith_start/",
+			min: "druid/at_glacier_monolith/glacier_monolith_start/min_glacier_monolith_start",
+			wav: "effect/druid/at_glacier_monolith_start"
+		}, {
+			type: "STR",
+			file: "druid/at_glacier_monolith/glacier_monolith_start_bottom/glacier_monolith_start_bottom",
+			texturePath: "druid/at_glacier_monolith/glacier_monolith_start_bottom/",
+			min: "druid/at_glacier_monolith/glacier_monolith_start_bottom/min_glacier_monolith_start_bottom",
+			renderBeforeEntities: true
+		}],
+		ef_druid_glacier_monolith_loop: [{
+			type: "STR",
+			file: "druid/at_glacier_monolith/glacier_monolith_loop/glacier_monolith_loop",
+			texturePath: "druid/at_glacier_monolith/glacier_monolith_loop/",
+			min: "druid/at_glacier_monolith/glacier_monolith_loop/min_glacier_monolith_loop"
+		}, {
+			type: "STR",
+			file: "druid/at_glacier_monolith/glacier_monolith_loop_bottom/glacier_monolith_loop_bottom",
+			texturePath: "druid/at_glacier_monolith/glacier_monolith_loop_bottom/",
+			min: "druid/at_glacier_monolith/glacier_monolith_loop_bottom/min_glacier_monolith_loop_bottom",
+			renderBeforeEntities: true
+		}],
+		ef_druid_glacier_nova: [{
+			type: "STR",
+			file: "druid/at_glacier_nova/glacier_nova/glacier_nova",
+			texturePath: "druid/at_glacier_nova/glacier_nova/",
+			min: "druid/at_glacier_nova/glacier_nova/min_glacier_nova",
+			wav: "effect/druid/at_glacier_nova"
+		}],
+		ef_druid_glacier_shard: [{
+			type: "STR",
+			file: "druid/at_glacier_shard/glacier_shard/glacier_shard",
+			texturePath: "druid/at_glacier_shard/glacier_shard/",
+			min: "druid/at_glacier_shard/glacier_shard/min_glacier_shard",
+			wav: "effect/druid/at_glacier_shard"
+		}, {
+			type: "STR",
+			file: "druid/at_glacier_shard/glacier_shard_target/glacier_shard_target",
+			texturePath: "druid/at_glacier_shard/glacier_shard_target/",
+			min: "druid/at_glacier_shard/glacier_shard_target/min_glacier_shard_target"
+		}],
+		ef_druid_glacier_stomp: [{
+			type: "STR",
+			file: "druid/at_glacier_stomp/glacier_stomp/glacier_stomp",
+			texturePath: "druid/at_glacier_stomp/glacier_stomp/",
+			min: "druid/at_glacier_stomp/glacier_stomp/min_glacier_stomp"
+		}],
+		ef_druid_chilling_blast: [{
+			type: "STR",
+			file: "druid/at_chilling_blast/chilling_blast/chilling_blast",
+			texturePath: "druid/at_chilling_blast/chilling_blast/",
+			min: "druid/at_chilling_blast/chilling_blast/min_chilling_blast",
+			wav: "effect/druid/at_chilling_blast"
+		}, {
+			type: "STR",
+			file: "druid/at_chilling_blast/chilling_blast_bottom/chilling_blast_bottom",
+			texturePath: "druid/at_chilling_blast/chilling_blast_bottom/",
+			min: "druid/at_chilling_blast/chilling_blast_bottom/min_chilling_blast_bottom",
+			renderBeforeEntities: true
+		}],
+		ef_druid_roaring_piercer_g: [{
+			type: "STR",
+			file: "druid/at_roaring_piercer/roaring_piercer_g/roaring_piercer_g",
+			texturePath: "druid/at_roaring_piercer/roaring_piercer_g/",
+			min: "druid/at_roaring_piercer/roaring_piercer_g/min_roaring_piercer_g",
+			wav: "effect/druid/at_roaring_piercer_g"
+		}],
+		ef_druid_roaring_piercer_y: [{
+			type: "STR",
+			file: "druid/at_roaring_piercer/roaring_piercer_y/roaring_piercer_y",
+			texturePath: "druid/at_roaring_piercer/roaring_piercer_y/",
+			min: "druid/at_roaring_piercer/roaring_piercer_y/min_roaring_piercer_y",
+			wav: "effect/druid/at_roaring_piercer_y"
+		}],
+		ef_druid_roaring_charge: [{
+			type: "STR",
+			file: "druid/at_roaring_charge/roaring_charge/roaring_charge",
+			texturePath: "druid/at_roaring_charge/roaring_charge/",
+			min: "druid/at_roaring_charge/roaring_charge/min_roaring_charge",
+			wav: "effect/druid/at_roaring_charge_g"
+		}, {
+			type: "STR",
+			file: "druid/at_roaring_charge/roaring_charge_bottom/roaring_charge_bottom",
+			texturePath: "druid/at_roaring_charge/roaring_charge_bottom/",
+			min: "druid/at_roaring_charge/roaring_charge_bottom/min_roaring_charge_bottom",
+			renderBeforeEntities: true
+		}],
+		ef_druid_roaring_charge_s: [{
+			type: "STR",
+			file: "druid/at_roaring_charge/roaring_charge_s/roaring_charge_s",
+			texturePath: "druid/at_roaring_charge/roaring_charge_s/",
+			min: "druid/at_roaring_charge/roaring_charge_s/min_roaring_charge_s",
+			wav: "effect/druid/at_roaring_charge_y"
+		}, {
+			type: "STR",
+			file: "druid/at_roaring_charge/roaring_charge_s_bottom/roaring_charge_s_bottom",
+			texturePath: "druid/at_roaring_charge/roaring_charge_s_bottom/",
+			min: "druid/at_roaring_charge/roaring_charge_s_bottom/min_roaring_charge_s_bottom",
+			renderBeforeEntities: true
+		}],
+		ef_druid_furios_storm: [{
+			type: "STR",
+			file: "druid/at_furios_storm/furios_storm_a/furios_storm_a",
+			texturePath: "druid/at_furios_storm/furios_storm_a/",
+			min: "druid/at_furios_storm/furios_storm_a/min_furios_storm_a",
+			wav: "effect/druid/at_furios_storm"
+		}, {
+			type: "STR",
+			file: "druid/at_furios_storm/furios_storm_a_bottom/furios_storm_a_bottom",
+			texturePath: "druid/at_furios_storm/furios_storm_a_bottom/",
+			min: "druid/at_furios_storm/furios_storm_a_bottom/min_furios_storm_a_bottom",
+			renderBeforeEntities: true
+		}],
+		ef_druid_terra_wave: [{
+			type: "STR",
+			file: "druid/at_terra_wave/terra_wave/terra_wave",
+			texturePath: "druid/at_terra_wave/terra_wave/",
+			min: "druid/at_terra_wave/terra_wave/min_terra_wave",
+			wav: "effect/druid/at_terra_wave"
+		}, {
+			type: "STR",
+			file: "druid/at_terra_wave/terra_wave_bottom/terra_wave_bottom",
+			texturePath: "druid/at_terra_wave/terra_wave_bottom/",
+			min: "druid/at_terra_wave/terra_wave_bottom/min_terra_wave_bottom",
+			renderBeforeEntities: true
+		}],
+		ef_druid_terra_harvest: [{
+			type: "STR",
+			file: "druid/at_terra_harvest/terra_harvest_yellow/terra_harvest_yellow",
+			texturePath: "druid/at_terra_harvest/terra_harvest_yellow/",
+			min: "druid/at_terra_harvest/terra_harvest_yellow/min_terra_harvest_yellow",
+			wav: "effect/druid/at_terra_harvest"
+		}, {
+			type: "STR",
+			file: "druid/at_terra_harvest/terra_harvest_yellow_bottom/terra_harvest_yellow_bottom",
+			texturePath: "druid/at_terra_harvest/terra_harvest_yellow_bottom/",
+			min: "druid/at_terra_harvest/terra_harvest_yellow_bottom/min_terra_harvest_yellow_bottom",
+			renderBeforeEntities: true
+		}],
+		ef_druid_solid_stomp: [{
+			type: "STR",
+			file: "druid/at_solid_stomp/solid_stomp/solid_stomp",
+			texturePath: "druid/at_solid_stomp/solid_stomp/",
+			min: "druid/at_solid_stomp/solid_stomp/min_solid_stomp",
+			wav: "effect/druid/at_solid_stomp"
+		}, {
+			type: "STR",
+			file: "druid/at_solid_stomp/solid_stomp_bottom/solid_stomp_bottom",
+			texturePath: "druid/at_solid_stomp/solid_stomp_bottom/",
+			min: "druid/at_solid_stomp/solid_stomp_bottom/min_solid_stomp_bottom",
+			renderBeforeEntities: true
+		}],
+		ef_druid_gravity_hole: [{
+			type: "STR",
+			file: "druid/at_gravity_hole/gravity_hole/gravity_hole",
+			texturePath: "druid/at_gravity_hole/gravity_hole/",
+			min: "druid/at_gravity_hole/gravity_hole/min_gravity_hole",
+			wav: "effect/druid/at_gravity_hole"
+		}, {
+			type: "STR",
+			file: "druid/at_gravity_hole/gravity_hole_bottom/gravity_hole_bottom",
+			texturePath: "druid/at_gravity_hole/gravity_hole_bottom/",
+			min: "druid/at_gravity_hole/gravity_hole_bottom/min_gravity_hole_bottom",
 			renderBeforeEntities: true
 		}],
 		...table,
@@ -311041,7 +320458,8 @@ function mergeEz2Effects(EffectTable, SkillEffect) {
 			xOffset: entry.PosX || 0,
 			yOffset: entry.PosY || 0,
 			wav: entry.SoundPath ? entry.SoundPath.replace(/\\/g, "/").replace(/\.wav$/i, "") : null,
-			delayLate: entry.StartDelayTime || 0,
+			soundLoop: entry.IsSoundLoop == null ? void 0 : !!entry.IsSoundLoop,
+			delayStart: entry.StartDelayTime || 0,
 			repeat: !!entry.IsInfinite,
 			attachedEntity: true
 		}];
@@ -312794,6 +322212,148 @@ function loadSkillTreeViewData(filename, callback, onEnd) {
 	}, onEnd);
 }
 /**
+* customSkillId, customSkillInfoList, customSkillDescript and
+* customSkillTreeView: the mods' rows of the four skill tables, read after
+* the client's, in mod order. Each is a list of files shaped like the
+* client's own -- skillid.lub, skillinfolist.lub, skilldescript.lub,
+* skilltreeview.lub -- holding only a mod's rows: its new skills, and stock
+* ones it changes. Every mod's names come first, so the other tables can use
+* a mod's new SKID entries.
+*
+* A mod's skilltreeview.lub may also take skills out of a job's window, for
+* the skills its server no longer teaches:
+*
+*   SKILL_TREEVIEW_HIDE = { [JOBID.JT_GUILLOTINE_CROSS] = { SKID.GC_DARKILLUSION } }
+*
+* @param {function} onEnd - once every table has been read, or has failed
+*/
+function loadCustomSkillTables(onEnd) {
+	resetHiddenSkills();
+	for (const id of Object.keys(ModSkillDescription)) delete ModSkillDescription[id];
+	const steps = [
+		["customSkillId", loadCustomSkillId],
+		["customSkillInfoList", loadCustomSkillInfoList],
+		["customSkillDescript", loadCustomSkillDescript],
+		["customSkillTreeView", loadCustomSkillTreeView]
+	].flatMap(([key, load]) => {
+		const files = Configs.get(key, []);
+		return Array.isArray(files) ? files.map((file) => [load, file]) : [];
+	});
+	const next = (index = 0) => {
+		if (index >= steps.length) {
+			onEnd();
+			return;
+		}
+		const [load, file] = steps[index];
+		load(file, once(() => next(index + 1)));
+	};
+	next();
+}
+/** The names a mod's skillid.lub gives its skills, into SKID. */
+function loadCustomSkillId(filename, onEnd) {
+	loadLuaValue(filename, "SKID", (json) => {
+		if (json && typeof json === "object") {
+			for (const [name, id] of Object.entries(json)) if (typeof id === "number" && id > 0) SkillConst_default[name] = id;
+		}
+	}, onEnd);
+}
+/** A mod's skillinfolist.lub: each skill it lists replaces the client's entry. */
+function loadCustomSkillInfoList(filename, onEnd) {
+	lua.doStringSync("SKILL_INFO_LIST = nil");
+	loadSkillInfoList(filename, null, onEnd);
+}
+/**
+* Run a mod's skill table with SKID and JOBID as the client's tables see
+* them, a name nobody defined reading as 0. `globals` are cleared first, so
+* a file that leaves one out does not see the previous file's.
+*/
+async function runCustomSkillTable(filename, buffer, globals) {
+	const ctx = lua.ctx;
+	const jobIdWithJT = { ...JobConst_default };
+	for (const [key, value] of Object.entries(JobConst_default)) jobIdWithJT[`JT_${key}`] = value;
+	ctx.JOBID = jobIdWithJT;
+	ctx.SKID = SkillConst_default;
+	await lua.doString(`
+		for _, name in ipairs({ ${globals.map((name) => `"${name}"`).join(", ")} }) do _G[name] = nil end
+		for name, unknown in pairs({ SKID = 0, JOBID = -1 }) do
+			local known = _G[name]
+			_G[name] = setmetatable({}, { __index = function(t, k) local id = known[k] return id ~= nil and id or unknown end })
+		end
+	`);
+	lua.mountFile(filename, buffer);
+	try {
+		await lua.doFile(filename);
+	} finally {
+		lua.unmountFile(filename);
+	}
+}
+/** A mod's skilldescript.lub: each skill it describes replaces the client's text. */
+function loadCustomSkillDescript(filename, onEnd) {
+	Client.loadFile(filename, async function(file) {
+		try {
+			console.log("Loading file \"" + filename + "\"...");
+			await runCustomSkillTable(filename, file instanceof ArrayBuffer ? new Uint8Array(file) : file, ["SKILL_DESCRIPT"]);
+			const table = {};
+			lua.ctx.addCustomSkillDescript = (skillId, line) => {
+				table[skillId] = (table[skillId] || "") + userStringDecoder.decode(line, userCharpage) + "\n";
+				return 1;
+			};
+			lua.doStringSync(`
+					for skillId, lines in pairs(SKILL_DESCRIPT or {}) do
+						if type(lines) == "table" then
+							for _, line in ipairs(lines) do addCustomSkillDescript(skillId, line) end
+						else
+							addCustomSkillDescript(skillId, lines)
+						end
+					end
+				`);
+			Object.assign(ModSkillDescription, table);
+		} catch (error) {
+			console.error(`[loadCustomSkillDescript] ${filename}: `, error);
+		} finally {
+			onEnd();
+		}
+	}, onEnd);
+}
+/**
+* A mod's skilltreeview.lub: SKILL_TREEVIEW_FOR_JOB places its skills in
+* jobs' windows (a skill already on a slot it takes moves to a free one), and
+* SKILL_TREEVIEW_HIDE takes skills out of them.
+*/
+function loadCustomSkillTreeView(filename, onEnd) {
+	Client.loadFile(filename, async function(file) {
+		try {
+			console.log("Loading file \"" + filename + "\"...");
+			await runCustomSkillTable(filename, file instanceof ArrayBuffer ? new Uint8Array(file) : file, ["SKILL_TREEVIEW_FOR_JOB", "SKILL_TREEVIEW_HIDE"]);
+			const known = (jobId, skillId) => {
+				if (Number(jobId) >= 0 && Number(skillId) > 0) return true;
+				console.error(`[loadCustomSkillTreeView] ${filename}: an unknown job or skill name; left out`);
+				return false;
+			};
+			lua.ctx.placeCustomSkill = (jobId, pos, skillId) => {
+				if (known(jobId, skillId) && !placeSkill(SkillTreeView, jobId, pos, skillId)) console.error(`[loadCustomSkillTreeView] ${filename}: no skill tree for job ${jobId}`);
+				return 1;
+			};
+			lua.ctx.hideCustomSkill = (jobId, skillId) => {
+				if (known(jobId, skillId)) hideSkill(jobId, skillId);
+				return 1;
+			};
+			lua.doStringSync(`
+					for jobId, skills in pairs(SKILL_TREEVIEW_FOR_JOB or {}) do
+						for pos, skillId in pairs(skills) do placeCustomSkill(jobId, pos, skillId) end
+					end
+					for jobId, skills in pairs(SKILL_TREEVIEW_HIDE or {}) do
+						for _, skillId in ipairs(skills) do hideCustomSkill(jobId, skillId) end
+					end
+				`);
+		} catch (error) {
+			console.error(`[loadCustomSkillTreeView] ${filename}: `, error);
+		} finally {
+			onEnd();
+		}
+	}, onEnd);
+}
+/**
 * Load State Icon Info (StatusInfo) from Lua files
 * Loads efstids.lub, stateiconimginfo.lub, and stateiconinfo.lub sequentially,
 * synchronizing EFST_IDs with StatusConst and populating the StatusInfo table.
@@ -313475,7 +323035,7 @@ function updateMapTable() {
 		else MapTable[key] = { name: MapInfo[key].displayName };
 	}
 }
-var lua, lookTables, itemPackages, HO_AI, MER_AI, default_HO_AI, default_MER_AI, mountPalettes, mountPalettesProbe, MsgStringTable, JokeTable, ScreamTable, MapTable, SkillDescription, SexTable, PetTalkTable, CheckAttendanceTable, buyingStoreItemList, LaphineSysTable, LaphineUpgTable, ItemDBNameTbl, ItemReformTable, EnchantListTable, SignBoardTranslatedTable, SignBoardTable, NaviMapTable, NaviMobTable, NaviNpcTable, NaviLinkTable, NaviLinkDistanceTable, NaviNpcDistanceTable, QuestInfo, TitleTable, PetDBTable, EggIDToJobID, ReputeGroup, ReputeInfo, AchievementTable, MsgEmotionCSV, HatEffectID, HatEffectInfo, FootPrintEffectInfo, CashShopBannerTable, Ez2streffect, unknownItem, servers, langType, userCharpage, userStringDecoder, DB, SUFFIX_TO_FIELD, HARDCODED_FIELD_MAPPING;
+var lua, lookTables, itemPackages, HO_AI, MER_AI, default_HO_AI, default_MER_AI, mountPalettes, mountPalettesProbe, MsgStringTable, JokeTable, ScreamTable, MapTable, SkillDescription, SexTable, PetTalkTable, CheckAttendanceTable, buyingStoreItemList, LaphineSysTable, LaphineUpgTable, ItemDBNameTbl, ItemReformTable, EnchantListTable, SignBoardTranslatedTable, SignBoardTable, NaviMapTable, NaviMobTable, NaviNpcTable, NaviLinkTable, NaviLinkDistanceTable, NaviNpcDistanceTable, QuestInfo, TitleTable, PetDBTable, EggIDToJobID, ReputeGroup, ReputeInfo, AchievementTable, MsgEmotionCSV, HatEffectID, HatEffectInfo, FootPrintEffectInfo, CashShopBannerTable, Ez2streffect, unknownItem, servers, langType, userCharpage, userStringDecoder, DB, SUFFIX_TO_FIELD, HARDCODED_FIELD_MAPPING, ModSkillDescription;
 var init_DBManager = __esmMin((() => {
 	init_Client();
 	init_Configs();
@@ -313509,6 +323069,7 @@ var init_DBManager = __esmMin((() => {
 	init_SkillInfo();
 	init_SkillTreeView();
 	init_SkillTreeMerge();
+	init_SkillTreeMods();
 	init_JobHitSoundTable();
 	init_WeaponTrailTable();
 	init_TownInfo();
@@ -313743,7 +323304,7 @@ var init_DBManager = __esmMin((() => {
 										});
 									});
 								}
-								onSkillEnd();
+								loadCustomSkillTables(onSkillEnd);
 							});
 						});
 					});
@@ -313790,9 +323351,26 @@ var init_DBManager = __esmMin((() => {
 				tryLoadLuaAliases(loadQuestInfo, getSystemAliases("System/OngoingQuestInfoList.lub"), null, () => {
 					loadQuestInfo("SystemEN/OngoingQuests.lub", null, () => loadCustomQuestInfo());
 				});
-				if (Configs.get("enableAchievements") && PacketVerManager_default.value >= 20150513) loadLuaValue("System/achievement_list.lub", "achievement_tbl", function(json) {
-					if (json) Object.assign(AchievementTable, json);
-				}, onLoad());
+				if (Configs.get("enableAchievements") && PacketVerManager_default.value >= 20150513) {
+					const onAchievementEnd = onLoad();
+					const addAchievements = (json) => {
+						if (json) Object.assign(AchievementTable, json);
+					};
+					const customAchievementInfo = Configs.get("customAchievementInfo", []);
+					const loadCustomAchievementInfo = (index = 0) => {
+						if (!Array.isArray(customAchievementInfo) || index >= customAchievementInfo.length) {
+							onAchievementEnd();
+							return;
+						}
+						try {
+							lua.doStringSync("achievement_tbl = nil");
+						} catch (error) {
+							console.error("[customAchievementInfo] ", error);
+						}
+						loadLuaValue(customAchievementInfo[index], "achievement_tbl", addAchievements, () => loadCustomAchievementInfo(index + 1));
+					};
+					loadLuaValue("System/achievement_list.lub", "achievement_tbl", addAchievements, () => loadCustomAchievementInfo());
+				}
 				if (Configs.get("enableCashShop") && PacketVerManager_default.value >= 2018e4) loadCashShopBanner(DB.LUA_PATH + "datainfo/tb_cashshop_banner.lub", null, onLoad());
 			} else {
 				loadTable("data/num2itemdisplaynametable.txt", "#", 2, function(_index, key, val) {
@@ -315223,7 +324801,7 @@ var init_DBManager = __esmMin((() => {
 		* @param {number} skill id
 		*/
 		static getSkillDescription(id) {
-			return SkillDescription[id] || "...";
+			return ModSkillDescription[id] || SkillDescription[id] || "...";
 		}
 		/**
 		* @param {string} filename
@@ -315723,6 +325301,8 @@ var init_DBManager = __esmMin((() => {
 				case JobConst_default.SUPERNOVICE: return "Second_Class";
 				case JobConst_default.GUNSLINGER:
 				case JobConst_default.NINJA:
+				case JobConst_default.DRUID:
+				case JobConst_default.DRUID_B:
 				case JobConst_default.TAEKWON: return "Expanded_First_Class";
 				case JobConst_default.NOVICE_H: return "Rebirth_Class";
 				case JobConst_default.SWORDMAN_H:
@@ -315751,6 +325331,8 @@ var init_DBManager = __esmMin((() => {
 				case JobConst_default.LINKER:
 				case JobConst_default.KAGEROU:
 				case JobConst_default.OBORO:
+				case JobConst_default.KARNOS:
+				case JobConst_default.KARNOS_B:
 				case JobConst_default.REBELLION: return "Expanded_Second_Class";
 				case JobConst_default.RUNE_KNIGHT:
 				case JobConst_default.WARLOCK:
@@ -315808,6 +325390,7 @@ var init_DBManager = __esmMin((() => {
 				case JobConst_default.NIGHT_WATCH:
 				case JobConst_default.HYPER_NOVICE:
 				case JobConst_default.SPIRIT_HANDLER:
+				case JobConst_default.ALITEA:
 				case JobConst_default.SKY_EMPEROR2: return "Fourth_Class";
 				default: return "Base_Class";
 			}
@@ -316319,6 +325902,7 @@ var init_DBManager = __esmMin((() => {
 		broken_limit_buff: "effectId",
 		abyss_flame_target: "hitEffectId"
 	};
+	ModSkillDescription = {};
 }));
 //#endregion
 //#region src/UI/Components/PetInformations/PetInformations.html?raw
@@ -316617,7 +326201,7 @@ function onRequestAddItem(index, count) {
 		ChatBox_default.addText(DB.getMessage(51), ChatBox_default.TYPE.ERROR, ChatBox_default.FILTER.PUBLIC_LOG);
 		return;
 	}
-	if (_send.length >= 10) {
+	if (index !== 0 && _send.length >= 10) {
 		ChatBox_default.addText(DB.getMessage(297), ChatBox_default.TYPE.ERROR, ChatBox_default.FILTER.PUBLIC_LOG);
 		return;
 	}
@@ -316865,7 +326449,7 @@ var init_Trade$1 = __esmMin((() => {
 		itemDiv.innerHTML = `<div class="icon"></div><div class="amount"><span class="count">${_tmpCount[index] || 1}</span></div><span class="name">${sanitizeHtml(DB.getItemName(item))}</span>`;
 		box.appendChild(itemDiv);
 		Client.loadFile(`${DB.INTERFACE_PATH}item/${item.IsIdentified ? it.identifiedResourceName : it.unidentifiedResourceName}.bmp`, (data) => {
-			const icon = root.querySelector(`.item[data-index="${idx}"] .icon`);
+			const icon = itemDiv.querySelector(".icon");
 			if (icon && icon.closest(".box.send")) icon.style.backgroundImage = `url(${data})`;
 		});
 	};
@@ -316890,7 +326474,7 @@ var init_Trade$1 = __esmMin((() => {
 		itemDiv.innerHTML = `<div class="icon"></div><div class="amount">${item.count}</div><span class="name">${sanitizeHtml(DB.getItemName(item))}</span>`;
 		box.appendChild(itemDiv);
 		Client.loadFile(`${DB.INTERFACE_PATH}item/${item.IsIdentified ? it.identifiedResourceName : it.unidentifiedResourceName}.bmp`, (data) => {
-			const icon = root.querySelector(`.item[data-index="${idx}"] .icon`);
+			const icon = itemDiv.querySelector(".icon");
 			if (icon && icon.closest(".box.recv")) icon.style.backgroundImage = `url(${data})`;
 		});
 	};
@@ -317429,7 +327013,11 @@ function setAction(option) {
 	const wasWalking = this.action === this.ACTION.WALK;
 	const newAction = option.action === -1 || typeof option.action === "undefined" ? this.ACTION.IDLE : option.action;
 	const willWalk = newAction === this.ACTION.WALK;
-	if (wasWalking && !willWalk && !this.isFastMoving && this.walk && this.walk.total > 0 && this.objecttype !== this.constructor.TYPE_FALCON && this.objecttype !== this.constructor.TYPE_WUG) this.resetRoute();
+	if (wasWalking && !willWalk && !this.isFastMoving && this.walk && this.walk.total > 0 && !this.walk.settling && this.objecttype !== this.constructor.TYPE_FALCON && this.objecttype !== this.constructor.TYPE_WUG) {
+		const predicted = this.walk.predicted;
+		this.resetRoute();
+		this.walk.predicted = predicted;
+	}
 	this.action = newAction;
 	anim.tick = Date.now() + 0;
 	anim.delay = 0;
@@ -317913,6 +327501,7 @@ var init_EntityDisplay = __esmMin((() => {
 			this.guild_name = "";
 			this.guild_rank = "";
 			this.title_name = "";
+			this.unit_title = "";
 			this.emblem = null;
 			this.gifEmblem = null;
 			this.emblemY = 0;
@@ -317970,6 +327559,7 @@ var init_EntityDisplay = __esmMin((() => {
 				lines[1] = this.guild_name;
 				if (this.guild_rank.length && Map_default.showname) lines[1] += " [" + this.guild_rank + "]";
 			} else if (this.guild_rank.length && (style === this.STYLE.DEFAULT || style === this.STYLE.ADMIN || style === this.STYLE.MOB || style === this.STYLE.NPC)) lines[1] = this.guild_rank;
+			if (!lines[1].length && this.unit_title.length && (style === this.STYLE.MOB || style === this.STYLE.NPC)) lines[1] = this.unit_title;
 			if (Map_default.showname && this.title_name.length && (style === this.STYLE.DEFAULT || style === this.STYLE.ADMIN || style === this.STYLE.MOB || style === this.STYLE.NPC)) lines[0] = "[" + this.title_name + "] " + lines[0];
 			ctx.font = (Map_default.showname ? "bold " : "") + fontSize + "px Arial";
 			const width = Math.max(ctx.measureText(lines[0]).width, ctx.measureText(lines[1]).width) + start_x + 5 * dpr;
@@ -319341,6 +328931,10 @@ function computeWalkStartTick(nowTick, moveStartTime, pathDuration, maxClamp) {
 * @property {function|null} onEnd Callback fired when entity reaches path end
 * @property {number} index Current segment index in path
 * @property {number} total Total number of coordinate values in path
+* @property {boolean} settling Gliding to rest on a cell the server named
+* @property {object|null} predicted A walk the server has not confirmed yet:
+*   { queue: [[x, y], ...] cells requested, fallback: [x, y] where the server
+*   has the entity, deadline: tick after which it walks back }
 */
 function WalkStructure() {
 	this.speed = 150;
@@ -319354,6 +328948,9 @@ function WalkStructure() {
 	this.onEnd = null;
 	this.index = 0;
 	this.total = 0;
+	this.settling = false;
+	this.predicted = null;
+	this.stuckWarned = false;
 }
 /**
 * Convert dx/dy offset to a floating-point direction in [0..8).
@@ -319485,9 +329082,14 @@ function walkToNonWalkableGround(from_x, from_y, to_x, to_y, range, isOverShoot 
 * @param {number} [moveEndTime]
 * @param {boolean} [isFastMove=false]
 * @param {number} [fastSpeed]
+* @param {boolean} [isPrediction=false] a walk the client starts before the server answers
 */
-function walkTo(from_x, from_y, to_x, to_y, range, moveStartTime, moveEndTime, isFastMove, fastSpeed) {
-	if (from_x === to_x && from_y === to_y) return;
+function walkTo(from_x, from_y, to_x, to_y, range, moveStartTime, moveEndTime, isFastMove, fastSpeed, isPrediction) {
+	if (!isPrediction && this.walk.predicted && answersOlderRequest(this.walk.predicted, to_x, to_y)) return;
+	if (from_x === to_x && from_y === to_y) {
+		if (!isPrediction && this.walk.predicted) this.settleTo(to_x, to_y);
+		return;
+	}
 	const curX = this.position[0];
 	const curY = this.position[1];
 	const hasCurrentPos = isFinite(curX) && isFinite(curY) && (curX !== 0 || curY !== 0);
@@ -319542,27 +329144,49 @@ function walkTo(from_x, from_y, to_x, to_y, range, moveStartTime, moveEndTime, i
 			this.walk.segmentDurations[i] = segDur;
 			clientDuration += segDur;
 		}
-		let serverDuration = 0;
-		if (!isFastMove) {
-			if (moveEndTime && moveStartTime && moveEndTime > moveStartTime) serverDuration = moveEndTime - moveStartTime;
-			else {
-				const sDx = to_x - from_x;
-				const sDy = to_y - from_y;
-				const straight = Math.abs(Math.abs(sDx) - Math.abs(sDy));
-				const diag = Math.min(Math.abs(sDx), Math.abs(sDy));
-				serverDuration = straight * this.walk.speed + diag * this.walk.speed * DIAGONAL_FACTOR;
+		if (isPrediction || Configs.get("movePrediction", false)) {
+			let serverDuration = 0;
+			if (!isFastMove && !isPrediction) {
+				if (moveEndTime && moveStartTime && moveEndTime > moveStartTime) serverDuration = moveEndTime - moveStartTime;
+				else if (usedFallback || curCellX === from_x && curCellY === from_y) serverDuration = gridPathDuration(path, total, this.walk.speed);
+				else {
+					const sDx = Math.abs(to_x - from_x);
+					const sDy = Math.abs(to_y - from_y);
+					const diag = Math.min(sDx, sDy);
+					serverDuration = (Math.max(sDx, sDy) - diag) * this.walk.speed + diag * this.walk.speed * DIAGONAL_FACTOR;
+				}
 			}
-		}
-		const nowTick = Date.now();
-		const isPlayerLike = this.objecttype === this.constructor.TYPE_PC || this.objecttype === this.constructor.TYPE_DISGUISED || this.objecttype === this.constructor.TYPE_PET || this.objecttype === this.constructor.TYPE_HOM || this.objecttype === this.constructor.TYPE_MERC;
-		const maxFastForward = isFastMove ? 0 : isPlayerLike ? clientDuration : Math.min(clientDuration, this.walk.speed);
-		const startTick = isFastMove ? nowTick : computeWalkStartTick(nowTick, moveStartTime, clientDuration, maxFastForward);
-		this.walk.tick = this.walk.prevTick = startTick;
-		if (!isFastMove && numSegments > 0 && serverDuration > 0) {
-			let sub = serverDuration - clientDuration;
-			sub = Math.max(-2500, Math.min(2500, sub));
-			const subDiv = sub / numSegments;
-			for (let i = 0; i < numSegments; i++) this.walk.segmentDurations[i] = Math.max(10, this.walk.segmentDurations[i] + subDiv);
+			const nowTick = Date.now();
+			this.walk.tick = this.walk.prevTick = nowTick;
+			if (serverDuration > 0 && numSegments > 0 && clientDuration > 0) {
+				const maxCatchUp = this.objecttype === this.constructor.TYPE_PC || this.objecttype === this.constructor.TYPE_DISGUISED || this.objecttype === this.constructor.TYPE_PET || this.objecttype === this.constructor.TYPE_HOM || this.objecttype === this.constructor.TYPE_MERC ? serverDuration : Math.min(serverDuration, this.walk.speed);
+				const elapsed = nowTick - computeWalkStartTick(nowTick, moveStartTime, serverDuration, maxCatchUp);
+				const pace = Math.max(MIN_PACE, Math.min(MAX_PACE, (serverDuration - elapsed) / clientDuration));
+				for (let i = 0; i < numSegments; i++) this.walk.segmentDurations[i] = Math.max(1, this.walk.segmentDurations[i] * pace);
+			}
+		} else {
+			let serverDuration = 0;
+			if (!isFastMove) {
+				if (moveEndTime && moveStartTime && moveEndTime > moveStartTime) serverDuration = moveEndTime - moveStartTime;
+				else {
+					const sDx = to_x - from_x;
+					const sDy = to_y - from_y;
+					const straight = Math.abs(Math.abs(sDx) - Math.abs(sDy));
+					const diag = Math.min(Math.abs(sDx), Math.abs(sDy));
+					serverDuration = straight * this.walk.speed + diag * this.walk.speed * DIAGONAL_FACTOR;
+				}
+			}
+			const nowTick = Date.now();
+			const isPlayerLike = this.objecttype === this.constructor.TYPE_PC || this.objecttype === this.constructor.TYPE_DISGUISED || this.objecttype === this.constructor.TYPE_PET || this.objecttype === this.constructor.TYPE_HOM || this.objecttype === this.constructor.TYPE_MERC;
+			const maxFastForward = isFastMove ? 0 : isPlayerLike ? clientDuration : Math.min(clientDuration, this.walk.speed);
+			const startTick = isFastMove ? nowTick : computeWalkStartTick(nowTick, moveStartTime, clientDuration, maxFastForward);
+			this.walk.tick = this.walk.prevTick = startTick;
+			if (!isFastMove && numSegments > 0 && serverDuration > 0) {
+				let sub = serverDuration - clientDuration;
+				sub = Math.max(-2500, Math.min(2500, sub));
+				const subDiv = sub / numSegments;
+				for (let i = 0; i < numSegments; i++) this.walk.segmentDurations[i] = Math.max(10, this.walk.segmentDurations[i] + subDiv);
+			}
 		}
 		if (this.walk.total >= 2) {
 			const firstX1 = this.walk.path[2];
@@ -319578,6 +329202,136 @@ function walkTo(from_x, from_y, to_x, to_y, range, moveStartTime, moveEndTime, i
 			play: true
 		});
 	}
+}
+/**
+* Walk time of a cell path, as the server counts it.
+*
+* @param {Int16Array} path cell pairs
+* @param {number} total number of cells in path
+* @param {number} speed ms per cell
+* @returns {number} ms
+*/
+function gridPathDuration(path, total, speed) {
+	let duration = 0;
+	for (let i = 1; i < total; i++) {
+		const diagonal = path[i * 2] !== path[i * 2 - 2] && path[i * 2 + 1] !== path[i * 2 - 1];
+		duration += diagonal ? speed * DIAGONAL_FACTOR : speed;
+	}
+	return duration;
+}
+/**
+* Whether a move reply answers a request older than the newest one predicted.
+* Drops the requests it answers, and remembers its destination as where the
+* server is taking the entity.
+*/
+function answersOlderRequest(predicted, to_x, to_y) {
+	const queue = predicted.queue;
+	for (let i = queue.length - 2; i >= 0; i--) if (queue[i][0] === to_x && queue[i][1] === to_y) {
+		queue.splice(0, i + 1);
+		predicted.fallback = [to_x, to_y];
+		return true;
+	}
+	return false;
+}
+/**
+* Start walking to a cell the player clicked, before the server answers.
+* The server's reply (walkTo) then takes over the walk where it is drawn and
+* evens out the pace; if no reply comes within `timeout`, the entity walks
+* back to where the server has it.
+*
+* @param {number} to_x
+* @param {number} to_y
+* @param {number} timeout ms to wait for the server's reply
+* @returns {boolean} whether a walk started
+*/
+function predictWalkTo(to_x, to_y, timeout) {
+	const walk = this.walk;
+	const action = this.action;
+	if (this.isFastMoving || this._bodyState || this.cast && this.cast.display || action !== this.ACTION.IDLE && action !== this.ACTION.WALK && action !== this.ACTION.READYFIGHT) return false;
+	const curX = Math.round(this.position[0]);
+	const curY = Math.round(this.position[1]);
+	if (curX === to_x && curY === to_y) return false;
+	if (walk.total > 0 && walk.path[walk.total - 2] === to_x && walk.path[walk.total - 1] === to_y) return false;
+	const steps = PathFinding_default.search(curX, curY, to_x, to_y, 0, _serverPath) - 1;
+	if (steps < 1 || steps > SERVER_MAX_WALK_PATH || steps > SERVER_MAX_BENT_PATH && !PathFinding_default.searchLong(curX, curY, to_x, to_y, 0, _serverPath).success) return false;
+	const predicted = walk.predicted;
+	const fallback = predicted ? predicted.fallback : walk.total > 0 ? [walk.path[walk.total - 2], walk.path[walk.total - 1]] : [curX, curY];
+	const queue = predicted ? predicted.queue : [];
+	this.walkTo(curX, curY, to_x, to_y, 0, void 0, void 0, false, void 0, true);
+	if (!walk.total) return false;
+	queue.push([to_x, to_y]);
+	walk.predicted = {
+		queue,
+		fallback,
+		deadline: Date.now() + timeout
+	};
+	return true;
+}
+/**
+* Give up a prediction the server never confirmed: walk back to where the
+* server has the entity.
+*/
+function cancelPrediction() {
+	const fallback = this.walk.predicted.fallback;
+	this.walk.predicted = null;
+	if (this.action === this.ACTION.DIE || this.action === this.ACTION.SIT) {
+		this.resetRoute();
+		this.position[0] = fallback[0];
+		this.position[1] = fallback[1];
+		this.position[2] = Altitude.getCellHeight(fallback[0], fallback[1]);
+		return;
+	}
+	const curX = Math.round(this.position[0]);
+	const curY = Math.round(this.position[1]);
+	if (curX === fallback[0] && curY === fallback[1]) {
+		this.settleTo(fallback[0], fallback[1]);
+		return;
+	}
+	this.walkTo(curX, curY, fallback[0], fallback[1]);
+	if (!this.walk.total) this.settleTo(fallback[0], fallback[1]);
+}
+/**
+* Come to rest on a cell the server named (STOPMOVE). Close by, the entity
+* glides there, at most at its walk speed and within SETTLE_MAX_MS, rather
+* than jumping. Whatever action it is in carries on; a walk ends in IDLE on
+* arrival.
+*
+* @param {number} x
+* @param {number} y
+* @returns {boolean} true if gliding, false if the entity was placed at once
+*/
+function settleTo(x, y) {
+	const dx = x - this.position[0];
+	const dy = y - this.position[1];
+	const dist = Math.hypot(dx, dy);
+	const canGlide = isFinite(dist) && dist > .05 && dist <= SETTLE_MAX_CELLS && this.walk.speed > 0;
+	this.resetRoute();
+	if (!canGlide) {
+		this.position[0] = x;
+		this.position[1] = y;
+		this.position[2] = Altitude.getCellHeight(x, y);
+		if (this.action === this.ACTION.WALK) this.setAction({
+			action: this.ACTION.IDLE,
+			frame: 0,
+			play: true,
+			repeat: true
+		});
+		return false;
+	}
+	const walk = this.walk;
+	walk.path[0] = Math.round(this.position[0]);
+	walk.path[1] = Math.round(this.position[1]);
+	walk.path[2] = x;
+	walk.path[3] = y;
+	walk.index = 2;
+	walk.total = 4;
+	walk.pos.set(this.position);
+	walk.lastPos.set(this.position);
+	walk.segmentDurations[0] = Math.min(dist * walk.speed, SETTLE_MAX_MS);
+	walk.tick = walk.prevTick = Date.now();
+	walk.settling = true;
+	this._preserveDirection = true;
+	return true;
 }
 /**
 * Fast move / forced relocation to a destination cell (e.g. MO_BODYRELOCATION, knockback, slide).
@@ -319648,8 +329402,13 @@ function walkProcess() {
 	const total = walk.total;
 	const TICK = Date.now();
 	const falconGliding = 5;
+	if (walk.predicted && TICK > walk.predicted.deadline) {
+		this.cancelPrediction();
+		return;
+	}
 	if (total == 0) return;
-	if (total > 0 && !this.isFastMoving && this.action !== this.ACTION.WALK && this.objecttype !== this.constructor.TYPE_FALCON && this.objecttype !== this.constructor.TYPE_WUG) {
+	if (total > 0 && !this.isFastMoving && !walk.settling && this.action !== this.ACTION.WALK && this.objecttype !== this.constructor.TYPE_FALCON && this.objecttype !== this.constructor.TYPE_WUG && !walk.stuckWarned) {
+		walk.stuckWarned = true;
 		let actionName = "UNKNOWN";
 		for (const key in this.ACTION) if (this.ACTION[key] === this.action) {
 			actionName = key;
@@ -319668,7 +329427,7 @@ function walkProcess() {
 		});
 		console.trace("Stack trace of debug:");
 	}
-	if (this.action === this.ACTION.WALK || this.isFastMoving || this.objecttype === this.constructor.TYPE_FALCON || this.objecttype === this.constructor.TYPE_WUG) {
+	if (this.action === this.ACTION.WALK || this.isFastMoving || walk.settling || this.objecttype === this.constructor.TYPE_FALCON || this.objecttype === this.constructor.TYPE_WUG) {
 		const getSegmentDuration = function getSegmentDuration(dx, dy, baseSpeed) {
 			let duration = dx && dy ? baseSpeed * Math.SQRT2 : baseSpeed;
 			if (!duration || duration < 1) duration = 1;
@@ -319703,7 +329462,7 @@ function walkProcess() {
 					next: false
 				}
 			});
-			else if (this.action !== this.ACTION.DIE) this.setAction({
+			else if (walk.settling ? this.action === this.ACTION.WALK : this.action !== this.ACTION.DIE) this.setAction({
 				action: this.ACTION.IDLE,
 				frame: 0,
 				play: true,
@@ -319714,7 +329473,9 @@ function walkProcess() {
 				walk.onEnd();
 				walk.onEnd = null;
 			}
+			const predicted = walk.predicted;
 			this.resetRoute();
+			walk.predicted = predicted;
 			this.isAttacking = false;
 		};
 		if (index >= total) {
@@ -319732,7 +329493,7 @@ function walkProcess() {
 		let segmentStart = walk.tick || TICK;
 		let segmentEnd = segmentStart + speed;
 		let traveledDist = 0;
-		if (walk.prevTick && walk.prevTick !== TICK && walk.prevTick > segmentStart && !this.isFastMoving && this.action !== this.ACTION.WALK && this.objecttype !== this.constructor.TYPE_FALCON) {
+		if (walk.prevTick && walk.prevTick !== TICK && walk.prevTick > segmentStart && !this.isFastMoving && !walk.settling && this.action !== this.ACTION.WALK && this.objecttype !== this.constructor.TYPE_FALCON) {
 			segmentStart += TICK - walk.prevTick;
 			segmentEnd = segmentStart + speed;
 		}
@@ -319833,6 +329594,8 @@ function resetRoute(keepDistance) {
 	this.isFastMoving = false;
 	this._fastMoveTrail = false;
 	this._preserveDirection = false;
+	this.walk.settling = false;
+	this.walk.predicted = null;
 	this.walk.tick = 0;
 	this.walk.prevTick = 0;
 	if (!keepDistance) this.walk.dist = 0;
@@ -319845,6 +329608,7 @@ function resetRoute(keepDistance) {
 	this.walk.onEnd = null;
 	this.walk.index = 0;
 	this.walk.total = 0;
+	this.walk.stuckWarned = false;
 }
 function calculateOverShot(from_x, from_y, to_x, to_y) {
 	const overshot = 5;
@@ -319891,6 +329655,9 @@ function Init$4() {
 	this._enableTrail = false;
 	this.walk = new WalkStructure();
 	this.walkTo = walkTo;
+	this.predictWalkTo = predictWalkTo;
+	this.cancelPrediction = cancelPrediction;
+	this.settleTo = settleTo;
 	this.fastMoveTo = fastMoveTo;
 	this.walkToNonWalkableGround = walkToNonWalkableGround;
 	this.walkProcess = walkProcess;
@@ -319898,11 +329665,12 @@ function Init$4() {
 	this.resetRoute = resetRoute;
 	this.distance = distance;
 }
-var DIRECTION$1, DIAGONAL_FACTOR, LATENCY_SLACK_MS;
+var DIRECTION$1, DIAGONAL_FACTOR, LATENCY_SLACK_MS, MIN_PACE, MAX_PACE, SERVER_MAX_WALK_PATH, SERVER_MAX_BENT_PATH, SETTLE_MAX_CELLS, SETTLE_MAX_MS, _serverPath;
 var init_EntityWalk = __esmMin((() => {
 	init_PathFinding();
 	init_Altitude();
 	init_SessionStorage();
+	init_Configs();
 	DIRECTION$1 = [
 		[
 			1,
@@ -319922,6 +329690,13 @@ var init_EntityWalk = __esmMin((() => {
 	];
 	DIAGONAL_FACTOR = 1.414;
 	LATENCY_SLACK_MS = 100;
+	MIN_PACE = .5;
+	MAX_PACE = 2;
+	SERVER_MAX_WALK_PATH = 17;
+	SERVER_MAX_BENT_PATH = 14;
+	SETTLE_MAX_CELLS = 2;
+	SETTLE_MAX_MS = 200;
+	_serverPath = new Int16Array(PathFinding_default.MAX_WALKPATH * 2);
 }));
 //#endregion
 //#region src/Renderer/Entity/EntityRender.js
@@ -320008,10 +329783,12 @@ function renderWaterDepth$1() {
 * @param {object} files
 * @param {string} type
 * @param {number[]} _position
-* @param {object} options
+* @param {boolean} enableHalo - halo type Assumptio (BL_DOUBLE_BODY)
+* @param {boolean} enableTrail - trail behind the character (EF_MAKEBLUR)
+* @param {number} blurType - 1 (standard) EF_MAKEBLUR , 3 (spaced) - EF_MAKEBLUR3, 4 (once), 5 (attack only) - EF_MAKEBLUR5
 */
-function renderSecondBody(entity, layers, spr, pal, files, type, _position, options = {}) {
-	const { enableHalo = false, enableTrail = false, trailLength = 5, blurType = 1 } = options;
+function renderSecondBody(entity, layers, spr, pal, files, type, _position, enableHalo, enableTrail, blurType) {
+	const trailLength = 5;
 	if (!enableHalo && !enableTrail) return;
 	if (type === "shadow" || type === "cartshadow") return;
 	if (enableHalo) {
@@ -320604,11 +330381,7 @@ var init_EntityRender = __esmMin((() => {
 			const isOVERTHRUST = entity.getOpt3(StatusState_default.Status.OVERTHRUST);
 			const isEXPLOSIONSPIRITS = entity.getOpt3(StatusState_default.Status.EXPLOSIONSPIRITS);
 			const isBERSERK = entity.getOpt3(StatusState_default.Status.BERSERK);
-			renderSecondBody(entity, layers, spr, pal, files, type, _position, {
-				enableHalo: entity.getOpt3(StatusState_default.Status.ASSUMPTIO) || !!entity._enableHalo,
-				enableTrail: isENERGYCOAT || isBUNSIN || isHALLUCINATIONWALK || isQUICKEN || isOVERTHRUST || isEXPLOSIONSPIRITS || isBERSERK || !!entity._fastMoveTrail || !!entity._enableTrail,
-				blurType: isBUNSIN ? 5 : isHALLUCINATIONWALK ? 3 : entity._blurType || 1
-			});
+			renderSecondBody(entity, layers, spr, pal, files, type, _position, entity.getOpt3(StatusState_default.Status.ASSUMPTIO) || !!entity._enableHalo, isENERGYCOAT || isBUNSIN || isHALLUCINATIONWALK || isQUICKEN || isOVERTHRUST || isEXPLOSIONSPIRITS || isBERSERK || !!entity._fastMoveTrail || !!entity._enableTrail, isBUNSIN ? 5 : isHALLUCINATIONWALK ? 3 : entity._blurType || 1);
 			for (let i = 0, count = layers.length; i < count; ++i) entity.renderLayer(layers[i], spr, pal, files.size, _position, type, isBlendModeOne);
 			if (is_main && type === "body" && entity.waterDepthFrame === null) {
 				const frame = entity._waterDepthFrameBuffer || (entity._waterDepthFrameBuffer = { position: /* @__PURE__ */ new Int32Array(2) });
@@ -321388,7 +331161,12 @@ var init_EntityAttachments = __esmMin((() => {
 		* Render attachments filtered by renderBefore flag
 		*/
 		_renderFiltered(tick, renderBeforeEntity) {
-			if (!this.list.some((item) => item.renderBefore === renderBeforeEntity)) return;
+			let any = false;
+			for (let i = 0; i < this.list.length; ++i) if (this.list[i].renderBefore === renderBeforeEntity) {
+				any = true;
+				break;
+			}
+			if (!any) return;
 			SpriteRenderer.shadow = Ground_default.getShadowFactor(this.entity.position[0], this.entity.position[1]);
 			_effectColor[0] = this.entity.effectColor[0];
 			_effectColor[1] = this.entity.effectColor[1];
@@ -324391,17 +334169,17 @@ var init_StatusIcons$1 = __esmMin((() => {
 function loadStatusIcon(index) {
 	const tkmVariant = SessionStorage_default.Entity && DB.isTaeKwon(SessionStorage_default.Entity._job) && TKM_ICON_OVERRIDE[index] || null;
 	const iconName = tkmVariant || StatusInfo[index].icon;
-	_status[index].tkmVariant = tkmVariant;
+	_status$1[index].tkmVariant = tkmVariant;
 	Client.loadFile(`data/texture/effect/${iconName}`, (data) => {
 		Texture.load(data, function() {
-			if (_status[index] && !_status[index].img) addResizedStatusIcon(this, index);
+			if (_status$1[index] && !_status$1[index].img) addResizedStatusIcon(this, index);
 		});
 	});
 }
 function addResizedStatusIcon(img, index) {
 	if (img.width < 33 && img.height < 33) {
-		_status[index].img = img;
-		addElement$4(_status[index].element);
+		_status$1[index].img = img;
+		addElement$4(_status$1[index].element);
 		return;
 	}
 	const canvas = document.createElement("canvas");
@@ -324421,8 +334199,8 @@ function addResizedStatusIcon(img, index) {
 	const resizedImg = new Image();
 	resizedImg.src = canvas.toDataURL();
 	resizedImg.onload = () => {
-		_status[index].img = resizedImg;
-		addElement$4(_status[index].element);
+		_status$1[index].img = resizedImg;
+		addElement$4(_status$1[index].element);
 	};
 }
 /**
@@ -324452,11 +334230,11 @@ function resetElementsPosition() {
 * @param {number} index
 */
 function removeElementIndex(index) {
-	if (!(index in _status)) return;
-	const element = _status[index].element;
+	if (!(index in _status$1)) return;
+	const element = _status$1[index].element;
 	if (element && element.parentNode) element.parentNode.removeChild(element);
 	ScreenEffectManager.cleanStatusEffect(index);
-	delete _status[index];
+	delete _status$1[index];
 }
 /**
 * Create an element
@@ -324470,9 +334248,9 @@ function createElement(index) {
 	canvas.width = 32;
 	canvas.height = 32;
 	state.appendChild(canvas);
-	_status[index] = {};
-	_status[index].element = state;
-	_status[index].ctx = canvas.getContext("2d");
+	_status$1[index] = {};
+	_status$1[index].element = state;
+	_status$1[index].ctx = canvas.getContext("2d");
 	if (StatusInfo[index].descript) {
 		const info = document.createElement("div");
 		info.className = "description";
@@ -324487,8 +334265,8 @@ function createElement(index) {
 		}
 		const time = info.getElementsByClassName("time");
 		if (time.length) {
-			_status[index].time = time[0];
-			_status[index].timeTick = 0;
+			_status$1[index].time = time[0];
+			_status$1[index].timeTick = 0;
 		}
 		state.appendChild(info);
 	}
@@ -324551,15 +334329,15 @@ function renderStatus(status, now) {
 * @param {number} tick
 */
 function rendering$1(tick) {
-	const indexes = Object.keys(_status);
+	const indexes = Object.keys(_status$1);
 	const count = indexes.length;
 	const time_now = Date.now();
 	if (time_now - _last_updated_time > _render_time) {
 		_last_updated_time = time_now;
-		for (let i = 0; i < count; ++i) renderStatus(_status[indexes[i]], tick);
+		for (let i = 0; i < count; ++i) renderStatus(_status$1[indexes[i]], tick);
 	}
 }
-var StatusIcons, _status, _last_updated_time, _render_time, TKM_ICON_OVERRIDE, StatusIcons_default;
+var StatusIcons, _status$1, _last_updated_time, _render_time, TKM_ICON_OVERRIDE, StatusIcons_default;
 var init_StatusIcons = __esmMin((() => {
 	init_StatusInfo();
 	init_StatusConst();
@@ -324583,7 +334361,7 @@ var init_StatusIcons = __esmMin((() => {
 	* @var {boolean} do not focus this UI
 	*/
 	StatusIcons.needFocus = false;
-	_status = {};
+	_status$1 = {};
 	_last_updated_time = Date.now();
 	_render_time = 500;
 	TKM_ICON_OVERRIDE = {
@@ -324619,7 +334397,7 @@ var init_StatusIcons = __esmMin((() => {
 	StatusIcons.clean = function clean() {
 		const container = StatusIcons.getRoot().querySelector("#StatusIcons");
 		if (container) container.innerHTML = "";
-		_status = {};
+		_status$1 = {};
 		ScreenEffectManager.clean();
 	};
 	/**
@@ -324636,14 +334414,14 @@ var init_StatusIcons = __esmMin((() => {
 			resetElementsPosition();
 			return;
 		}
-		if (!(index in _status)) createElement(index);
-		_status[index].start = Renderer.tick;
-		_status[index].end = Renderer.tick + life;
-		if (life === 9999) _status[index].end = Infinity;
-		if (_status[index].img) {
+		if (!(index in _status$1)) createElement(index);
+		_status$1[index].start = Renderer.tick;
+		_status$1[index].end = Renderer.tick + life;
+		if (life === 9999) _status$1[index].end = Infinity;
+		if (_status$1[index].img) {
 			if (TKM_ICON_OVERRIDE[index]) {
 				const wantVariant = SessionStorage_default.Entity && DB.isTaeKwon(SessionStorage_default.Entity._job) && TKM_ICON_OVERRIDE[index] || null;
-				if (_status[index].tkmVariant !== wantVariant) _status[index].img = null;
+				if (_status$1[index].tkmVariant !== wantVariant) _status$1[index].img = null;
 				else return;
 			} else return;
 		}
@@ -328455,11 +338233,7 @@ var init_Vending = __esmMin((() => {
 			cancelBtn.addEventListener("mousedown", (e) => e.stopImmediatePropagation());
 			cancelBtn.addEventListener("click", (e) => {
 				e.stopImmediatePropagation();
-				let pkt;
-				if (_type$2 === Vending.Type.VENDING_STORE) pkt = new PACKET.CZ.REQ_OPENSTORE2();
-				else pkt = new PACKET.CZ.REQ_OPEN_BUYING_STORE();
-				submitNetworkPacket(pkt);
-				Vending.onRemove();
+				Vending.onCancel();
 			});
 		}
 		const extendBtn = root.querySelector(".InputWindow .footer .extend");
@@ -328507,22 +338281,18 @@ var init_Vending = __esmMin((() => {
 				Vending.focus();
 			});
 		});
-		if (inputWin) this.draggable.call({
-			_host: inputWin,
-			_shadow: null,
-			_container: inputWin,
-			magnet: {},
-			needFocus: false,
-			manager: null
-		}, inputWin.querySelector(".titlebar"));
-		if (outputWin) this.draggable.call({
-			_host: outputWin,
-			_shadow: null,
-			_container: outputWin,
-			magnet: {},
-			needFocus: false,
-			manager: null
-		}, outputWin.querySelector(".titlebar"));
+		this._windowDrags = [inputWin, outputWin].filter(Boolean).map((win) => {
+			const drag = Object.assign(Object.create(GUIComponent.prototype), {
+				_host: win,
+				_shadow: null,
+				_container: win,
+				magnet: {},
+				needFocus: false,
+				manager: null
+			});
+			drag.draggable(win.querySelector(".titlebar"));
+			return drag;
+		});
 		Client.loadFile(`${DB.INTERFACE_PATH}basic_interface/itemwin_mid.bmp`, (data) => {
 			Vending.itemBg = data;
 		});
@@ -328567,7 +338337,12 @@ var init_Vending = __esmMin((() => {
 		}
 		_type$2 = type;
 	};
+	Vending.cancelDrag = function cancelDrag() {
+		GUIComponent.prototype.cancelDrag.call(this);
+		this._windowDrags?.forEach((drag) => drag.cancelDrag());
+	};
 	Vending.onRemove = function onRemove() {
+		this.cancelDrag();
 		VendingModelMessage_default.onRemove();
 		const root = Vending.getRoot();
 		const inputWin = root.querySelector(".InputWindow");
@@ -328588,16 +338363,12 @@ var init_Vending = __esmMin((() => {
 		Vending.isOpen = false;
 	};
 	Vending.onKeyDown = function onKeyDown(event) {
-		if (this.isEditableFocused()) {
-			if (event.which === KEYS.ESCAPE || event.key === "Escape") {
-				this.remove();
-				event.stopImmediatePropagation();
-				return false;
-			}
+		if ((event.which === KEYS.ESCAPE || event.key === "Escape") && this.isOpen && this._host.style.display !== "none") {
+			this.onCancel();
 			event.stopImmediatePropagation();
-			return true;
+			return false;
 		}
-		if ((event.which === KEYS.ESCAPE || event.key === "Escape") && this._host.style.display !== "none") this.remove();
+		if (this.isEditableFocused()) event.stopImmediatePropagation();
 		return true;
 	};
 	Vending.setList = function setList(items) {
@@ -328671,7 +338442,13 @@ var init_Vending = __esmMin((() => {
 		this._fixPositionOverflow();
 		Vending.isOpen = true;
 	};
+	Vending.onCancel = function onCancel() {
+		if (!this.isOpen) return;
+		submitNetworkPacket(_type$2 === Vending.Type.VENDING_STORE ? new PACKET.CZ.REQ_OPENSTORE2() : new PACKET.CZ.REQ_OPEN_BUYING_STORE());
+		this.onRemove();
+	};
 	Vending.onClose = function onClose() {
+		this.cancelDrag();
 		this._host.style.display = "none";
 		Vending.isOpen = false;
 	};
@@ -328947,6 +338724,16 @@ var init_VendingShop = __esmMin((() => {
 	*/
 	VendingShop.setType = function setType(type) {
 		_type$1 = type;
+	};
+	/** Apply a buyer notification by item ID, rather than its inventory index. */
+	VendingShop.updateBuyingItem = function updateBuyingItem(itemId, count) {
+		if (_type$1 !== VendingShop.Type.BUYING_LIST || count <= 0) return;
+		const item = this.getItemById(itemId);
+		if (item) this.updateItem(item.index, item.count - count);
+	};
+	/** The server already closed this store; do not send a second close request. */
+	VendingShop.closeBuyingStore = function closeBuyingStore() {
+		if (_type$1 === VendingShop.Type.BUYING_LIST) this.remove();
 	};
 	/**
 	* Remove Inventory from window (and so clean up items)
@@ -332926,16 +342713,53 @@ var init_RodexIcon = __esmMin((() => {
 //#region src/UI/Components/Roulette/Roulette.html?raw
 var Roulette_default$2;
 var init_Roulette$3 = __esmMin((() => {
-	Roulette_default$2 = "<div id=\"Roulette\">\r\n	<div class=\"body\" data-background=\"basic_interface/roullette/roulletteBG.bmp\">\r\n		<div class=\"titlebar\">\r\n			<div class=\"left\">\r\n				<span class=\"title\">Roulette</span>\r\n			</div>\r\n			<div class=\"right\">\r\n				<button class=\"base close\">×</button>\r\n			</div>\r\n			<div class=\"clear\"></div>\r\n		</div>\r\n\r\n		<div class=\"roulette-container\">\r\n			<div class=\"roulette-wheel\">\r\n				<div class=\"wheel-center\"></div>\r\n				<div class=\"wheel-slots\">\r\n					<!-- Slots will be generated dynamically -->\r\n				</div>\r\n				<div class=\"wheel-pointer\"></div>\r\n			</div>\r\n\r\n			<div class=\"roulette-info\">\r\n				<div class=\"points-display\">\r\n					<span class=\"label\">Points:</span>\r\n					<span class=\"points-value\">0</span>\r\n				</div>\r\n\r\n				<div class=\"buttons-container\">\r\n					<button\r\n						class=\"btn-spin\"\r\n						data-background=\"basic_interface/roullette/StartRoullette_a.bmp\"\r\n						data-hover=\"basic_interface/roullette/StartRoullette_b.bmp\"\r\n					>\r\n						<span>Spin</span>\r\n					</button>\r\n					<button class=\"btn-info\">\r\n						<span>Info</span>\r\n					</button>\r\n					<button\r\n						class=\"btn-close\"\r\n						data-background=\"basic_interface/roullette/GetWinPrize_a.bmp\"\r\n						data-hover=\"basic_interface/roullette/GetWinPrize_b.bmp\"\r\n					>\r\n						<span>Get Prize</span>\r\n					</button>\r\n				</div>\r\n\r\n				<div class=\"result-display\">\r\n					<span class=\"result-label\">Result:</span>\r\n					<div class=\"result-item\"></div>\r\n				</div>\r\n			</div>\r\n		</div>\r\n	</div>\r\n</div>\r\n";
+	Roulette_default$2 = "<div id=\"Roulette\">\r\n	<div class=\"body\" data-background=\"basic_interface/roullette/roulletteBG.bmp\">\r\n		<div class=\"titlebar\">\r\n			<div class=\"left\">\r\n				<span class=\"title\">Roulette</span>\r\n			</div>\r\n			<div class=\"right\">\r\n				<button class=\"base close\">×</button>\r\n			</div>\r\n			<div class=\"clear\"></div>\r\n		</div>\r\n\r\n		<div class=\"roulette-container\">\r\n			<div class=\"row-label\"></div>\r\n			<div class=\"roulette-wheel\">\r\n				<div class=\"wheel-center\"></div>\r\n				<div class=\"wheel-slots\">\r\n					<!-- Slots will be generated dynamically -->\r\n				</div>\r\n				<div class=\"wheel-pointer\"></div>\r\n			</div>\r\n\r\n			<div class=\"roulette-info\">\r\n				<div class=\"points-display\">\r\n					<span class=\"label\">Points:</span>\r\n					<span class=\"points-value\">0</span>\r\n				</div>\r\n\r\n				<div class=\"buttons-container\">\r\n					<button\r\n						class=\"btn-spin\"\r\n						data-background=\"basic_interface/roullette/StartRoullette_a.bmp\"\r\n						data-hover=\"basic_interface/roullette/StartRoullette_b.bmp\"\r\n					>\r\n						<span>Spin</span>\r\n					</button>\r\n					<button class=\"btn-info\">\r\n						<span>Refresh Rewards</span>\r\n					</button>\r\n					<button\r\n						class=\"btn-claim\"\r\n						data-background=\"basic_interface/roullette/GetWinPrize_a.bmp\"\r\n						data-hover=\"basic_interface/roullette/GetWinPrize_b.bmp\"\r\n					>\r\n						<span>Get Prize</span>\r\n					</button>\r\n				</div>\r\n\r\n				<div class=\"status\" role=\"status\"></div>\r\n				<div class=\"result-display\">\r\n					<span class=\"result-label\">Result:</span>\r\n					<div class=\"result-item\"></div>\r\n				</div>\r\n			</div>\r\n		</div>\r\n	</div>\r\n</div>\r\n";
 }));
 //#endregion
 //#region src/UI/Components/Roulette/Roulette.css?raw
 var Roulette_default$1;
 var init_Roulette$2 = __esmMin((() => {
-	Roulette_default$1 = ":host {\r\n	width: 600px;\r\n	height: 500px;\r\n}\r\n\r\n#Roulette {\r\n	position: absolute;\r\n	width: 100%;\r\n	height: 100%;\r\n	z-index: 50;\r\n}\r\n\r\n#Roulette .body {\r\n	position: relative;\r\n	width: 100%;\r\n	height: 100%;\r\n	background-color: #2a2a2a;\r\n	border: 2px solid #5a5a5a;\r\n	border-radius: 10px;\r\n}\r\n\r\n#Roulette .titlebar {\r\n	position: relative;\r\n	height: 30px;\r\n	background: linear-gradient(to bottom, #4a4a4a 0%, #2a2a2a 100%);\r\n	border-bottom: 1px solid #5a5a5a;\r\n	cursor: move;\r\n	padding: 5px 10px;\r\n}\r\n\r\n#Roulette .titlebar .left {\r\n	float: left;\r\n}\r\n\r\n#Roulette .titlebar .title {\r\n	color: #fff;\r\n	font-size: 14px;\r\n	font-weight: bold;\r\n	line-height: 20px;\r\n}\r\n\r\n#Roulette .titlebar .right {\r\n	float: right;\r\n}\r\n\r\n#Roulette .titlebar .close {\r\n	width: 20px;\r\n	height: 20px;\r\n	border: 0;\r\n	background-repeat: no-repeat;\r\n	background-position: center;\r\n	background-color: transparent;\r\n	cursor: pointer;\r\n}\r\n\r\n#Roulette .roulette-container {\r\n	position: relative;\r\n	width: 100%;\r\n	height: calc(100% - 30px);\r\n	padding: 20px;\r\n	display: flex;\r\n	flex-direction: column;\r\n	align-items: center;\r\n	justify-content: center;\r\n}\r\n\r\n#Roulette .roulette-wheel {\r\n	position: relative;\r\n	width: 350px;\r\n	height: 350px;\r\n	margin: 0 auto 20px;\r\n}\r\n\r\n#Roulette .wheel-center {\r\n	position: absolute;\r\n	top: 50%;\r\n	left: 50%;\r\n	transform: translate(-50%, -50%);\r\n	width: 300px;\r\n	height: 300px;\r\n	border-radius: 50%;\r\n	background: radial-gradient(circle, #4a4a4a 0%, #2a2a2a 100%);\r\n	border: 3px solid #8a8a8a;\r\n	box-shadow: 0 0 20px rgba(0, 0, 0, 0.5);\r\n}\r\n\r\n#Roulette .wheel-slots {\r\n	position: absolute;\r\n	top: 50%;\r\n	left: 50%;\r\n	transform: translate(-50%, -50%);\r\n	width: 280px;\r\n	height: 280px;\r\n	border-radius: 50%;\r\n	transition: transform 3s cubic-bezier(0.25, 0.1, 0.25, 1);\r\n}\r\n\r\n#Roulette .wheel-slot {\r\n	position: absolute;\r\n	top: 50%;\r\n	left: 50%;\r\n	width: 50px;\r\n	height: 50px;\r\n	margin-left: -25px;\r\n	margin-top: -25px;\r\n	transform-origin: center;\r\n	display: flex;\r\n	align-items: center;\r\n	justify-content: center;\r\n	background-color: rgba(255, 255, 255, 0.1);\r\n	border: 1px solid #5a5a5a;\r\n	border-radius: 5px;\r\n	transition: background-color 0.3s;\r\n}\r\n\r\n#Roulette .wheel-slot:hover {\r\n	background-color: rgba(255, 255, 255, 0.2);\r\n}\r\n\r\n#Roulette .wheel-slot .item-icon {\r\n	width: 40px;\r\n	height: 40px;\r\n	background-size: contain;\r\n	background-position: center;\r\n	background-repeat: no-repeat;\r\n}\r\n\r\n#Roulette .wheel-pointer {\r\n	position: absolute;\r\n	top: 10px;\r\n	left: 50%;\r\n	transform: translateX(-50%);\r\n	width: 0;\r\n	height: 0;\r\n	border-left: 15px solid transparent;\r\n	border-right: 15px solid transparent;\r\n	border-top: 30px solid #ff0000;\r\n	z-index: 10;\r\n	filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.5));\r\n}\r\n\r\n#Roulette .roulette-info {\r\n	width: 100%;\r\n	text-align: center;\r\n}\r\n\r\n#Roulette .points-display {\r\n	margin-bottom: 15px;\r\n	font-size: 16px;\r\n	color: #fff;\r\n}\r\n\r\n#Roulette .points-display .label {\r\n	font-weight: bold;\r\n	margin-right: 10px;\r\n}\r\n\r\n#Roulette .points-display .points-value {\r\n	color: #ffd700;\r\n	font-size: 18px;\r\n	font-weight: bold;\r\n}\r\n\r\n#Roulette .buttons-container {\r\n	display: flex;\r\n	justify-content: center;\r\n	gap: 10px;\r\n	margin-bottom: 15px;\r\n}\r\n\r\n#Roulette .buttons-container button {\r\n	min-width: 80px;\r\n	height: 30px;\r\n	border: 1px solid #5a5a5a;\r\n	background-color: #3a3a3a;\r\n	background-repeat: no-repeat;\r\n	background-position: center;\r\n	color: #fff;\r\n	border-radius: 5px;\r\n	transition: background-color 0.3s;\r\n}\r\n\r\n#Roulette .buttons-container button:hover {\r\n	background-color: #4a4a4a;\r\n}\r\n\r\n#Roulette .buttons-container button:active {\r\n	background-color: #2a2a2a;\r\n}\r\n\r\n#Roulette .buttons-container button:disabled {\r\n	opacity: 0.5;\r\n}\r\n\r\n#Roulette .result-display {\r\n	min-height: 60px;\r\n	padding: 10px;\r\n	background-color: rgba(0, 0, 0, 0.3);\r\n	border: 1px solid #5a5a5a;\r\n	border-radius: 5px;\r\n}\r\n\r\n#Roulette .result-display .result-label {\r\n	display: block;\r\n	color: #fff;\r\n	font-weight: bold;\r\n	margin-bottom: 5px;\r\n}\r\n\r\n#Roulette .result-display .result-item {\r\n	display: inline-block;\r\n	width: 40px;\r\n	height: 40px;\r\n	background-size: contain;\r\n	background-position: center;\r\n	background-repeat: no-repeat;\r\n}\r\n\r\n#Roulette .clear {\r\n	clear: both;\r\n}\r\n\r\n/* Animation classes */\r\n#Roulette .wheel-slots.spinning {\r\n	animation: spin 3s cubic-bezier(0.25, 0.1, 0.25, 1);\r\n}\r\n\r\n@keyframes spin {\r\n	0% {\r\n		transform: translate(-50%, -50%) rotate(0deg);\r\n	}\r\n	100% {\r\n		transform: translate(-50%, -50%) rotate(1800deg);\r\n	}\r\n}\r\n";
+	Roulette_default$1 = ":host {\r\n	width: 600px;\r\n	height: 600px;\r\n}\r\n\r\n#Roulette {\r\n	position: absolute;\r\n	width: 100%;\r\n	height: 100%;\r\n	z-index: 50;\r\n}\r\n\r\n#Roulette .body {\r\n	position: relative;\r\n	width: 100%;\r\n	height: 100%;\r\n	background-color: #2a2a2a;\r\n	border: 2px solid #5a5a5a;\r\n	border-radius: 10px;\r\n}\r\n\r\n#Roulette .titlebar {\r\n	position: relative;\r\n	height: 30px;\r\n	background: linear-gradient(to bottom, #4a4a4a 0%, #2a2a2a 100%);\r\n	border-bottom: 1px solid #5a5a5a;\r\n	cursor: move;\r\n	padding: 5px 10px;\r\n}\r\n\r\n#Roulette .titlebar .left {\r\n	float: left;\r\n}\r\n\r\n#Roulette .titlebar .title {\r\n	color: #fff;\r\n	font-size: 14px;\r\n	font-weight: bold;\r\n	line-height: 20px;\r\n}\r\n\r\n#Roulette .titlebar .right {\r\n	float: right;\r\n}\r\n\r\n#Roulette .titlebar .close {\r\n	width: 20px;\r\n	height: 20px;\r\n	border: 0;\r\n	background-repeat: no-repeat;\r\n	background-position: center;\r\n	background-color: transparent;\r\n	cursor: pointer;\r\n}\r\n\r\n#Roulette .roulette-container {\r\n	position: relative;\r\n	width: 100%;\r\n	height: calc(100% - 30px);\r\n	padding: 20px;\r\n	display: flex;\r\n	flex-direction: column;\r\n	align-items: center;\r\n	justify-content: center;\r\n}\r\n\r\n#Roulette .roulette-wheel {\r\n	position: relative;\r\n	width: 350px;\r\n	height: 350px;\r\n	margin: 0 auto 20px;\r\n}\r\n\r\n#Roulette .wheel-center {\r\n	position: absolute;\r\n	top: 50%;\r\n	left: 50%;\r\n	transform: translate(-50%, -50%);\r\n	width: 300px;\r\n	height: 300px;\r\n	border-radius: 50%;\r\n	background: radial-gradient(circle, #4a4a4a 0%, #2a2a2a 100%);\r\n	border: 3px solid #8a8a8a;\r\n	box-shadow: 0 0 20px rgba(0, 0, 0, 0.5);\r\n}\r\n\r\n#Roulette .wheel-slots {\r\n	position: absolute;\r\n	top: 50%;\r\n	left: 50%;\r\n	transform: translate(-50%, -50%);\r\n	width: 280px;\r\n	height: 280px;\r\n	border-radius: 50%;\r\n	transition: transform 3s cubic-bezier(0.25, 0.1, 0.25, 1);\r\n}\r\n\r\n#Roulette .wheel-slot {\r\n	position: absolute;\r\n	top: 50%;\r\n	left: 50%;\r\n	width: 50px;\r\n	height: 50px;\r\n	margin-left: -25px;\r\n	margin-top: -25px;\r\n	transform-origin: center;\r\n	display: flex;\r\n	align-items: center;\r\n	justify-content: center;\r\n	background-color: rgba(255, 255, 255, 0.1);\r\n	border: 1px solid #5a5a5a;\r\n	border-radius: 5px;\r\n	transition: background-color 0.3s;\r\n}\r\n\r\n#Roulette .wheel-slot:hover {\r\n	background-color: rgba(255, 255, 255, 0.2);\r\n}\r\n\r\n#Roulette .wheel-slot .item-icon {\r\n	width: 40px;\r\n	height: 40px;\r\n	background-size: contain;\r\n	background-position: center;\r\n	background-repeat: no-repeat;\r\n}\r\n\r\n#Roulette .wheel-pointer {\r\n	position: absolute;\r\n	top: 10px;\r\n	left: 50%;\r\n	transform: translateX(-50%);\r\n	width: 0;\r\n	height: 0;\r\n	border-left: 15px solid transparent;\r\n	border-right: 15px solid transparent;\r\n	border-top: 30px solid #ff0000;\r\n	z-index: 10;\r\n	filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.5));\r\n}\r\n\r\n#Roulette .roulette-info {\r\n	width: 100%;\r\n	text-align: center;\r\n}\r\n\r\n#Roulette .points-display {\r\n	margin-bottom: 15px;\r\n	font-size: 16px;\r\n	color: #fff;\r\n}\r\n\r\n#Roulette .points-display .label {\r\n	font-weight: bold;\r\n	margin-right: 10px;\r\n}\r\n\r\n#Roulette .points-display .points-value {\r\n	color: #ffd700;\r\n	font-size: 18px;\r\n	font-weight: bold;\r\n}\r\n\r\n#Roulette .buttons-container {\r\n	display: flex;\r\n	justify-content: center;\r\n	gap: 10px;\r\n	margin-bottom: 15px;\r\n}\r\n\r\n#Roulette .buttons-container button {\r\n	min-width: 80px;\r\n	height: 30px;\r\n	border: 1px solid #5a5a5a;\r\n	background-color: #3a3a3a;\r\n	background-repeat: no-repeat;\r\n	background-position: center;\r\n	color: #fff;\r\n	border-radius: 5px;\r\n	transition: background-color 0.3s;\r\n}\r\n\r\n#Roulette .buttons-container button:hover {\r\n	background-color: #4a4a4a;\r\n}\r\n\r\n#Roulette .buttons-container button:active {\r\n	background-color: #2a2a2a;\r\n}\r\n\r\n#Roulette .buttons-container button:disabled {\r\n	opacity: 0.5;\r\n}\r\n\r\n#Roulette .result-display {\r\n	min-height: 60px;\r\n	padding: 10px;\r\n	background-color: rgba(0, 0, 0, 0.3);\r\n	border: 1px solid #5a5a5a;\r\n	border-radius: 5px;\r\n}\r\n\r\n#Roulette .result-display .result-label {\r\n	display: block;\r\n	color: #fff;\r\n	font-weight: bold;\r\n	margin-bottom: 5px;\r\n}\r\n\r\n#Roulette .result-display .result-item {\r\n	display: inline-block;\r\n	width: 40px;\r\n	height: 40px;\r\n	background-size: contain;\r\n	background-position: center;\r\n	background-repeat: no-repeat;\r\n}\r\n\r\n#Roulette .clear {\r\n	clear: both;\r\n}\r\n\r\n/* Animation classes */\r\n#Roulette .wheel-slots.spinning {\r\n	animation: spin 3s cubic-bezier(0.25, 0.1, 0.25, 1);\r\n}\r\n\r\n@keyframes spin {\r\n	0% {\r\n		transform: translate(-50%, -50%) rotate(0deg);\r\n	}\r\n	100% {\r\n		transform: translate(-50%, -50%) rotate(1800deg);\r\n	}\r\n}\r\n\r\n#Roulette .roulette-container {\r\n	box-sizing: border-box;\r\n}\r\n\r\n#Roulette .row-label,\r\n#Roulette .status {\r\n	color: #fff;\r\n	min-height: 20px;\r\n	margin-bottom: 8px;\r\n}\r\n\r\n#Roulette .wheel-slot .item-icon {\r\n	font-size: 0;\r\n}\r\n\r\n#Roulette .wheel-slot .item-count {\r\n	position: absolute;\r\n	right: 2px;\r\n	bottom: 1px;\r\n	color: #fff;\r\n	background-color: #2a2a2a;\r\n}\r\n\r\n#Roulette .result-display .result-item {\r\n	width: auto;\r\n	min-width: 40px;\r\n	padding-left: 48px;\r\n	background-size: 40px 40px;\r\n	background-position: left center;\r\n	color: #fff;\r\n	line-height: 40px;\r\n}\r\n";
 }));
 //#endregion
 //#region src/UI/Components/Roulette/Roulette.js
+function isBusy() {
+	return _pending !== null || Date.now() < _cooldownUntil;
+}
+function finishRequest$1() {
+	clearTimeout(_requestTimer);
+	_requestTimer = null;
+	_pending = null;
+}
+function sendRequest(packet, kind) {
+	finishRequest$1();
+	_pending = kind;
+	_requestTimer = setTimeout(() => {
+		finishRequest$1();
+		_status = "No response. Close and reopen Roulette to refresh.";
+		Roulette.updateUI();
+	}, 1e4);
+	Network.sendPacket(packet);
+	Roulette.updateUI();
+}
+function hasPrizePosition(pkt) {
+	return pkt.step >= 0 && pkt.step < 7 && pkt.idx >= 0 && pkt.idx < 9 - pkt.step;
+}
+function startingStep() {
+	return _rouletteInfo.bronzePoint > 0 ? 0 : _rouletteInfo.silverPoint >= 10 ? 2 : _rouletteInfo.goldPoint >= 10 ? 4 : 0;
+}
+function setItem(element, item) {
+	element.style.backgroundImage = "";
+	element.textContent = "";
+	element.title = "";
+	if (!item) return;
+	const info = DB.getItemInfo(item.itemId);
+	element.title = `${info.identifiedDisplayName} ×${item.count}`;
+	element.textContent = element.title;
+	Client.loadFile(`${DB.INTERFACE_PATH}item/${info.identifiedResourceName}.bmp`, (data) => {
+		if (element.isConnected && element.title === `${info.identifiedDisplayName} ×${item.count}`) element.style.backgroundImage = `url(${data})`;
+	});
+}
 /**
 * Click on roulette icon
 */
@@ -332944,12 +342768,7 @@ function onClickIcon() {
 		Roulette.onClose();
 		return;
 	}
-	const pkt = new PACKET.CZ.REQ_OPEN_ROULETTE();
-	Network.sendPacket(pkt);
-	if (_responseTimeout) clearTimeout(_responseTimeout);
-	_responseTimeout = setTimeout(() => {
-		_responseTimeout = null;
-	}, 2e3);
+	if (_pending !== "open") sendRequest(new PACKET.CZ.REQ_OPEN_ROULETTE(), "open");
 }
 /**
 * Create the roulette icon as a standalone light-DOM button.
@@ -332958,6 +342777,9 @@ function addRouletteIcon() {
 	if (_iconBtn) return;
 	_iconBtn = document.createElement("button");
 	_iconBtn.className = "rouletteIcon";
+	_iconBtn.title = "Roulette";
+	_iconBtn.setAttribute("aria-label", "Roulette");
+	_iconBtn.textContent = "Roulette";
 	Object.assign(_iconBtn.style, {
 		position: "absolute",
 		top: "74px",
@@ -332979,7 +342801,7 @@ function addRouletteIcon() {
 		if (_iconBtn) _iconBtn.style.backgroundImage = `url(${data})`;
 	});
 }
-var Roulette, _preferences$10, _rouletteInfo, _isSpinning, _responseTimeout, _iconBtn, Roulette_default;
+var Roulette, _preferences$10, _rouletteInfo, _pending, _requestTimer, _spinTimer, _cooldownUntil, _prize, _nextStep, _status, _rotation, _iconBtn, Roulette_default;
 var init_Roulette$1 = __esmMin((() => {
 	init_DBManager();
 	init_Client();
@@ -333011,7 +342833,14 @@ var init_Roulette$1 = __esmMin((() => {
 		additionItemID: 0,
 		items: []
 	};
-	_isSpinning = false;
+	_pending = null;
+	_requestTimer = null;
+	_spinTimer = null;
+	_cooldownUntil = 0;
+	_prize = null;
+	_nextStep = 0;
+	_status = "";
+	_rotation = 0;
 	/**
 	* Initialize UI
 	*/
@@ -333020,25 +342849,24 @@ var init_Roulette$1 = __esmMin((() => {
 		root.querySelector(".close").addEventListener("click", () => {
 			Roulette.onClose();
 		});
-		root.querySelector(".btn-close").addEventListener("click", () => {
-			Roulette.onClose();
+		root.querySelector(".btn-claim").addEventListener("click", () => {
+			Roulette.requestReceiveItem();
 		});
 		root.querySelector(".btn-spin").addEventListener("click", () => {
-			if (!_isSpinning) Roulette.onSpin();
+			if (!isBusy()) Roulette.onSpin();
 		});
 		root.querySelector(".btn-info").addEventListener("click", () => {
 			Roulette.onInfo();
 		});
 		this.draggable(".titlebar");
 	};
-	_responseTimeout = null;
 	/**
 	* Once append to the DOM
 	*/
 	Roulette.onAppend = function onAppend() {
 		this._host.style.top = Math.min(Math.max(0, _preferences$10.y), Renderer.height - this._host.offsetHeight) + "px";
 		this._host.style.left = Math.min(Math.max(0, _preferences$10.x), Renderer.width - this._host.offsetWidth) + "px";
-		if (!_preferences$10.show) this._host.style.display = "none";
+		this._host.style.display = "none";
 		if (ROConfig.enableRoulette === false) return;
 		if (PacketVerManager_default.value < 20141008) return;
 		addRouletteIcon();
@@ -333056,21 +342884,32 @@ var init_Roulette$1 = __esmMin((() => {
 		_preferences$10.x = parseInt(this._host.style.left, 10);
 		_preferences$10.y = parseInt(this._host.style.top, 10);
 		_preferences$10.save();
+		finishRequest$1();
+		clearTimeout(_spinTimer);
+		_spinTimer = null;
+		_cooldownUntil = 0;
+		_prize = null;
+		_rouletteInfo.items = [];
+		_status = "";
 	};
 	/**
 	* Open Roulette Window
 	*/
 	Roulette.onOpen = function onOpen(pkt) {
-		if (pkt) {
-			_rouletteInfo.step = pkt.step || 0;
-			_rouletteInfo.idx = pkt.idx || 0;
-			_rouletteInfo.goldPoint = pkt.goldPoint || 0;
-			_rouletteInfo.silverPoint = pkt.silverPoint || 0;
-			_rouletteInfo.bronzePoint = pkt.bronzePoint || 0;
-			_rouletteInfo.additionItemID = pkt.additionItemID || 0;
-		}
+		finishRequest$1();
+		setItem(this.getRoot().querySelector(".result-item"), null);
+		Object.assign(_rouletteInfo, pkt);
+		_nextStep = startingStep();
+		_prize = hasPrizePosition(pkt) ? {
+			row: pkt.step,
+			position: pkt.idx,
+			losing: false
+		} : null;
+		if (_prize && Date.now() >= _cooldownUntil) this.startSpin(_prize.position, Math.max(0, _prize.row));
+		_status = _prize ? "Prize ready after the wheel stops." : "Spin, then collect your prize or spin again.";
+		if (pkt.idx >= 0 && !_prize) _status = "Invalid reward position. Close and reopen Roulette to refresh.";
 		this._host.style.display = "";
-		this.updateUI();
+		this.onInfo();
 		this.focus();
 	};
 	/**
@@ -333085,9 +342924,9 @@ var init_Roulette$1 = __esmMin((() => {
 	* Request to spin the roulette
 	*/
 	Roulette.onSpin = function onSpin() {
-		if (_isSpinning) return;
-		const pkt = new PACKET.CZ.REQ_GENERATE_ROULETTE();
-		Network.sendPacket(pkt);
+		if (isBusy()) return;
+		_status = "Waiting for spin result…";
+		sendRequest(new PACKET.CZ.REQ_GENERATE_ROULETTE(), "spin");
 	};
 	/**
 	* Handle roulette item list response
@@ -333097,30 +342936,39 @@ var init_Roulette$1 = __esmMin((() => {
 			_rouletteInfo.items = pkt.items;
 			_rouletteInfo.serial = pkt.serial;
 		}
-		Roulette.generateWheelSlots();
+		Roulette.updateUI();
 	};
 	/**
-	* Show info window
+	* Refresh the configured reward list
 	*/
-	Roulette.onInfo = function onInfo() {};
+	Roulette.onInfo = function onInfo() {
+		Network.sendPacket(new PACKET.CZ.REQ_ROULETTE_INFO());
+		this.updateUI();
+	};
 	/**
 	* Update UI with current roulette data
 	*/
 	Roulette.updateUI = function updateUI() {
 		const root = this.getRoot();
 		this.generateWheelSlots();
-		const btnSpin = root.querySelector(".btn-spin");
-		if (btnSpin) btnSpin.disabled = _isSpinning;
+		root.querySelector(".points-value").textContent = `Gold: ${_rouletteInfo.goldPoint} · Silver: ${_rouletteInfo.silverPoint} · Bronze: ${_rouletteInfo.bronzePoint}`;
+		root.querySelector(".status").textContent = _status;
+		root.querySelector(".btn-spin").disabled = isBusy();
+		root.querySelector(".btn-claim").disabled = isBusy() || !_prize;
+		if (_prize && Date.now() >= _cooldownUntil) this.showResult();
 	};
 	/**
 	* Generate wheel slots from items
 	*/
 	Roulette.generateWheelSlots = function generateWheelSlots() {
-		const wheelSlots = this.getRoot().querySelector(".wheel-slots");
+		const root = this.getRoot();
+		const wheelSlots = root.querySelector(".wheel-slots");
 		if (!wheelSlots) return;
 		wheelSlots.innerHTML = "";
-		const items = _rouletteInfo.items || [];
-		const numSlots = items.length || 10;
+		const row = _prize?.row >= 0 ? _prize.row : _nextStep;
+		const items = _rouletteInfo.items.filter((item) => item.row === row).sort((a, b) => a.position - b.position);
+		const numSlots = items.length;
+		root.querySelector(".row-label").textContent = `Reward level ${row + 1}`;
 		for (let i = 0; i < numSlots; i++) {
 			const angle = 360 / numSlots * i;
 			const distance = 120;
@@ -333131,81 +342979,90 @@ var init_Roulette$1 = __esmMin((() => {
 			slot.className = "wheel-slot";
 			slot.setAttribute("data-index", i);
 			Object.assign(slot.style, { transform: `translate(${x}px, ${y}px) rotate(${angle}deg)` });
-			if (items[i]) {
-				const itemId = items[i].itemId || items[i].item_id || items[i].ItemID;
-				if (itemId) Client.loadFile(DB.INTERFACE_PATH + `item/${itemId}.bmp`, function(data) {
-					const icon = document.createElement("div");
-					icon.className = "item-icon";
-					icon.style.backgroundImage = `url(${data})`;
-					slot.appendChild(icon);
-				});
-			}
+			const icon = document.createElement("div");
+			icon.className = "item-icon";
+			slot.appendChild(icon);
 			wheelSlots.appendChild(slot);
+			setItem(icon, items[i]);
+			const count = document.createElement("span");
+			count.className = "item-count";
+			count.textContent = `×${items[i].count}`;
+			slot.appendChild(count);
 		}
 	};
 	/**
 	* Start spinning animation
 	*/
-	Roulette.startSpin = function startSpin(resultIndex) {
-		if (_isSpinning) return;
-		_isSpinning = true;
-		const root = this.getRoot();
-		const btnSpin = root.querySelector(".btn-spin");
-		if (btnSpin) btnSpin.disabled = true;
-		const wheelSlots = root.querySelector(".wheel-slots");
-		if (!wheelSlots) {
-			_isSpinning = false;
-			if (btnSpin) btnSpin.disabled = false;
-			return;
-		}
-		const targetRotation = 1800 + resultIndex * (360 / (_rouletteInfo.items.length || 10));
-		wheelSlots.style.transform = `translate(-50%, -50%) rotate(${targetRotation}deg)`;
-		setTimeout(() => {
-			_isSpinning = false;
-			const btn = Roulette.getRoot().querySelector(".btn-spin");
-			if (btn) btn.disabled = false;
-			Roulette.showResult(resultIndex);
-		}, 3e3);
+	Roulette.startSpin = function startSpin(resultIndex, row) {
+		clearTimeout(_spinTimer);
+		const duration = Math.max(1, 6 - row) * 1e3;
+		_cooldownUntil = Date.now() + duration;
+		const wheel = this.getRoot().querySelector(".wheel-slots");
+		const slots = _rouletteInfo.items.filter((item) => item.row === row).length || 9 - row;
+		_rotation += 1800 + (360 - resultIndex * 360 / slots - _rotation % 360) % 360;
+		wheel.style.transitionDuration = `${duration}ms`;
+		wheel.style.transform = `translate(-50%, -50%) rotate(${_rotation}deg)`;
+		setItem(this.getRoot().querySelector(".result-item"), null);
+		_spinTimer = setTimeout(function finishSpin() {
+			const remaining = _cooldownUntil - Date.now();
+			if (remaining > 0) {
+				_spinTimer = setTimeout(finishSpin, remaining);
+				return;
+			}
+			_spinTimer = null;
+			_status = _prize?.losing ? "Round ended. Collect this prize or start a new round." : "Collect your prize or spin again.";
+			Roulette.updateUI();
+		}, duration);
 	};
-	/**
-	* Show result after spin
-	*/
-	Roulette.showResult = function showResult(resultIndex) {
-		const resultDisplay = this.getRoot().querySelector(".result-item");
-		if (!resultDisplay) return;
-		resultDisplay.innerHTML = "";
-		if (_rouletteInfo.items[resultIndex]) {
-			const item = _rouletteInfo.items[resultIndex];
-			const itemId = item.itemId || item.item_id || item.ItemID;
-			if (itemId) Client.loadFile(DB.INTERFACE_PATH + `item/${itemId}.bmp`, function(data) {
-				resultDisplay.style.backgroundImage = `url(${data})`;
-			});
-		}
+	Roulette.showResult = function showResult() {
+		const reward = _rouletteInfo.items.find((item) => item.row === _prize?.row && item.position === _prize?.position);
+		setItem(this.getRoot().querySelector(".result-item"), reward);
 	};
-	/**
-	* Handle roulette result from server
-	*/
 	Roulette.onResult = function onResult(pkt) {
-		if (pkt.step !== void 0) _rouletteInfo.step = pkt.step;
-		if (pkt.idx !== void 0) _rouletteInfo.idx = pkt.idx;
-		if (pkt.remainGold !== void 0) _rouletteInfo.goldPoint = pkt.remainGold;
-		if (pkt.remainSilver !== void 0) _rouletteInfo.silverPoint = pkt.remainSilver;
-		if (pkt.remainBronze !== void 0) _rouletteInfo.bronzePoint = pkt.remainBronze;
-		if (pkt.idx !== void 0) Roulette.startSpin(pkt.idx);
+		finishRequest$1();
+		for (const [field, reply] of [
+			["goldPoint", "remainGold"],
+			["silverPoint", "remainSilver"],
+			["bronzePoint", "remainBronze"]
+		]) if (pkt[reply] !== void 0) _rouletteInfo[field] = pkt[reply];
+		if ((pkt.result === 0 || pkt.result === 3) && hasPrizePosition(pkt)) {
+			_prize = {
+				row: pkt.step,
+				position: pkt.idx,
+				losing: pkt.result === 3
+			};
+			_nextStep = startingStep();
+			_status = "Spinning…";
+			this.startSpin(pkt.idx, pkt.step);
+		} else {
+			_prize = null;
+			_nextStep = startingStep();
+			setItem(this.getRoot().querySelector(".result-item"), null);
+			_status = pkt.result === 2 ? "Not enough roulette points." : "The spin failed. Close and reopen to refresh.";
+		}
+		this.updateUI();
 	};
-	/**
-	* Handle item received from server
-	*/
-	Roulette.onItemReceived = function onItemReceived(_pkt) {
-		Roulette.updateUI();
+	Roulette.onItemReceived = function onItemReceived(pkt) {
+		finishRequest$1();
+		_prize = null;
+		_nextStep = startingStep();
+		_rouletteInfo.additionItemID = pkt.additionItemID;
+		const messages = [
+			"Prize collected.",
+			"Could not collect the prize.",
+			"Inventory item limit exceeded.",
+			"Inventory weight limit exceeded."
+		];
+		_status = messages[pkt.result] || messages[1];
+		setItem(this.getRoot().querySelector(".result-item"), null);
+		this.updateUI();
 	};
-	/**
-	* Request to receive the roulette item
-	*/
-	Roulette.requestReceiveItem = function requestReceiveItem(condition) {
+	Roulette.requestReceiveItem = function requestReceiveItem() {
+		if (isBusy() || !_prize) return;
 		const pkt = new PACKET.CZ.RECV_ROULETTE_ITEM();
-		pkt.condition = condition || 0;
-		Network.sendPacket(pkt);
+		pkt.condition = _prize.losing ? 1 : 0;
+		_status = "Collecting prize…";
+		sendRequest(pkt, "claim");
 	};
 	Roulette_default = UIManager.addComponent(Roulette);
 }));
@@ -333436,7 +343293,7 @@ var init_CaptchaAnswer$1 = __esmMin((() => {
 }));
 //#endregion
 //#region src/UI/Components/Captcha/CaptchaAnswer.js
-var CaptchaAnswer, _preferences$9, timer, CaptchaAnswer_default;
+var CaptchaAnswer, _preferences$9, timer$1, CaptchaAnswer_default;
 var init_CaptchaAnswer = __esmMin((() => {
 	init_UIManager();
 	init_GUIComponent();
@@ -333451,7 +343308,7 @@ var init_CaptchaAnswer = __esmMin((() => {
 		x: 230,
 		y: 295
 	}, 2);
-	timer = null;
+	timer$1 = null;
 	CaptchaAnswer.render = () => CaptchaAnswer_default$2;
 	CaptchaAnswer.captureKeyEvents = true;
 	/**
@@ -333502,11 +343359,11 @@ var init_CaptchaAnswer = __esmMin((() => {
 		const root = this.getRoot();
 		const retryEl = root.querySelector(".retry_count");
 		if (retryEl) retryEl.textContent = DB.getMessage(2886).replace("%d", retryCount);
-		if (timer) {
-			clearInterval(timer);
-			timer = null;
+		if (timer$1) {
+			clearInterval(timer$1);
+			timer$1 = null;
 		}
-		timer = setInterval(() => {
+		timer$1 = setInterval(() => {
 			timeout--;
 			const minutes = Math.floor(timeout / 60);
 			const seconds = timeout % 60;
@@ -333515,8 +343372,8 @@ var init_CaptchaAnswer = __esmMin((() => {
 			const timerBarFill = root.querySelector(".timer_bar_fill");
 			if (timerBarFill) timerBarFill.style.width = `${timeout / 60 * 100}%`;
 			if (timeout <= 0) {
-				clearInterval(timer);
-				timer = null;
+				clearInterval(timer$1);
+				timer$1 = null;
 			}
 		}, 1e3);
 	};
@@ -333545,9 +343402,9 @@ var init_CaptchaAnswer = __esmMin((() => {
 		if (timerText) timerText.textContent = "0";
 		const errorText = root.querySelector(".error_text");
 		if (errorText) errorText.textContent = "";
-		if (timer) {
-			clearInterval(timer);
-			timer = null;
+		if (timer$1) {
+			clearInterval(timer$1);
+			timer$1 = null;
 		}
 	};
 	/**
@@ -336017,7 +345874,7 @@ function onSound(pkt) {
 /**
 * Received bgm from npc
 *
-* @param {object} pkt - PACKET.ZC.PLAY_NPC_BGM
+* @param {object} pkt - PACKET.ZC.PLAY_NPC_BGM or PACKET.ZC.PLAY_NPC_BGM2
 */
 function onBGM(pkt) {
 	if (!pkt.Bgm.match(/\.mp3$/i)) pkt.Bgm += ".mp3";
@@ -336041,6 +345898,7 @@ function NPCEngine$2() {
 	Network.hookPacket(PACKET.ZC.PROGRESS_CANCEL, onProgressBarStop);
 	Network.hookPacket(PACKET.ZC.SOUND, onSound);
 	Network.hookPacket(PACKET.ZC.PLAY_NPC_BGM, onBGM);
+	Network.hookPacket(PACKET.ZC.PLAY_NPC_BGM2, onBGM);
 	Network.hookPacket(PACKET.ZC.CLOSE_SCRIPT, onCloseScript);
 	Network.hookPacket(PACKET.ZC.DYNAMICNPC_CREATE_RESULT, onDynamicNPCCreateRequest);
 }
@@ -336939,6 +346797,15 @@ var init_Footprints = __esmMin((() => {
 }));
 //#endregion
 //#region src/Engine/MapEngine/Entity.js
+function requestEntityGuildEmblem(entity) {
+	const actorId = entity.GID;
+	const guildId = entity.GUID;
+	GuildEngine.requestGuildEmblem(guildId, entity.GEmblemVer, (image, gif) => {
+		if (EntityManager.get(actorId) !== entity || entity.GUID !== guildId || entity.GEmblemVer === 0) return;
+		entity.setEntityGuildEmblem(image, gif);
+		if (SessionStorage_default.mapState.isSiege && guildId !== SessionStorage_default.Entity?.GUID) entity.emblem.display = true;
+	});
+}
 /**
 * Spam an entity on the map
 * Generic packet handler
@@ -337062,10 +346929,7 @@ function onEntitySpam(pkt) {
 		});
 		delete clanEmblems[entity.GID];
 	}
-	if (entity.GUID) GuildEngine.requestGuildEmblem(entity.GUID, entity.GEmblemVer, (image, gif) => {
-		entity.setEntityGuildEmblem(image, gif);
-		if (SessionStorage_default.mapState.isSiege && entity.GUID !== SessionStorage_default.Entity.GUID) entity.emblem.display = true;
-	});
+	if (entity.GUID) requestEntityGuildEmblem(entity);
 	entity.aura.load(EffectManager);
 }
 /**
@@ -337157,18 +347021,21 @@ function onEntityMove(pkt) {
 */
 function onEntityStopMove(pkt) {
 	const entity = EntityManager.get(pkt.AID);
-	if (entity) {
-		if (entity.action === entity.ACTION.WALK) entity.setAction({
-			action: entity.ACTION.IDLE,
-			frame: 0,
-			repeat: true,
-			play: true
-		});
-		entity.resetRoute();
-		entity.position[0] = pkt.xPos;
-		entity.position[1] = pkt.yPos;
-		entity.position[2] = Altitude.getCellHeight(pkt.xPos, pkt.yPos);
+	if (!entity) return;
+	if (Configs.get("movePrediction", false)) {
+		entity.settleTo(pkt.xPos, pkt.yPos);
+		return;
 	}
+	if (entity.action === entity.ACTION.WALK) entity.setAction({
+		action: entity.ACTION.IDLE,
+		frame: 0,
+		repeat: true,
+		play: true
+	});
+	entity.resetRoute();
+	entity.position[0] = pkt.xPos;
+	entity.position[1] = pkt.yPos;
+	entity.position[2] = Altitude.getCellHeight(pkt.xPos, pkt.yPos);
 }
 /**
 * Move entity to a point
@@ -337543,14 +347410,12 @@ function onEntityIdentity(pkt) {
 			const equipment = EquipmentController.getUI();
 			if (equipment && typeof equipment.setTitle === "function") equipment.setTitle(pkt.TitleID);
 		}
+		entity.display.unit_title = pkt.Title || "";
 		entity.display.party_name = pkt.PName || "";
 		entity.display.guild_name = pkt.GName || "";
 		entity.display.guild_rank = pkt.RName || "";
 		entity.display.load = entity.display.TYPE.COMPLETE;
-		if (entity.GUID) GuildEngine.requestGuildEmblem(entity.GUID, entity.GEmblemVer, (image, gif) => {
-			entity.setEntityGuildEmblem(image, gif);
-			if (SessionStorage_default.mapState.isSiege && entity.GUID !== SessionStorage_default.Entity.GUID) entity.emblem.display = true;
-		});
+		if (entity.GUID) requestEntityGuildEmblem(entity);
 		else if (pkt.GID) DB.loadGroupEmblem(pkt.GID, (image) => {
 			entity.setEntityGuildEmblem(image);
 		});
@@ -338899,6 +348764,7 @@ var init_Entity = __esmMin((() => {
 	init_JobConst();
 	init_AttackEffectTable();
 	init_SoundManager();
+	init_Configs();
 	init_Events();
 	init_Guild();
 	init_SessionStorage();
@@ -344281,6 +354147,416 @@ var init_Mercenary = __esmMin((() => {
 	};
 }));
 //#endregion
+//#region src/UI/Components/StoreSearch/StoreSearch.html?raw
+var StoreSearch_default$2;
+var init_StoreSearch$3 = __esmMin((() => {
+	StoreSearch_default$2 = "<div id=\"StoreSearch\">\r\n	<div class=\"head\">\r\n		<ui-image src=\"basic_interface/titlebar_mid.bmp\"></ui-image><strong>Store Search</strong\r\n		><ui-button\r\n			class=\"close\"\r\n			aria-label=\"Close catalog\"\r\n			bg=\"btn_close.bmp\"\r\n			hover=\"btn_close_a.bmp\"\r\n			down=\"btn_close_b.bmp\"\r\n		></ui-button>\r\n	</div>\r\n	<div class=\"body\">\r\n		<div class=\"summary\"><span class=\"effect\"></span><span class=\"uses\"></span></div>\r\n		<label\r\n			>Search for\r\n			<select class=\"store-type\">\r\n				<option value=\"0\">Selling shops</option>\r\n				<option value=\"1\">Buying shops</option>\r\n			</select></label\r\n		>\r\n		<div class=\"pickers\">\r\n			<section data-picker=\"items\">\r\n				<label\r\n					>Items <input aria-label=\"Item name or ID\" placeholder=\"Name or known item ID\" autocomplete=\"off\"\r\n				/></label>\r\n				<div class=\"candidates\"></div>\r\n				<div class=\"selected\"></div>\r\n			</section>\r\n			<section data-picker=\"cards\">\r\n				<label\r\n					>Card filter\r\n					<input aria-label=\"Card name or ID\" placeholder=\"Select a card by name or ID\" autocomplete=\"off\"\r\n				/></label>\r\n				<div class=\"candidates\"></div>\r\n				<div class=\"selected\"></div>\r\n				<small class=\"card-note\">Optional: items containing any selected card.</small>\r\n			</section>\r\n		</div>\r\n		<div class=\"prices\">\r\n			<label>Min Zeny <input class=\"min-price\" type=\"number\" min=\"0\" max=\"4294967295\" value=\"0\" /></label\r\n			><label>Max Zeny <input class=\"max-price\" type=\"number\" min=\"0\" max=\"4294967295\" value=\"0\" /></label\r\n			><small>0 = no limit</small\r\n			><ui-button\r\n				class=\"search\"\r\n				aria-label=\"Search\"\r\n				title=\"Search\"\r\n				bg=\"reputation/btn_search.bmp\"\r\n				hover=\"reputation/btn_search_over.bmp\"\r\n				down=\"reputation/btn_search_press.bmp\"\r\n			></ui-button>\r\n		</div>\r\n		<div class=\"status\" role=\"status\" aria-live=\"polite\"></div>\r\n		<div class=\"results\"></div>\r\n	</div>\r\n	<div class=\"footer\">\r\n		<ui-image src=\"basic_interface/btnbar_mid2.bmp\"></ui-image><span class=\"result-count\"></span\r\n		><ui-button\r\n			class=\"next\"\r\n			aria-label=\"More results\"\r\n			title=\"More results\"\r\n			bg=\"btn_next.bmp\"\r\n			hover=\"btn_next_a.bmp\"\r\n			down=\"btn_next_b.bmp\"\r\n		></ui-button>\r\n	</div>\r\n</div>\r\n";
+}));
+//#endregion
+//#region src/UI/Components/StoreSearch/StoreSearch.css?raw
+var StoreSearch_default$1;
+var init_StoreSearch$2 = __esmMin((() => {
+	StoreSearch_default$1 = ":host {\r\n	position: absolute;\r\n	width: 540px;\r\n	top: 100px;\r\n	left: 100px;\r\n	font:\r\n		12px Arial,\r\n		sans-serif;\r\n	touch-action: none;\r\n}\r\n#StoreSearch {\r\n	background: #fff;\r\n	color: #111;\r\n}\r\n.head {\r\n	height: 20px;\r\n	position: relative;\r\n	display: flex;\r\n	align-items: center;\r\n	padding: 0 6px;\r\n}\r\n.head ui-image,\r\n.footer ui-image {\r\n	position: absolute;\r\n	inset: 0;\r\n	z-index: 0;\r\n}\r\n.head strong,\r\n.head .close,\r\n.footer > *:not(ui-image) {\r\n	position: relative;\r\n	z-index: 1;\r\n}\r\n.close {\r\n	width: 11px;\r\n	height: 11px;\r\n	margin-left: auto;\r\n}\r\n.body {\r\n	padding: 8px;\r\n}\r\n.summary,\r\n.prices {\r\n	display: flex;\r\n	align-items: center;\r\n	gap: 8px;\r\n	margin-bottom: 8px;\r\n}\r\n.uses {\r\n	margin-left: auto;\r\n}\r\n.pickers {\r\n	display: grid;\r\n	grid-template-columns: 1fr 1fr;\r\n	gap: 8px;\r\n	margin: 8px 0;\r\n}\r\nlabel {\r\n	display: flex;\r\n	gap: 5px;\r\n	align-items: center;\r\n}\r\ninput {\r\n	min-width: 0;\r\n	width: 100%;\r\n}\r\n.prices input {\r\n	width: 90px;\r\n}\r\n.candidates {\r\n	max-height: 96px;\r\n	overflow: auto;\r\n}\r\n.candidates button {\r\n	display: flex;\r\n	align-items: center;\r\n	width: 100%;\r\n	text-align: left;\r\n	border: 0;\r\n	background: transparent;\r\n	cursor: pointer;\r\n}\r\n.candidates button:hover,\r\n.result:hover {\r\n	background: #e6f0ff;\r\n}\r\n.icon {\r\n	width: 24px;\r\n	height: 24px;\r\n	flex-shrink: 0;\r\n	background-repeat: no-repeat;\r\n	background-position: center;\r\n}\r\n.selected {\r\n	display: flex;\r\n	flex-wrap: wrap;\r\n	gap: 3px;\r\n	max-height: 64px;\r\n	overflow: auto;\r\n}\r\n.selected button {\r\n	font-size: 11px;\r\n}\r\n.card-note {\r\n	display: block;\r\n	margin-top: 4px;\r\n}\r\n.status {\r\n	min-height: 28px;\r\n	margin: 6px 0;\r\n}\r\n.results {\r\n	height: 230px;\r\n	overflow: auto;\r\n}\r\n.result {\r\n	display: grid;\r\n	grid-template-columns: 1fr auto auto;\r\n	align-items: center;\r\n	gap: 8px;\r\n	padding: 5px 2px;\r\n	border-bottom: 1px solid #ddd;\r\n}\r\n.details {\r\n	display: flex;\r\n	align-items: center;\r\n	text-align: left;\r\n	border: 0;\r\n	background: transparent;\r\n	color: inherit;\r\n	cursor: pointer;\r\n	min-width: 0;\r\n}\r\n.item-label {\r\n	overflow-wrap: anywhere;\r\n}\r\n.shop {\r\n	display: block;\r\n	font-size: 11px;\r\n	color: #555;\r\n}\r\n.price {\r\n	text-align: right;\r\n	white-space: nowrap;\r\n}\r\n.footer {\r\n	position: relative;\r\n	min-height: 25px;\r\n	display: flex;\r\n	align-items: center;\r\n	justify-content: space-between;\r\n	padding: 0 8px;\r\n}\r\nui-button {\r\n	background-color: transparent;\r\n	background-repeat: no-repeat;\r\n	border: 0;\r\n	display: flex;\r\n	align-items: center;\r\n	justify-content: center;\r\n}\r\n.search,\r\n.next {\r\n	min-width: 42px;\r\n	height: 20px;\r\n}\r\n.visit {\r\n	font: inherit;\r\n}\r\nbutton:disabled {\r\n	opacity: 0.5;\r\n	cursor: default;\r\n}\r\n";
+}));
+//#endregion
+//#region src/UI/Components/StoreSearch/StoreSearch.js
+function icon(id) {
+	const element = document.createElement("span");
+	element.className = "icon";
+	const info = DB.getItemInfo(id);
+	Client.loadFile(`${DB.INTERFACE_PATH}item/${info.identifiedResourceName}.bmp`, (data) => {
+		element.style.backgroundImage = `url(${data})`;
+	});
+	return element;
+}
+function label(id) {
+	const info = ItemTable_default[id];
+	return `${info.identifiedDisplayName} [${info.slotCount || 0}] (#${id})`;
+}
+function renderSelected(kind) {
+	const container = Search.getRoot().querySelector(`[data-picker="${kind}"] .selected`);
+	container.replaceChildren();
+	for (const id of selected[kind]) {
+		const button = document.createElement("button");
+		button.type = "button";
+		button.textContent = `${label(id)} ×`;
+		button.title = "Remove selection";
+		button.addEventListener("click", () => {
+			selected[kind] = selected[kind].filter((value) => value !== id);
+			renderSelected(kind);
+		});
+		container.append(button);
+	}
+}
+function showCandidates(kind) {
+	const picker = Search.getRoot().querySelector(`[data-picker="${kind}"]`);
+	const query = picker.querySelector("input").value.trim().toLocaleLowerCase();
+	const candidates = picker.querySelector(".candidates");
+	candidates.replaceChildren();
+	if (!query) return;
+	let count = 0;
+	for (const [key, info] of Object.entries(ItemTable_default)) {
+		if (!info.identifiedDisplayName || !info.identifiedDisplayName.toLocaleLowerCase().includes(query) && key !== query) continue;
+		const id = Number(key);
+		if (!Number.isInteger(id) || id <= 0 || id > 4294967295) continue;
+		const button = document.createElement("button");
+		button.type = "button";
+		button.dataset.itemId = key;
+		button.append(icon(id), document.createTextNode(label(id)));
+		button.addEventListener("click", () => {
+			if (selected[kind].includes(id)) return;
+			if (selected.items.length + selected.cards.length >= 20) {
+				Search.getRoot().querySelector(".status").textContent = "Select up to 20 items and cards in total.";
+				return;
+			}
+			selected[kind].push(id);
+			renderSelected(kind);
+			candidates.replaceChildren();
+			picker.querySelector("input").value = "";
+		});
+		candidates.append(button);
+		if (++count >= 40) break;
+	}
+}
+var Search, selected, StoreSearch_default;
+var init_StoreSearch$1 = __esmMin((() => {
+	init_DBManager();
+	init_HtmlHelper();
+	init_ItemTable();
+	init_Client();
+	init_Renderer();
+	init_GUIComponent();
+	init_UIManager();
+	init_ItemInfo();
+	init_Elements();
+	init_StoreSearch$3();
+	init_StoreSearch$2();
+	Search = new GUIComponent("StoreSearch", StoreSearch_default$1);
+	Search.render = () => StoreSearch_default$2;
+	Search.captureKeyEvents = true;
+	selected = {
+		items: [],
+		cards: []
+	};
+	Search.init = function() {
+		const root = this.getRoot();
+		this.draggable(root.querySelector(".head"));
+		root.querySelector(".close").addEventListener("click", () => this.onClose());
+		for (const kind of ["items", "cards"]) root.querySelector(`[data-picker="${kind}"] input`).addEventListener("input", () => showCandidates(kind));
+		root.querySelector(".store-type").addEventListener("change", () => {
+			const buying = root.querySelector(".store-type").value === "1";
+			root.querySelector("[data-picker=\"cards\"] input").disabled = buying;
+			root.querySelector(".card-note").textContent = buying ? "Buying shops do not use card filters." : "Optional: items containing any selected card.";
+			selected.cards = [];
+			renderSelected("cards");
+			root.querySelector("[data-picker=\"cards\"] .candidates").replaceChildren();
+		});
+		root.querySelector(".search").addEventListener("click", () => {
+			if (!selected.items.length) {
+				root.querySelector(".status").textContent = "Select at least one item from the name search.";
+				return;
+			}
+			const minPrice = Number(root.querySelector(".min-price").value), maxPrice = Number(root.querySelector(".max-price").value);
+			if (![minPrice, maxPrice].every((n) => Number.isInteger(n) && n >= 0 && n <= 4294967295)) {
+				root.querySelector(".status").textContent = "Enter whole, nonnegative Zeny amounts.";
+				return;
+			}
+			if (minPrice > maxPrice) {
+				root.querySelector(".status").textContent = "Enter a maximum price at least as large as the minimum.";
+				return;
+			}
+			this.onSearch({
+				items: [...selected.items],
+				cards: [...selected.cards],
+				type: Number(root.querySelector(".store-type").value),
+				minPrice,
+				maxPrice
+			});
+		});
+		root.querySelector(".next").addEventListener("click", () => this.onNext());
+	};
+	Search.clearSelection = function() {
+		selected = {
+			items: [],
+			cards: []
+		};
+		const root = this.getRoot();
+		for (const kind of ["items", "cards"]) {
+			const picker = root.querySelector(`[data-picker="${kind}"]`);
+			picker.querySelector("input").value = "";
+			picker.querySelector("input").disabled = false;
+			picker.querySelector(".candidates").replaceChildren();
+			renderSelected(kind);
+		}
+		root.querySelector(".store-type").value = "0";
+		root.querySelector(".min-price").value = "0";
+		root.querySelector(".max-price").value = "0";
+		root.querySelector(".card-note").textContent = "Optional: items containing any selected card.";
+	};
+	Search.setCatalog = function(value) {
+		const root = this.getRoot();
+		const busy = !!value.pending || value.failed;
+		root.querySelector(".effect").textContent = value.effect ? "Remote catalog" : "Map catalog";
+		root.querySelector(".uses").textContent = `Searches remaining: ${value.uses}`;
+		root.querySelector(".status").textContent = value.status;
+		root.querySelector(".search").disabled = busy || !value.uses;
+		root.querySelector(".next").disabled = busy || !value.next;
+		root.querySelector(".result-count").textContent = `${value.rows.length} results`;
+		const list = root.querySelector(".results");
+		const scroll = list.scrollTop;
+		list.replaceChildren();
+		for (const row of value.rows) {
+			const element = document.createElement("div");
+			element.className = "result";
+			const details = document.createElement("button");
+			details.type = "button";
+			details.className = "details";
+			const name = document.createElement("span");
+			name.className = "item-label";
+			name.textContent = htmlToText(DB.getItemName(row));
+			const shop = document.createElement("span");
+			shop.className = "shop";
+			shop.textContent = row.StoreName;
+			name.append(shop);
+			details.append(icon(row.ITID), name);
+			details.addEventListener("click", () => {
+				ItemInfo_default.append();
+				ItemInfo_default.setItem(row);
+			});
+			const price = document.createElement("span");
+			price.className = "price";
+			price.textContent = `${row.price.toLocaleString()} Zeny × ${row.count}`;
+			const visit = document.createElement("button");
+			visit.type = "button";
+			visit.className = "visit";
+			visit.textContent = value.effect ? "Open" : "Locate";
+			visit.disabled = busy || !!row.stale;
+			visit.addEventListener("click", () => this.onVisit(row));
+			element.append(details, price, visit);
+			list.append(element);
+		}
+		list.scrollTop = scroll;
+	};
+	Search.onAppend = function() {
+		this._host.style.left = `${Math.max(0, (Renderer.width - 540) / 2)}px`;
+		this._host.style.top = `${Math.max(0, (Renderer.height - 480) / 2)}px`;
+	};
+	Search.onRemove = function() {
+		selected = {
+			items: [],
+			cards: []
+		};
+		this.onClose();
+	};
+	Search.onKeyDown = function(event) {
+		if (event.key === "Escape" || event.which === 27) {
+			event.stopImmediatePropagation();
+			this.onClose();
+		} else if (this.isEditableFocused()) event.stopImmediatePropagation();
+	};
+	Search.onClose = () => {};
+	Search.onSearch = () => {};
+	Search.onNext = () => {};
+	Search.onVisit = () => {};
+	StoreSearch_default = UIManager.addComponent(Search);
+}));
+//#endregion
+//#region src/Engine/MapEngine/StoreSearch.js
+function clearMarker() {
+	Controller$5.getUI()?.removeNpcMark(marker);
+}
+function retireRemoteShop() {
+	const retire = retireShop;
+	retireShop = null;
+	retire?.();
+}
+function finishRequest() {
+	clearTimeout(timer);
+	timer = null;
+	if (catalog) catalog.pending = null;
+}
+function refresh() {
+	if (catalog) StoreSearch_default.setCatalog(catalog);
+}
+function request(packet, pending) {
+	catalog.pending = pending;
+	timer = setTimeout(() => {
+		if (!catalog) return;
+		catalog.failed = true;
+		if (remoteAttempt) remoteAttempt.retired = true;
+		catalog.status = "No response. Close and reopen the catalog to refresh.";
+		finishRequest();
+		refresh();
+	}, 1e4);
+	refresh();
+	Network.sendPacket(packet);
+}
+function resetStoreSearch(newConnection = false) {
+	if (newConnection) remoteAttempt = null;
+	else if (remoteAttempt) remoteAttempt.retired = true;
+	finishRequest();
+	catalog = null;
+	retireRemoteShop();
+	clearMarker();
+	StoreSearch_default.remove();
+}
+function close() {
+	if (!catalog) return;
+	Network.sendPacket(new PACKET.CZ.CLOSE_SEARCH_STORE_INFO());
+	resetStoreSearch();
+}
+function onOpen(pkt) {
+	resetStoreSearch();
+	remoteAttempt = null;
+	if (pkt.openType !== 0 && pkt.openType !== 1) return;
+	catalog = {
+		effect: pkt.openType,
+		uses: pkt.SearchCntMax,
+		rows: [],
+		next: false,
+		pending: null,
+		failed: false,
+		status: "",
+		type: 0
+	};
+	StoreSearch_default.append();
+	StoreSearch_default.clearSelection();
+	refresh();
+}
+function onResults(pkt) {
+	if (!catalog || catalog.failed || !["query", "page"].includes(catalog.pending?.kind)) return;
+	if (pkt.IsFirstPage) catalog.rows = [];
+	catalog.rows.push(...pkt.SSI_List);
+	catalog.next = !!pkt.IsNexPage;
+	catalog.uses = pkt.RemainedSearchCnt;
+	if (catalog.pending.kind === "query") catalog.type = catalog.pending.type;
+	finishRequest();
+	refresh();
+}
+function onFailure(pkt) {
+	if (pkt.Reason === 4) remoteAttempt = null;
+	if (!catalog || catalog.failed) return;
+	const message = failures[pkt.Reason];
+	catalog.status = message ? DB.getMessage(message[0], message[1]) || message[1] : "Store search failed.";
+	if (pkt.Reason === 4) {
+		if (catalog.pending?.kind === "click") catalog.pending.row.stale = true;
+		clearMarker();
+		finishRequest();
+	} else if (pkt.Reason === 2 || pkt.Reason === 3) {
+		if (pkt.Reason === 2) catalog.uses = 0;
+		finishRequest();
+	}
+	refresh();
+}
+function onMarker(pkt) {
+	if (!catalog || catalog.effect !== 0 || catalog.pending?.kind !== "click" || catalog.failed) return;
+	clearMarker();
+	if (pkt.x >= 0 && pkt.y >= 0) {
+		Controller$5.getUI()?.addNpcMark(marker, pkt.x, pkt.y, 16776960, Infinity);
+		catalog.status = `Store marked at ${pkt.x}, ${pkt.y}.`;
+	} else catalog.status = "The store is not on this map.";
+	finishRequest();
+	refresh();
+}
+/** Gate a known retired catalog reply before it can replace a manually opened shop. */
+function canOpenSearchStore(account, storeId, type) {
+	if (!remoteAttempt || remoteAttempt.account !== account || remoteAttempt.storeId !== storeId || remoteAttempt.type !== type) return true;
+	if (remoteAttempt.retired) {
+		remoteAttempt = null;
+		return false;
+	}
+	return true;
+}
+/** Called by the existing store list handler after it installs its normal transaction UI. */
+function onSearchStoreOpened(account, storeId, type, retire) {
+	if (!catalog || catalog.failed || catalog.effect !== 1 || catalog.pending?.kind !== "click" || catalog.pending.row.AID !== account || catalog.pending.row.SSI_ID !== storeId || catalog.type !== type) return false;
+	remoteAttempt = null;
+	retireRemoteShop();
+	retireShop = retire;
+	catalog.status = "Store opened.";
+	finishRequest();
+	refresh();
+	return true;
+}
+function initializeStoreSearch() {
+	StoreSearch_default.onClose = close;
+	StoreSearch_default.onSearch = (query) => {
+		if (!catalog || catalog.failed || catalog.pending || !catalog.uses) return;
+		const { items, cards, type, minPrice, maxPrice } = query;
+		if (!items.length || items.length + cards.length > 20 || ![0, 1].includes(type) || ![
+			minPrice,
+			maxPrice,
+			...items,
+			...cards
+		].every((n) => Number.isInteger(n) && n >= 0 && n <= 4294967295)) return;
+		retireRemoteShop();
+		clearMarker();
+		catalog.status = "";
+		const pkt = new PACKET.CZ.SEARCH_STORE_INFO();
+		Object.assign(pkt, {
+			StoreType: type,
+			minPrice,
+			maxPrice,
+			ItemIDList: items,
+			CardIDList: cards
+		});
+		request(pkt, {
+			kind: "query",
+			type
+		});
+	};
+	StoreSearch_default.onNext = () => {
+		if (!catalog || catalog.failed || catalog.pending || !catalog.next) return;
+		request(new PACKET.CZ.SEARCH_STORE_INFO_NEXT_PAGE(), { kind: "page" });
+	};
+	StoreSearch_default.onVisit = (row) => {
+		if (!catalog || catalog.failed || catalog.pending || row.stale || !catalog.rows.includes(row)) return;
+		retireRemoteShop();
+		clearMarker();
+		catalog.status = "";
+		const pkt = new PACKET.CZ.SSILIST_ITEM_CLICK();
+		Object.assign(pkt, {
+			AID: row.AID,
+			SSI_ID: row.SSI_ID,
+			ITID: row.ITID
+		});
+		if (catalog.effect === 1) remoteAttempt = {
+			account: row.AID,
+			storeId: row.SSI_ID,
+			type: catalog.type,
+			retired: false
+		};
+		request(pkt, {
+			kind: "click",
+			row
+		});
+	};
+	Network.hookPacket(PACKET.ZC.OPEN_SEARCH_STORE_INFO, onOpen);
+	Network.hookPacket(PACKET.ZC.SEARCH_STORE_INFO_ACK2, onResults);
+	Network.hookPacket(PACKET.ZC.SEARCH_STORE_INFO_FAILED, onFailure);
+	Network.hookPacket(PACKET.ZC.SSILIST_ITEM_CLICK_ACK, onMarker);
+}
+var marker, catalog, timer, retireShop, remoteAttempt, failures;
+var init_StoreSearch = __esmMin((() => {
+	init_NetworkManager();
+	init_PacketStructure();
+	init_DBManager();
+	init_StoreSearch$1();
+	init_MiniMap();
+	marker = "store-search";
+	catalog = null;
+	timer = null;
+	retireShop = null;
+	remoteAttempt = null;
+	failures = [
+		[1803, "No matching stores were found."],
+		[1784, "There are too many results. Please narrow the search."],
+		[1798, "You cannot search anymore."],
+		[1800, "You cannot search yet. Please try again later."],
+		[1797, "No sale or purchase information is available."]
+	];
+}));
+//#endregion
 //#region src/UI/Components/NpcStore/NpcStore.html?raw
 var NpcStore_default$2;
 var init_NpcStore$2 = __esmMin((() => {
@@ -345275,6 +355551,12 @@ function onBuyingList(pkt) {
 	VendingShop_default.setType(VendingShop_default.Type.BUYING_LIST);
 	VendingShop_default.setItems(pkt.itemList);
 }
+function onBuyingStoreUpdate(pkt) {
+	VendingShop_default.updateBuyingItem(pkt.ITID, pkt.count);
+}
+function onBuyingStoreClosed(pkt) {
+	if (pkt.Result === 3 || pkt.Result === 4) VendingShop_default.closeBuyingStore();
+}
 function onDeleteVendingItem(pkt) {
 	if (PacketVerManager_default.value >= 20141016) VendingReport_default.add(pkt);
 	VendingShop_default.removeItem(pkt.index, pkt.count);
@@ -345483,6 +355765,7 @@ function onSellResult(pkt) {
 * @param {object} pkt - PACKET.ZC.PC_PURCHASE_ITEMLIST_FROMMC
 */
 function onVendingStoreList(_pkt) {
+	if (!canOpenSearchStore(_pkt.AID, _pkt.UniqueID, 0)) return;
 	NpcStore_default.append();
 	NpcStore_default.setType(NpcStore_default.Type.VENDING_STORE);
 	NpcStore_default.setList(_pkt.itemList);
@@ -345507,6 +355790,10 @@ function onVendingStoreList(_pkt) {
 		});
 		Network.sendPacket(pkt);
 	};
+	const submit = NpcStore_default.onSubmit;
+	onSearchStoreOpened(_pkt.AID, _pkt.UniqueID, 0, () => {
+		if (NpcStore_default.__active && NpcStore_default.onSubmit === submit) NpcStore_default.remove();
+	});
 }
 /**
 * Received items list to buy from player
@@ -345514,6 +355801,7 @@ function onVendingStoreList(_pkt) {
 * @param {object} pkt - PACKET.ZC.ACK_ITEMLIST_BUYING_STORE
 */
 function onBuyingStoreList(_pkt) {
+	if (!canOpenSearchStore(_pkt.AID, _pkt.UniqueID, 1)) return;
 	NpcStore_default.append();
 	NpcStore_default.setType(NpcStore_default.Type.BUYING_STORE);
 	NpcStore_default.setList(_pkt.itemList);
@@ -345534,6 +355822,10 @@ function onBuyingStoreList(_pkt) {
 		});
 		Network.sendPacket(pkt);
 	};
+	const submit = NpcStore_default.onSubmit;
+	onSearchStoreOpened(_pkt.AID, _pkt.UniqueID, 1, () => {
+		if (NpcStore_default.__active && NpcStore_default.onSubmit === submit) NpcStore_default.remove();
+	});
 }
 /**
 * Open vending creation window with X slots
@@ -345633,6 +355925,9 @@ function MainEngine$9() {
 	Network.hookPacket(PACKET.ZC.OPEN_BUYING_STORE, onOpenBuying);
 	Network.hookPacket(PACKET.ZC.FAILED_OPEN_BUYING_STORE_TO_BUYER, onOpenBuyingResult);
 	Network.hookPacket(PACKET.ZC.MYITEMLIST_BUYING_STORE, onBuyingList);
+	Network.hookPacket(PACKET.ZC.UPDATE_ITEM_FROM_BUYING_STORE, onBuyingStoreUpdate);
+	Network.hookPacket(PACKET.ZC.UPDATE_ITEM_FROM_BUYING_STORE2, onBuyingStoreUpdate);
+	Network.hookPacket(PACKET.ZC.FAILED_TRADE_BUYING_STORE_TO_BUYER, onBuyingStoreClosed);
 	Network.hookPacket(PACKET.ZC.PC_PURCHASE_ITEMLIST_FROMMC3, onVendingStoreList);
 	Network.hookPacket(PACKET.ZC.ACK_ITEMLIST_BUYING_STORE, onBuyingStoreList);
 	Network.hookPacket(PACKET.ZC.FAILED_TRADE_BUYING_STORE_TO_SELLER, onSellToBuyingStoreResult);
@@ -345645,6 +355940,7 @@ function MainEngine$9() {
 }
 var init_Store = __esmMin((() => {
 	init_DBManager();
+	init_StoreSearch();
 	init_SessionStorage();
 	init_NetworkManager();
 	init_PacketStructure();
@@ -346631,7 +356927,7 @@ var init_Rodex = __esmMin((() => {
 */
 function onOpenRoulette(pkt) {
 	if (pkt.result === 0) {
-		if (!Roulette_default.ui) Roulette_default.append();
+		if (!Roulette_default.__active) Roulette_default.append();
 		Roulette_default.onOpen(pkt);
 	} else console.error("Failed to open roulette:", pkt.result);
 }
@@ -346641,7 +356937,7 @@ function onOpenRoulette(pkt) {
 * @param {object} pkt - PACKET.ZC.ACK_ROULETTE_INFO
 */
 function onRouletteInfo(pkt) {
-	if (!Roulette_default.ui) Roulette_default.append();
+	if (!Roulette_default.__active) Roulette_default.append();
 	Roulette_default.onRouletteInfo(pkt);
 }
 /**
@@ -346650,10 +356946,7 @@ function onRouletteInfo(pkt) {
 * @param {object} pkt - PACKET.ZC.ACK_GENERATE_ROULETTE
 */
 function onGenerateRoulette(pkt) {
-	if (pkt.result === 0) {
-		if (!Roulette_default.ui) Roulette_default.append();
-		Roulette_default.onResult(pkt);
-	} else console.error("Roulette spin failed:", pkt.result);
+	Roulette_default.onResult(pkt);
 }
 /**
 * Receive Roulette Close ACK
@@ -346669,21 +356962,7 @@ function onCloseRoulette(pkt) {
 * @param {object} pkt - PACKET.ZC.RECV_ROULETTE_ITEM
 */
 function onRecvRouletteItem(pkt) {
-	if (pkt.result === 0) {
-		if (Roulette_default.ui && typeof Roulette_default.onItemReceived === "function") Roulette_default.onItemReceived(pkt);
-	} else {
-		let errorMsg = "Failed to receive roulette item";
-		switch (pkt.result) {
-			case 1:
-				errorMsg = "Failed to receive item";
-				break;
-			case 2:
-				errorMsg = "Item count exceeded";
-				break;
-			case 3: errorMsg = "Overweight";
-		}
-		console.error("[Roulette]", errorMsg);
-	}
+	Roulette_default.onItemReceived(pkt);
 }
 /**
 * Initialize
@@ -347438,6 +357717,10 @@ function onConnectionRefused$2(pkt) {
 * @param {object} pkt - PACKET.ZC.NPCACK_MAPMOVE
 */
 function onMapChange(pkt) {
+	resetStoreSearch();
+	_mapReady = false;
+	SessionStorage_default.ping.pingTime = 0;
+	SessionStorage_default.ping.returned = false;
 	clearQuestEffects();
 	MapRenderer.onLoad = () => {
 		SessionStorage_default.Entity.resetRoute();
@@ -347540,6 +357823,7 @@ function onMapChange(pkt) {
 		}
 		Plugins.init();
 		Network.sendPacket(new PACKET.CZ.NOTIFY_ACTORINIT());
+		_mapReady = true;
 		if (SessionStorage_default.ratesInfo) {
 			Announce_default.append();
 			Announce_default.set(SessionStorage_default.ratesInfo, "#FFFF00", true);
@@ -347561,10 +357845,20 @@ function onServerChange(pkt) {
 	MapEngine.init(pkt.addr.ip, pkt.addr.port, pkt.mapName);
 }
 /**
+* The map socket closed: drop the catalog with it, then show the same
+* message NetworkManager shows when no disconnect handler is set.
+*/
+function onMapDisconnect() {
+	resetStoreSearch(true);
+	UIManager.showErrorBox("Disconnected from Server.");
+}
+/**
 * Resets the per-character UI state shared by the exit and restart flows.
 * Components that were never prepared have no root element to clean.
 */
 function cleanGameUI() {
+	resetStoreSearch(true);
+	if (Network.onDisconnect === onMapDisconnect) Network.onDisconnect = null;
 	WhisperBox.clearAll();
 	const tasks = [
 		[BasicInfoController, "remove"],
@@ -347765,6 +358059,10 @@ function walkIntervalProcess() {
 			pkt.dest[1] = Mouse.world.y;
 		}
 		Network.sendPacket(pkt);
+		if (Configs.get("movePrediction", false)) {
+			const ping = SessionStorage_default.ping.value > 0 ? SessionStorage_default.ping.value : 0;
+			SessionStorage_default.Entity.predictWalkTo(pkt.dest[0], pkt.dest[1], Math.max(400, 2 * ping + 250));
+		}
 	}
 	Events.clearTimeout(_walkTimer);
 	_walkTimer = Events.setTimeout(walkIntervalProcess, 500);
@@ -347916,6 +358214,8 @@ function onConfigUpdate(type, val) {
 * Go back from map-server to char-server
 */
 function onRestart() {
+	resetStoreSearch(true);
+	if (Network.onDisconnect === onMapDisconnect) Network.onDisconnect = null;
 	__vitePreload(() => Promise.resolve().then(() => (init_CharEngine(), CharEngine_exports)).then((m) => m.default.reload(() => {
 		cleanGameUI();
 		MapRenderer.free();
@@ -347933,7 +358233,7 @@ function onReassemblyAuth(pkt) {
 		return;
 	}
 }
-var _mapName, _isInitialised, _exiting, _exitTimer, snCounter, chatLines, packetMap, MapEngine, _walkTimer, _walkLastTick;
+var _mapName, _isInitialised, _mapReady, _exiting, _exitTimer, snCounter, chatLines, packetMap, MapEngine, _walkTimer, _walkLastTick;
 var init_MapEngine = __esmMin((() => {
 	init_DBManager();
 	init_Configs();
@@ -348031,6 +358331,7 @@ var init_MapEngine = __esmMin((() => {
 	init_Homun();
 	init_Mercenary();
 	init_Store();
+	init_StoreSearch();
 	init_Trade();
 	init_Friends();
 	init_UIOpen();
@@ -348046,6 +358347,7 @@ var init_MapEngine = __esmMin((() => {
 	init_preload_helper();
 	_mapName = "";
 	_isInitialised = false;
+	_mapReady = false;
 	_exiting = false;
 	_exitTimer = null;
 	snCounter = 0;
@@ -348064,7 +358366,10 @@ var init_MapEngine = __esmMin((() => {
 		* @param {string} mapName
 		*/
 		static init(ip, port, mapName) {
+			resetStoreSearch(true);
+			Network.onDisconnect = onMapDisconnect;
 			_mapName = mapName;
+			_mapReady = false;
 			_exiting = false;
 			_exitTimer = null;
 			const forceAddress = Configs.get("forceUseAddress");
@@ -348099,12 +358404,15 @@ var init_MapEngine = __esmMin((() => {
 				const is_sec_hbt = Configs.get("sec_HBT", null);
 				let ping;
 				const SP = SessionStorage_default.ping;
+				SP.pingTime = 0;
+				SP.returned = false;
 				if (PacketVerManager_default.value >= 20180307) ping = new PACKET.CZ.REQUEST_TIME2();
 				else ping = new PACKET.CZ.REQUEST_TIME();
 				const startTick = Date.now();
 				SessionStorage_default.serverTickSynced = false;
 				Network.setPing(() => {
 					if (is_sec_hbt) Network.sendPacket(hbt);
+					if (!_mapReady) return;
 					ping.clientTime = Date.now() - startTick;
 					if (!SP.returned && SP.pingTime) console.warn("[Network] The server did not answer the previous PING!");
 					SP.pingTime = ping.clientTime;
@@ -348166,6 +358474,7 @@ var init_MapEngine = __esmMin((() => {
 				NPCEngine();
 				MercenaryEngine();
 				MainEngine$9();
+				initializeStoreSearch();
 				MainEngine$8();
 				FriendEngine.init();
 				MainEngine$7();
@@ -358649,10 +368958,14 @@ async function onFileLoaded(data, error, input) {
 	let i, count, j, size;
 	let gl, frames, texture, layers, palette;
 	let precision;
-	if (error && ClothPalette_default.canBuild(input.filename)) {
-		ClothPalette_default.build(input.filename, function(built) {
+	if (!input.clothChecked && ClothPalette_default.canBuild(input.filename)) {
+		input.clothChecked = true;
+		if (error) ClothPalette_default.build(input.filename, function(built) {
 			if (built) onFileLoaded(built.buffer, null, input);
 			else MemoryManager.set(input.filename, data, error);
+		});
+		else ClothPalette_default.adjust(input.filename, data, function(replaced) {
+			onFileLoaded(replaced ? replaced.buffer : data, null, input);
 		});
 		return;
 	}
@@ -358809,10 +369122,10 @@ var init_Client = __esmMin((() => {
 		* @param {function} onerror
 		* @param {Array} args - optional
 		*/
-		static loadFile(filename, onload, onerror, args = {}) {
+		static loadFile(filename, onload, onerror, args) {
 			if (!MemoryManager.exist(filename)) Thread.send("LOAD_FILE", {
 				filename,
-				args: args || null
+				args: args === void 0 ? {} : args || null
 			}, onFileLoaded);
 			return MemoryManager.get(filename, onload, onerror);
 		}
